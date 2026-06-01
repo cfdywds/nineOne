@@ -16,6 +16,7 @@ import (
 	"github.com/video-site/backend/internal/drives"
 	"github.com/video-site/backend/internal/drives/pikpak"
 	"github.com/video-site/backend/internal/drives/spider91"
+	"github.com/video-site/backend/internal/drives/spiderxvideos"
 )
 
 // fakeRegistry 是 Registry 接口的最小实现。
@@ -328,6 +329,57 @@ func writeSpider91Video(t *testing.T, cat *catalog.Catalog, d *spider91.Driver, 
 	return id
 }
 
+func setupSpiderXVideos(t *testing.T) (*spiderxvideos.Driver, string) {
+	t.Helper()
+	root := t.TempDir()
+	d := spiderxvideos.New(spiderxvideos.Config{ID: "xvideos-x", RootDir: root})
+	if err := d.Init(context.Background()); err != nil {
+		t.Fatalf("spiderxvideos init: %v", err)
+	}
+	return d, root
+}
+
+func writeSpiderXVideosVideo(t *testing.T, cat *catalog.Catalog, d *spiderxvideos.Driver, sourceID, ext string, content []byte, publishedAt time.Time) string {
+	t.Helper()
+	fileID := sourceID + ext
+	path, err := d.VideoPath(fileID)
+	if err != nil {
+		t.Fatalf("xvideos video path: %v", err)
+	}
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatalf("write xvideos video: %v", err)
+	}
+	thumbPath, err := d.ThumbPath(sourceID + ".jpg")
+	if err != nil {
+		t.Fatalf("xvideos thumb path: %v", err)
+	}
+	if err := os.WriteFile(thumbPath, []byte("thumb"), 0o644); err != nil {
+		t.Fatalf("write xvideos thumb: %v", err)
+	}
+
+	id := spiderxvideos.BuildVideoID(d.ID(), sourceID)
+	v := &catalog.Video{
+		ID:            id,
+		DriveID:       d.ID(),
+		FileID:        fileID,
+		FileName:      fileID,
+		Title:         "XVideos Sample " + sourceID,
+		Author:        spiderxvideos.DefaultAuthor,
+		Ext:           strings.TrimPrefix(ext, "."),
+		Quality:       "HD",
+		Size:          int64(len(content)),
+		ThumbnailURL:  "/p/thumb/" + id,
+		PreviewStatus: "pending",
+		PublishedAt:   publishedAt,
+		CreatedAt:     publishedAt,
+		UpdatedAt:     publishedAt,
+	}
+	if err := cat.UpsertVideo(context.Background(), v); err != nil {
+		t.Fatalf("upsert xvideos video: %v", err)
+	}
+	return id
+}
+
 func TestRunOnceMigratesSpider91VideosAndCleansLocalFiles(t *testing.T) {
 	cat := setupCatalog(t)
 	src, _ := setupSpider91(t)
@@ -391,6 +443,56 @@ func TestRunOnceMigratesSpider91VideosAndCleansLocalFiles(t *testing.T) {
 	thumbPath, _ := src.ThumbPath("vk001.jpg")
 	if _, err := os.Stat(thumbPath); !os.IsNotExist(err) {
 		t.Fatalf("local thumb still exists or stat error %v", err)
+	}
+}
+
+func TestRunOnceMigratesSpiderXVideosVideosAndCleansLocalFiles(t *testing.T) {
+	cat := setupCatalog(t)
+	src, _ := setupSpiderXVideos(t)
+	pp := newFakePikPak("pikpak-target", "pikpak-root-id")
+
+	reg := newFakeRegistry()
+	reg.Add(src)
+	reg.Add(pp)
+
+	now := time.Now()
+	id := writeSpiderXVideosVideo(t, cat, src, "12345678", ".mp4", []byte("xvideos bytes here"), now)
+
+	m := New(Config{
+		Catalog:          cat,
+		Registry:         reg,
+		GetTargetDriveID: func() string { return pp.ID() },
+		KeepLatestN:      -1,
+	})
+	m.runOnce(context.Background())
+
+	if pp.uploadCalls != 1 {
+		t.Fatalf("upload calls = %d, want 1", pp.uploadCalls)
+	}
+	got, err := cat.GetVideo(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if got.DriveID != pp.ID() {
+		t.Fatalf("drive_id = %q, want %q", got.DriveID, pp.ID())
+	}
+	wantName := desiredMigratedName("XVideos Sample 12345678", id, "mp4")
+	if !strings.HasPrefix(wantName, "xvideos-") {
+		t.Fatalf("xvideos migrated name = %q, want xvideos- prefix", wantName)
+	}
+	if _, ok := pp.gotBodies[wantName]; !ok {
+		t.Fatalf("target did not receive expected upload name %q (got names: %v)", wantName, keysOf(pp.gotBodies))
+	}
+	if got.FileName != wantName {
+		t.Fatalf("file_name = %q, want %q", got.FileName, wantName)
+	}
+	videoPath, _ := src.VideoPath("12345678.mp4")
+	if _, err := os.Stat(videoPath); !os.IsNotExist(err) {
+		t.Fatalf("local xvideos mp4 still exists or stat error %v", err)
+	}
+	thumbPath, _ := src.ThumbPath("12345678.jpg")
+	if _, err := os.Stat(thumbPath); !os.IsNotExist(err) {
+		t.Fatalf("local xvideos thumb still exists or stat error %v", err)
 	}
 }
 
@@ -553,7 +655,7 @@ func TestCleanupRemovesAllAlreadyMigratedOrphans(t *testing.T) {
 		GetTargetDriveID: func() string { return pp.ID() },
 	})
 
-	deleted, err := m.cleanupOldLocalVideos(context.Background(), src)
+	deleted, err := m.cleanupOldLocalVideos(context.Background(), src, spider91.Kind)
 	if err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}

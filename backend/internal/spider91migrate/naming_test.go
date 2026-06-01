@@ -136,3 +136,11 @@ func TestDesiredPikPakName(t *testing.T) {
 		}
 	}
 }
+
+func TestDesiredMigratedNamePrefixesXVideos(t *testing.T) {
+	got := desiredMigratedName("Sample Title", "spiderxvideos-xv-12345678", "mp4")
+	want := "xvideos-Sample Title-12345678.mp4"
+	if got != want {
+		t.Fatalf("desiredMigratedName = %q, want %q", got, want)
+	}
+}

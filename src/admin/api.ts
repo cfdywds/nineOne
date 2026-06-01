@@ -77,7 +77,7 @@ export function checkUpdate() {
 
 export type AdminDrive = {
   id: string;
-  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "localstorage" | "spider91";
+  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "localstorage" | "spider91" | "spiderxvideos";
   name: string;
   rootId: string;
   scanRootId: string;
@@ -137,7 +137,7 @@ export function getDriveStorage() {
 
 export type UpsertDriveInput = {
   id: string;
-  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "localstorage" | "spider91";
+  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "localstorage" | "spider91" | "spiderxvideos";
   name: string;
   rootId: string;
   scanRootId: string;

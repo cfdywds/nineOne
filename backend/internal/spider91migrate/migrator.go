@@ -22,7 +22,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -32,6 +31,7 @@ import (
 	"github.com/video-site/backend/internal/drives/p115"
 	"github.com/video-site/backend/internal/drives/pikpak"
 	"github.com/video-site/backend/internal/drives/spider91"
+	"github.com/video-site/backend/internal/drives/spiderxvideos"
 )
 
 // uploadTarget 是 migrator 调用目标 drive 的最小接口。任何一种"接收 spider91 上传"的
@@ -64,6 +64,18 @@ type UploadResult struct {
 }
 
 const spider91UploadDirName = "91 Spider"
+
+type localCrawlerDriver interface {
+	ID() string
+	VideosDir() string
+	VideoPath(fileID string) (string, error)
+	ThumbPath(fileID string) (string, error)
+}
+
+type localCrawlerSource struct {
+	kind   string
+	driver localCrawlerDriver
+}
 
 // pikpakAdapter / p115Adapter / onedriveAdapter 把具体 driver 包装成 uploadTarget。
 //
@@ -311,13 +323,13 @@ func (m *Migrator) runOnce(ctx context.Context) {
 	}
 
 	migrated := 0
-	for _, src := range m.spider91Drives() {
+	for _, src := range m.localCrawlerSources() {
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		n, err := m.migrateDrive(ctx, src, target, pp)
+		n, err := m.migrateDrive(ctx, src.driver, src.kind, target, pp)
 		if err != nil {
-			log.Printf("[spider91migrate] drive=%s migrate batch error: %v", src.ID(), err)
+			log.Printf("[spider91migrate] drive=%s migrate batch error: %v", src.driver.ID(), err)
 		}
 		migrated += n
 		if active, _ := m.inCooldown(); active {
@@ -334,16 +346,16 @@ func (m *Migrator) runOnce(ctx context.Context) {
 	// 收尾：扫每个 spider91 drive 的本地目录，把 catalog 已经迁到别处但本地
 	// 仍有残留的孤儿文件清掉。这是纯防御性兜底——正常路径下 migrateDrive
 	// 已经在迁移成功后立刻 CleanupSpider91Local，不会留孤儿。
-	for _, src := range m.spider91Drives() {
+	for _, src := range m.localCrawlerSources() {
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		deleted, err := m.cleanupOldLocalVideos(ctx, src)
+		deleted, err := m.cleanupOldLocalVideos(ctx, src.driver, src.kind)
 		if err != nil {
-			log.Printf("[spider91migrate] cleanup drive=%s: %v", src.ID(), err)
+			log.Printf("[spider91migrate] cleanup drive=%s: %v", src.driver.ID(), err)
 		}
 		if deleted > 0 {
-			log.Printf("[spider91migrate] cleanup drive=%s deleted %d orphan local file(s)", src.ID(), deleted)
+			log.Printf("[spider91migrate] cleanup drive=%s deleted %d orphan local file(s)", src.driver.ID(), deleted)
 		}
 	}
 
@@ -410,6 +422,24 @@ func (m *Migrator) spider91Drives() []*spider91.Driver {
 	return out
 }
 
+func (m *Migrator) localCrawlerSources() []localCrawlerSource {
+	all := m.cfg.Registry.All()
+	out := make([]localCrawlerSource, 0, len(all))
+	for _, d := range all {
+		switch d.Kind() {
+		case spider91.Kind:
+			if sd, ok := d.(*spider91.Driver); ok {
+				out = append(out, localCrawlerSource{kind: spider91.Kind, driver: sd})
+			}
+		case spiderxvideos.Kind:
+			if sd, ok := d.(*spiderxvideos.Driver); ok {
+				out = append(out, localCrawlerSource{kind: spiderxvideos.Kind, driver: sd})
+			}
+		}
+	}
+	return out
+}
+
 // migrateDrive 对单个 spider91 drive 跑一批迁移；返回成功迁移的条数。
 //
 // 策略（与"本地缓存最新 N 个"语义一致）：
@@ -420,7 +450,7 @@ func (m *Migrator) spider91Drives() []*spider91.Driver {
 //   - 已经迁移过但本地还有残留 → 仅删本地（兜底）
 //
 // KeepLatestN < 0 时不保护任何本地文件，全部尝试迁移（旧行为，主要给测试用）。
-func (m *Migrator) migrateDrive(ctx context.Context, src *spider91.Driver, targetDriveID string, pp uploadTarget) (int, error) {
+func (m *Migrator) migrateDrive(ctx context.Context, src localCrawlerDriver, sourceKind, targetDriveID string, pp uploadTarget) (int, error) {
 	keepN := m.cfg.KeepLatestN
 	if keepN < 0 {
 		keepN = 0
@@ -481,7 +511,7 @@ func (m *Migrator) migrateDrive(ctx context.Context, src *spider91.Driver, targe
 		}
 
 		viewkey := stripExt(f.name)
-		videoID := "spider91-" + src.ID() + "-" + viewkey
+		videoID := sourceKind + "-" + src.ID() + "-" + viewkey
 		v, err := m.cfg.Catalog.GetVideo(ctx, videoID)
 		if err != nil || v == nil {
 			// 找不到 catalog 行：保险起见保留本地，让管理员可见
@@ -490,7 +520,7 @@ func (m *Migrator) migrateDrive(ctx context.Context, src *spider91.Driver, targe
 
 		if v.DriveID != src.ID() {
 			// catalog 已迁移到别的 drive，但本地还有残留 → 兜底删本地
-			CleanupSpider91Local(src, v.FileID)
+			CleanupLocalCrawlerLocal(src, v.FileID)
 			continue
 		}
 
@@ -521,7 +551,7 @@ func (m *Migrator) migrateDrive(ctx context.Context, src *spider91.Driver, targe
 // migrateOne 把单条 spider91 视频上传到目标盘并改写 catalog。
 // 返回 (true, nil) 表示真的迁了一条；(false, nil) 表示跳过（本地文件已不在等）；
 // (false, err) 表示真出错。
-func (m *Migrator) migrateOne(ctx context.Context, v *catalog.Video, src *spider91.Driver, targetDriveID string, pp uploadTarget) (bool, error) {
+func (m *Migrator) migrateOne(ctx context.Context, v *catalog.Video, src localCrawlerDriver, targetDriveID string, pp uploadTarget) (bool, error) {
 	path, err := src.VideoPath(v.FileID)
 	if err != nil {
 		return false, fmt.Errorf("resolve local path: %w", err)
@@ -558,7 +588,7 @@ func (m *Migrator) migrateOne(ctx context.Context, v *catalog.Video, src *spider
 	if err != nil {
 		return false, fmt.Errorf("%s ensure %q dir: %w", pp.Kind(), spider91UploadDirName, err)
 	}
-	uploadName := desiredPikPakName(v.Title, extractViewKey(v.ID), v.Ext)
+	uploadName := desiredMigratedName(v.Title, v.ID, v.Ext)
 	res, err := pp.UploadAndReportHash(ctx, parent, uploadName, f, info.Size())
 	if err != nil {
 		return false, fmt.Errorf("%s upload: %w", pp.Kind(), err)
@@ -577,7 +607,7 @@ func (m *Migrator) migrateOne(ctx context.Context, v *catalog.Video, src *spider
 	}
 
 	// 删除本地 mp4 和 thumb（thumb 在 previews/thumbs/ 还有副本，不影响展示）
-	CleanupSpider91Local(src, v.FileID)
+	CleanupLocalCrawlerLocal(src, v.FileID)
 
 	log.Printf("[spider91migrate] %s migrated to drive=%s(kind=%s) file=%s name=%q", v.ID, targetDriveID, pp.Kind(), res.FileID, uploadName)
 	return true, nil
@@ -590,6 +620,14 @@ func (m *Migrator) migrateOne(ctx context.Context, v *catalog.Video, src *spider
 //
 // 暴露成包级函数方便 cleanup 模块复用（任务 6）。
 func CleanupSpider91Local(src *spider91.Driver, fileID string) {
+	CleanupLocalCrawlerLocal(src, fileID)
+}
+
+func CleanupSpiderXVideosLocal(src *spiderxvideos.Driver, fileID string) {
+	CleanupLocalCrawlerLocal(src, fileID)
+}
+
+func CleanupLocalCrawlerLocal(src localCrawlerDriver, fileID string) {
 	videoPath, err := src.VideoPath(fileID)
 	if err == nil {
 		if err := os.Remove(videoPath); err != nil && !os.IsNotExist(err) {
@@ -626,7 +664,7 @@ func stripExt(name string) string {
 // 找到孤儿。
 //
 // 返回实际删除的文件个数。
-func (m *Migrator) cleanupOldLocalVideos(ctx context.Context, src *spider91.Driver) (int, error) {
+func (m *Migrator) cleanupOldLocalVideos(ctx context.Context, src localCrawlerDriver, sourceKind string) (int, error) {
 	entries, err := os.ReadDir(src.VideosDir())
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -644,7 +682,7 @@ func (m *Migrator) cleanupOldLocalVideos(ctx context.Context, src *spider91.Driv
 			continue
 		}
 		viewkey := stripExt(e.Name())
-		videoID := "spider91-" + src.ID() + "-" + viewkey
+		videoID := sourceKind + "-" + src.ID() + "-" + viewkey
 		v, err := m.cfg.Catalog.GetVideo(ctx, videoID)
 		if err != nil || v == nil {
 			// 找不到 catalog 行：保险起见保留，等管理员处理
@@ -694,10 +732,10 @@ func (m *Migrator) backfillFileNames(ctx context.Context, targetDriveID string, 
 		if err := ctx.Err(); err != nil {
 			return renamed, err
 		}
-		if !strings.HasPrefix(v.ID, "spider91-") {
+		if !isCrawlerVideoID(v.ID) {
 			continue
 		}
-		want := desiredPikPakName(v.Title, extractViewKey(v.ID), v.Ext)
+		want := desiredMigratedName(v.Title, v.ID, v.Ext)
 		if v.FileName == want {
 			continue
 		}

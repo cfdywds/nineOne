@@ -28,6 +28,7 @@ const kindLabel: Record<string, string> = {
   onedrive: "OneDrive",
   localstorage: "本地存储",
   spider91: "91 爬虫",
+  spiderxvideos: "XVideos 爬虫",
 };
 
 type Kind = api.AdminDrive["kind"];
@@ -63,6 +64,10 @@ const emptyForm: FormState = {
   creds: {},
   spider91UploadDriveId: "",
 };
+
+function isSpiderCrawlerKind(kind: string): boolean {
+  return kind === "spider91" || kind === "spiderxvideos";
+}
 
 export function DrivesPage() {
   const [list, setList] = useState<api.AdminDrive[]>([]);
@@ -170,9 +175,9 @@ export function DrivesPage() {
         credentials: form.creds,
       });
 
-      // 仅当编辑/新建的是 spider91 drive 时，才同步全局上传目标 setting。
+      // 仅当编辑/新建的是爬虫 drive 时，才同步全局上传目标 setting。
       // 避免动其它类型 drive 的表单顺手覆盖了这个独立设置。
-      if (form.kind === "spider91" && form.spider91UploadDriveId !== (settings?.spider91UploadDriveId ?? "")) {
+      if (isSpiderCrawlerKind(form.kind) && form.spider91UploadDriveId !== (settings?.spider91UploadDriveId ?? "")) {
         try {
           const updated = await api.updateSettings({
             spider91UploadDriveId: form.spider91UploadDriveId,
@@ -220,7 +225,7 @@ export function DrivesPage() {
   async function handleRescan(d: api.AdminDrive) {
     try {
       await api.rescan(d.id);
-      if (d.kind === "spider91") {
+      if (isSpiderCrawlerKind(d.kind)) {
         show("已触发抓取任务，需要 2-4 分钟，可稍后刷新视频列表查看", "success");
       } else {
         show("已触发扫描，可稍后刷新视频列表查看", "success");
@@ -356,7 +361,7 @@ export function DrivesPage() {
                   <span className="admin-detail-label">网盘 ID</span>
                   <span className="admin-detail-value admin-mono-cell">{d.id}</span>
                 </div>
-                {d.kind !== "spider91" && (
+                {!isSpiderCrawlerKind(d.kind) && (
                   <>
                     <div className="admin-detail-row">
                       <span className="admin-detail-label">根目录 ID</span>
@@ -368,7 +373,7 @@ export function DrivesPage() {
                     </div>
                   </>
                 )}
-                {d.kind === "spider91" && (
+                {isSpiderCrawlerKind(d.kind) && (
                   <div className="admin-detail-row">
                     <span className="admin-detail-label">上次抓取时间</span>
                     <span className="admin-detail-value">
@@ -388,7 +393,7 @@ export function DrivesPage() {
 
               <div className="admin-detail-actions">
                 <button className="admin-btn is-primary" onClick={() => handleRescan(d)}>
-                  {d.kind === "spider91" ? (
+                  {isSpiderCrawlerKind(d.kind) ? (
                     <>
                       <Download size={13} /> 立即抓取
                     </>
@@ -399,7 +404,7 @@ export function DrivesPage() {
                   )}
                 </button>
                 <button className="admin-btn" onClick={() => openEdit(d)}>
-                  {d.kind === "spider91" ? "编辑配置" : "编辑配置凭证"}
+                  {isSpiderCrawlerKind(d.kind) ? "编辑配置" : "编辑配置凭证"}
                 </button>
                 <button className="admin-btn is-danger" onClick={() => {
                   handleDelete(d);
@@ -411,7 +416,7 @@ export function DrivesPage() {
             </div>
 
             {/* 如果不是爬虫网盘，内嵌显示跳过目录设置 */}
-            {d.kind !== "spider91" && (
+            {!isSpiderCrawlerKind(d.kind) && (
               <SkipDirsPanel
                 drive={d}
                 onSaved={(saved) => {
@@ -832,11 +837,11 @@ function StatusTag({
   hasCred: boolean;
 }) {
   // spider91 没有用户凭证概念，直接看 status；保存后默认就是 "ok"
-  if (kind !== "spider91" && !hasCred) {
+  if (!isSpiderCrawlerKind(kind) && !hasCred) {
     return <span className="admin-status is-pending">未配置凭证</span>;
   }
   if (status === "ok") {
-    if (kind === "spider91") {
+    if (isSpiderCrawlerKind(kind)) {
       return <span className="admin-status is-ok">已就绪</span>;
     }
     return <span className="admin-status is-ok">已连接</span>;
@@ -864,7 +869,7 @@ function DriveForm({
   const fields = useMemo(() => credentialFields(form.kind), [form.kind]);
   const help = credentialHelp(form.kind, isEdit);
   const showDirectoryFields =
-    form.kind !== "spider91" &&
+    !isSpiderCrawlerKind(form.kind) &&
     form.kind !== "onedrive" &&
     form.kind !== "localstorage" &&
     form.kind !== "pikpak";
@@ -907,6 +912,7 @@ function DriveForm({
           <option value="onedrive">OneDrive</option>
           <option value="localstorage">本地存储</option>
           <option value="spider91">91 Spider</option>
+          <option value="spiderxvideos">XVideos Spider</option>
           <option value="quark">夸克网盘</option>
           <option value="wopan">联通沃盘</option>
         </select>
@@ -967,7 +973,7 @@ function DriveForm({
         </>
       )}
 
-      {form.kind === "spider91" && (
+      {isSpiderCrawlerKind(form.kind) && (
         <>
           <hr className="admin-form__divider" />
           <Spider91UploadTargetField
@@ -1035,6 +1041,8 @@ function credentialHelp(kind: Kind, isEdit: boolean): string {
       return `把服务器上的一个已有目录作为视频来源扫描。填写绝对路径，例如 /mnt/videos；系统会读取该目录及子目录中的视频，并生成封面、Teaser 和指纹。${note}`;
     case "spider91":
       return "91 爬虫会把定时抓取到的视频和封面先保存到本机，并作为一个视频来源接入站点；它不是外部网盘，不需要填写 Cookie 或目录 ID。后续流水线会把较早的视频上传到你选择的 115 / PikPak / OneDrive 目标盘。";
+    case "spiderxvideos":
+      return "XVideos 爬虫会按起始 URL 定时抓取视频和封面，先保存到本机并作为视频来源接入站点；可配置 Cookie、代理、清晰度和每轮新增数量。后续流水线会把较早的视频上传到你选择的 115 / PikPak / OneDrive 目标盘。";
     default:
       return "";
   }
@@ -1125,7 +1133,131 @@ function credentialFields(kind: Kind): Array<{
         },
       ];
     case "spider91":
-      return [];
+      return [
+        {
+          key: "target_new",
+          label: "每轮新增数量",
+          placeholder: "15",
+          required: false,
+          help: "立即抓取或凌晨任务每轮最多新增多少个视频；为空默认 15。",
+        },
+        {
+          key: "proxy",
+          label: "代理 URL",
+          placeholder: "http://127.0.0.1:7890",
+          required: false,
+          help: "可选；为空时后端使用 HTTPS_PROXY / HTTP_PROXY 环境变量。",
+        },
+        {
+          key: "python_path",
+          label: "Python 路径",
+          placeholder: "python",
+          required: false,
+          help: "可选；为空时 Windows 默认 python，其他系统默认 python3。",
+        },
+        {
+          key: "script_path",
+          label: "脚本路径",
+          placeholder: "/opt/video-site-91/91VideoSpider/spider_91porn.py",
+          required: false,
+          help: "可选；为空时后端自动查找内置脚本。",
+        },
+      ];
+        case "spiderxvideos":
+          return [
+            {
+              key: "keyword",
+              label: "关键词",
+              placeholder: "keyword",
+              required: false,
+              help: "可选；为空时使用起始 URL 或首页。",
+            },
+            {
+              key: "start_url",
+              label: "起始 URL",
+              placeholder: "https://www.xvideos.com/",
+              required: false,
+              help: "首页、搜索页或分类页 URL；为空默认首页。",
+            },
+            {
+              key: "min_size",
+              label: "最小文件大小",
+              placeholder: "500MB",
+              required: false,
+              help: "可选；支持字节、KB、MB、GB。",
+            },
+            {
+              key: "max_size",
+              label: "最大文件大小",
+              placeholder: "2GB",
+              required: false,
+              help: "可选；支持字节、KB、MB、GB。",
+            },
+            {
+              key: "min_duration",
+              label: "最小时长",
+              placeholder: "01:00",
+              required: false,
+              help: "可选；支持秒数或 mm:ss / hh:mm:ss。",
+            },
+            {
+              key: "max_duration",
+              label: "最大时长",
+              placeholder: "10:00",
+              required: false,
+              help: "可选；支持秒数或 mm:ss / hh:mm:ss。",
+            },
+            {
+              key: "target_new",
+              label: "每轮新增数量",
+              placeholder: "15",
+              required: false,
+              help: "立即抓取或凌晨任务每轮最多新增多少个视频；为空默认 15。",
+            },
+            {
+              key: "quality",
+              label: "清晰度",
+              placeholder: "best",
+              required: false,
+              help: "best / hd / high / low / hls；默认 best。开启 merge_hls 时可合并 HLS。",
+            },
+            {
+              key: "merge_hls",
+              label: "合并 HLS",
+              placeholder: "true",
+              required: false,
+              help: "可选；填 true/1/yes 时使用 ffmpeg 合并 HLS 分片。",
+            },
+            {
+              key: "proxy",
+              label: "代理 URL",
+          placeholder: "http://127.0.0.1:7890",
+          required: false,
+          help: "可选；为空时后端使用 HTTPS_PROXY / HTTP_PROXY 环境变量。",
+        },
+        {
+          key: "cookie",
+          label: "Cookie",
+          placeholder: "key=value; ...",
+          required: false,
+          multiline: true,
+          help: "可选；遇到站点侧限制时从浏览器复制 Cookie。",
+        },
+        {
+          key: "python_path",
+          label: "Python 路径",
+          placeholder: "python",
+          required: false,
+          help: "可选；为空时 Windows 默认 python，其他系统默认 python3。",
+        },
+        {
+          key: "script_path",
+          label: "脚本路径",
+          placeholder: "/opt/video-site-91/91VideoSpider/spider_xvideos.py",
+          required: false,
+          help: "可选；为空时后端自动查找内置脚本。",
+        },
+      ];
   }
 }
 
@@ -1133,7 +1265,7 @@ function defaultRootId(kind: Kind): string {
   if (kind === "pikpak") return "";
   if (kind === "onedrive") return "root";
   if (kind === "localstorage") return "/";
-  if (kind === "spider91") return "/";
+  if (isSpiderCrawlerKind(kind)) return "/";
   return "0";
 }
 

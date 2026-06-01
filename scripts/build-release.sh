@@ -65,6 +65,7 @@ build_package() {
   cp -R "$ROOT_DIR/dist" "$work/dist"
   mkdir -p "$work/91VideoSpider"
   cp "$ROOT_DIR/91VideoSpider/spider_91porn.py" "$work/91VideoSpider/spider_91porn.py"
+  cp "$ROOT_DIR/91VideoSpider/spider_xvideos.py" "$work/91VideoSpider/spider_xvideos.py"
 
   cat >"$work/README.txt" <<EOF
 $APP_NAME $VERSION

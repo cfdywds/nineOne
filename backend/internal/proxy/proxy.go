@@ -220,14 +220,14 @@ func (p *Proxy) ServeLocal(w http.ResponseWriter, r *http.Request, path string) 
 }
 
 func localFilePath(u *url.URL, raw string) (string, bool) {
+	if filepath.IsAbs(raw) {
+		return raw, true
+	}
 	if u == nil {
 		return "", false
 	}
 	if u.Scheme == "file" && u.Path != "" {
 		return u.Path, true
-	}
-	if u.Scheme == "" && u.Host == "" && filepath.IsAbs(raw) {
-		return raw, true
 	}
 	return "", false
 }

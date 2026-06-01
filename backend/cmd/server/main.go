@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ import (
 	"github.com/video-site/backend/internal/drives/pikpak"
 	"github.com/video-site/backend/internal/drives/quark"
 	"github.com/video-site/backend/internal/drives/spider91"
+	"github.com/video-site/backend/internal/drives/spiderxvideos"
 	"github.com/video-site/backend/internal/drives/wopan"
 	"github.com/video-site/backend/internal/fingerprint"
 	"github.com/video-site/backend/internal/nightly"
@@ -42,6 +44,13 @@ import (
 )
 
 const fingerprintReconcileInterval = time.Minute
+
+func defaultCrawlerPythonPath() string {
+	if runtime.GOOS == "windows" {
+		return "python"
+	}
+	return "python3"
+}
 
 func main() {
 	cfgPath := "./config.yaml"
@@ -67,13 +76,14 @@ func main() {
 	defer cat.Close()
 
 	app := &App{
-		cfg:                cfg,
-		cat:                cat,
-		registry:           proxy.NewRegistry(),
-		workers:            make(map[string]*preview.Worker),
-		thumbWorkers:       make(map[string]*preview.ThumbWorker),
-		fingerprintWorkers: make(map[string]*fingerprint.Worker),
-		spider91Crawlers:   make(map[string]*spider91.Crawler),
+		cfg:                   cfg,
+		cat:                   cat,
+		registry:              proxy.NewRegistry(),
+		workers:               make(map[string]*preview.Worker),
+		thumbWorkers:          make(map[string]*preview.ThumbWorker),
+		fingerprintWorkers:    make(map[string]*fingerprint.Worker),
+		spider91Crawlers:      make(map[string]*spider91.Crawler),
+		spiderXVideosCrawlers: make(map[string]*spiderxvideos.Crawler),
 	}
 	app.proxy = proxy.New(app.registry)
 	app.spider91Migrator = spider91migrate.New(spider91migrate.Config{
@@ -161,9 +171,14 @@ func main() {
 			// spider91 的"重扫"等同于手动触发一次爬取；其它 drive 走标准 scan
 			app.mu.Lock()
 			_, isSpider91 := app.spider91Crawlers[driveID]
+			_, isSpiderXVideos := app.spiderXVideosCrawlers[driveID]
 			app.mu.Unlock()
 			if isSpider91 {
 				go app.runSpider91Crawl(ctx, driveID)
+				return
+			}
+			if isSpiderXVideos {
+				go app.runSpiderXVideosCrawl(ctx, driveID)
 				return
 			}
 			app.scheduleScan(ctx, driveID)
@@ -228,16 +243,18 @@ func main() {
 	//   Phase 3 spider91 → 云盘迁移
 	// 也响应 admin "扫描所有网盘" 按钮（POST /admin/api/jobs/nightly/run → TriggerNow）。
 	app.nightlyRunner = nightly.New(nightly.Config{
-		Settings:              cat,
-		CronHour:              cfg.Nightly.CronHour,
-		MaxDuration:           cfg.Nightly.MaxDuration,
-		ListScanTargets:       app.listScanTargetIDs,
-		RunScan:               app.runScan,
-		ListSpider91Drives:    app.listSpider91DriveIDs,
-		RunSpider91Crawl:      app.runSpider91Crawl,
-		WaitPreviewQueuesIdle: app.waitAllPreviewQueuesIdle,
-		RunMigration:          app.spider91Migrator.RunOnce,
-		RunDedupeAssetCleanup: app.cleanupDuplicateVideoAssets,
+		Settings:                cat,
+		CronHour:                cfg.Nightly.CronHour,
+		MaxDuration:             cfg.Nightly.MaxDuration,
+		ListScanTargets:         app.listScanTargetIDs,
+		RunScan:                 app.runScan,
+		ListSpider91Drives:      app.listSpider91DriveIDs,
+		RunSpider91Crawl:        app.runSpider91Crawl,
+		ListSpiderXVideosDrives: app.listSpiderXVideosDriveIDs,
+		RunSpiderXVideosCrawl:   app.runSpiderXVideosCrawl,
+		WaitPreviewQueuesIdle:   app.waitAllPreviewQueuesIdle,
+		RunMigration:            app.spider91Migrator.RunOnce,
+		RunDedupeAssetCleanup:   app.cleanupDuplicateVideoAssets,
 	})
 	go app.nightlyRunner.Run(ctx)
 
@@ -278,6 +295,9 @@ type App struct {
 	cancels            map[string]context.CancelFunc
 	// spider91Crawlers 按 driveID 索引，每个 spider91 drive 独立一个 Crawler
 	spider91Crawlers map[string]*spider91.Crawler
+
+	// spiderXVideosCrawlers 按 driveID 索引，每个 XVideos drive 独立一个 Crawler
+	spiderXVideosCrawlers map[string]*spiderxvideos.Crawler
 
 	// driveAttachMu 串行化云盘挂载/重挂载。挂载会访问上游服务，可能较慢；
 	// 串行化可以避免启动后台挂载和手动扫盘按需挂载同一个 drive 时重复创建 worker。
@@ -643,6 +663,11 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			ID:      d.ID,
 			RootDir: a.spider91DriveDir(d.ID),
 		})
+	case spiderxvideos.Kind:
+		drv = spiderxvideos.New(spiderxvideos.Config{
+			ID:      d.ID,
+			RootDir: a.spiderXVideosDriveDir(d.ID),
+		})
 	default:
 		return fmt.Errorf("unknown drive kind: %s", d.Kind)
 	}
@@ -683,6 +708,9 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 	// spider91 driver 还需要一个 crawler，挂在专用 map 里供 crawlerLoop 调用
 	if sd, ok := drv.(*spider91.Driver); ok {
 		a.attachSpider91Crawler(d, sd)
+	}
+	if sd, ok := drv.(*spiderxvideos.Driver); ok {
+		a.attachSpiderXVideosCrawler(d, sd)
 	}
 
 	return nil
@@ -744,6 +772,14 @@ func (a *App) spider91DriveDir(driveID string) string {
 	return filepath.Join(a.spider91RootDir(), driveID)
 }
 
+func (a *App) spiderXVideosRootDir() string {
+	return filepath.Join(filepath.Dir(a.cfg.Storage.LocalPreviewDir), "spiderxvideos")
+}
+
+func (a *App) spiderXVideosDriveDir(driveID string) string {
+	return filepath.Join(a.spiderXVideosRootDir(), driveID)
+}
+
 // commonThumbsDir 是所有 drive 共享的封面目录，/p/thumb/{videoID} 路由命中这里。
 func (a *App) commonThumbsDir() string {
 	return filepath.Join(a.cfg.Storage.LocalPreviewDir, "thumbs")
@@ -773,11 +809,29 @@ func (a *App) defaultSpider91ScriptPath() string {
 	return ""
 }
 
+func (a *App) defaultSpiderXVideosScriptPath() string {
+	candidates := []string{
+		filepath.Join(filepath.Dir(filepath.Dir(a.cfg.Storage.LocalPreviewDir)), "91VideoSpider", "spider_xvideos.py"),
+		filepath.Join("..", "91VideoSpider", "spider_xvideos.py"),
+		filepath.Join("91VideoSpider", "spider_xvideos.py"),
+	}
+	for _, p := range candidates {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			continue
+		}
+		if _, err := os.Stat(abs); err == nil {
+			return abs
+		}
+	}
+	return ""
+}
+
 // attachSpider91Crawler 创建该 drive 对应的 Crawler 并注册到 a.spider91Crawlers。
 func (a *App) attachSpider91Crawler(d *catalog.Drive, drv *spider91.Driver) {
 	pythonPath := strings.TrimSpace(d.Credentials["python_path"])
 	if pythonPath == "" {
-		pythonPath = "python3"
+		pythonPath = defaultCrawlerPythonPath()
 	}
 	scriptPath := strings.TrimSpace(d.Credentials["script_path"])
 	if scriptPath == "" {
@@ -814,6 +868,68 @@ func (a *App) attachSpider91Crawler(d *catalog.Drive, drv *spider91.Driver) {
 		defer cancel()
 		if _, err := a.cat.CreateTagAndClassify(bgCtx, spider91.DefaultTag, nil, "system"); err != nil {
 			log.Printf("[spider91] ensure %q tag: %v", spider91.DefaultTag, err)
+		}
+	}()
+}
+
+func (a *App) attachSpiderXVideosCrawler(d *catalog.Drive, drv *spiderxvideos.Driver) {
+	pythonPath := strings.TrimSpace(d.Credentials["python_path"])
+	if pythonPath == "" {
+		pythonPath = defaultCrawlerPythonPath()
+	}
+	scriptPath := strings.TrimSpace(d.Credentials["script_path"])
+	if scriptPath == "" {
+		scriptPath = a.defaultSpiderXVideosScriptPath()
+	}
+	proxyURL := strings.TrimSpace(d.Credentials["proxy"])
+	startURL := strings.TrimSpace(d.Credentials["start_url"])
+	if startURL == "" {
+		startURL = spiderxvideos.DefaultStartURL
+	}
+	quality := strings.TrimSpace(d.Credentials["quality"])
+	if quality == "" {
+		quality = "best"
+	}
+	keyword := strings.TrimSpace(d.Credentials["keyword"])
+	minSize := strings.TrimSpace(d.Credentials["min_size"])
+	maxSize := strings.TrimSpace(d.Credentials["max_size"])
+	minDuration := strings.TrimSpace(d.Credentials["min_duration"])
+	maxDuration := strings.TrimSpace(d.Credentials["max_duration"])
+	mergeHLS := strings.EqualFold(strings.TrimSpace(d.Credentials["merge_hls"]), "true") ||
+		strings.EqualFold(strings.TrimSpace(d.Credentials["merge_hls"]), "1") ||
+		strings.EqualFold(strings.TrimSpace(d.Credentials["merge_hls"]), "yes")
+	cookie := strings.TrimSpace(d.Credentials["cookie"])
+
+	driveID := d.ID
+	c := spiderxvideos.NewCrawler(spiderxvideos.CrawlerConfig{
+		Driver:         drv,
+		Catalog:        a.cat,
+		PythonPath:     pythonPath,
+		ScriptPath:     scriptPath,
+		WorkDir:        filepath.Dir(scriptPath),
+		CommonThumbDir: a.commonThumbsDir(),
+		ProxyURL:       proxyURL,
+		StartURL:       startURL,
+		Keyword:        keyword,
+		Quality:        quality,
+		MinSize:        minSize,
+		MaxSize:        maxSize,
+		MinDuration:    minDuration,
+		MaxDuration:    maxDuration,
+		MergeHLS:       mergeHLS,
+		FFmpegPath:     a.cfg.Preview.FFmpegPath,
+		Cookie:         cookie,
+	})
+
+	a.mu.Lock()
+	a.spiderXVideosCrawlers[driveID] = c
+	a.mu.Unlock()
+
+	bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	go func() {
+		defer cancel()
+		if _, err := a.cat.CreateTagAndClassify(bgCtx, spiderxvideos.DefaultTag, nil, "system"); err != nil {
+			log.Printf("[spiderxvideos] ensure %q tag: %v", spiderxvideos.DefaultTag, err)
 		}
 	}()
 }
@@ -994,6 +1110,7 @@ func (a *App) detachDrive(id string) {
 	delete(a.thumbWorkers, id)
 	delete(a.fingerprintWorkers, id)
 	delete(a.spider91Crawlers, id)
+	delete(a.spiderXVideosCrawlers, id)
 	a.mu.Unlock()
 }
 
@@ -1140,7 +1257,7 @@ func (a *App) runScan(ctx context.Context, driveID string) {
 	// spider91 / localupload 走自己的生命周期管理，不应该参与扫描清理；
 	// stats.Errors > 0 时（云盘 API 中途抖动）保守起见跳过这一轮，避免把
 	// "暂时列不出来"误认成"被用户删了"。
-	if drv.Kind() != spider91.Kind && drv.ID() != localupload.DriveID {
+	if !isCrawlerDriveKind(drv.Kind()) && drv.ID() != localupload.DriveID {
 		if stats.Errors > 0 {
 			log.Printf("[cleanup] skip stale cleanup for drive=%s kind=%s: scan had %d directory errors", driveID, drv.Kind(), stats.Errors)
 		} else {
@@ -1517,7 +1634,7 @@ func (a *App) listScanTargetIDs(ctx context.Context) []string {
 	}
 	out := make([]string, 0, len(all))
 	for _, d := range all {
-		if d == nil || d.ID == localupload.DriveID || d.Kind == spider91.Kind {
+		if d == nil || d.ID == localupload.DriveID || isCrawlerDriveKind(d.Kind) {
 			continue
 		}
 		out = append(out, d.ID)
@@ -1535,6 +1652,21 @@ func (a *App) listSpider91DriveIDs(ctx context.Context) []string {
 	out := make([]string, 0, len(all))
 	for _, d := range all {
 		if d != nil && d.Kind == spider91.Kind {
+			out = append(out, d.ID)
+		}
+	}
+	return out
+}
+
+func (a *App) listSpiderXVideosDriveIDs(ctx context.Context) []string {
+	all, err := a.cat.ListDrives(ctx)
+	if err != nil {
+		log.Printf("[nightly] list spiderxvideos drives: %v", err)
+		return nil
+	}
+	out := make([]string, 0, len(all))
+	for _, d := range all {
+		if d != nil && d.Kind == spiderxvideos.Kind {
 			out = append(out, d.ID)
 		}
 	}
@@ -1576,14 +1708,18 @@ func shouldScanDrive(d drives.Drive) bool {
 	if d == nil || d.ID() == localupload.DriveID {
 		return false
 	}
-	// spider91 由专用的 crawlerLoop 触发，不参与 scanLoop
-	if d.Kind() == spider91.Kind {
+	// 本地爬虫源由专用 crawler 触发，不参与 scanLoop
+	if isCrawlerDriveKind(d.Kind()) {
 		return false
 	}
 	return true
 }
 
-// ---------- spider91 crawl ----------
+func isCrawlerDriveKind(kind string) bool {
+	return kind == spider91.Kind || kind == spiderxvideos.Kind
+}
+
+// ---------- crawler crawl ----------
 
 // runSpider91Crawl 运行一次完整爬取流程并把 last_crawl_at 写回 drive.credentials。
 //
@@ -1649,6 +1785,67 @@ func (a *App) runSpider91Crawl(ctx context.Context, driveID string) {
 	// 让"下载阶段"和"teaser 阶段"在时间上分清楚（也跟 nightly Phase 2
 	// 的"等 teaser 队列 idle"语义对齐）。enqueueDriveGeneration 内部会读
 	// 该 drive 当前的 teaser_enabled，关闭时是 noop。
+	a.mu.Lock()
+	worker := a.workers[driveID]
+	thumbWorker := a.thumbWorkers[driveID]
+	fingerprintWorker := a.fingerprintWorkers[driveID]
+	a.mu.Unlock()
+	a.scheduleFingerprintBackfill(ctx, driveID, fingerprintWorker)
+	a.enqueueDriveGeneration(ctx, driveID, worker, thumbWorker)
+}
+
+func (a *App) runSpiderXVideosCrawl(ctx context.Context, driveID string) {
+	a.mu.Lock()
+	c := a.spiderXVideosCrawlers[driveID]
+	a.mu.Unlock()
+	if c == nil {
+		if err := a.ensureDriveAttached(ctx, driveID); err != nil {
+			log.Printf("[spiderxvideos] drive=%s attach failed: %v", driveID, err)
+			return
+		}
+		a.mu.Lock()
+		c = a.spiderXVideosCrawlers[driveID]
+		a.mu.Unlock()
+		if c == nil {
+			log.Printf("[spiderxvideos] drive=%s crawler not attached", driveID)
+			return
+		}
+	}
+
+	d, err := a.cat.GetDrive(ctx, driveID)
+	if err != nil || d == nil {
+		log.Printf("[spiderxvideos] drive=%s lookup failed: %v", driveID, err)
+		return
+	}
+	targetNew := spider91IntCred(d, "target_new", spiderxvideos.DefaultTargetNew)
+	if targetNew <= 0 {
+		targetNew = spiderxvideos.DefaultTargetNew
+	}
+
+	log.Printf("[spiderxvideos] drive=%s start crawl target_new=%d", driveID, targetNew)
+	res, runErr := c.RunOnce(ctx, targetNew)
+	if runErr != nil {
+		log.Printf("[spiderxvideos] drive=%s crawl failed: %v", driveID, runErr)
+	} else if res != nil {
+		log.Printf("[spiderxvideos] drive=%s crawl done target=%d total=%d new=%d skipped=%d failed=%d seen_snapshot=%d",
+			driveID, res.TargetNew, res.TotalEntries, res.NewVideos, res.Skipped, res.Failed, res.SeenSnapshot)
+	}
+
+	if d.Credentials == nil {
+		d.Credentials = make(map[string]string)
+	}
+	d.Credentials["last_crawl_at"] = strconv.FormatInt(time.Now().Unix(), 10)
+	if runErr != nil {
+		d.Status = "error"
+		d.LastError = runErr.Error()
+	} else {
+		d.Status = "ok"
+		d.LastError = ""
+	}
+	if err := a.cat.UpsertDrive(ctx, d); err != nil {
+		log.Printf("[spiderxvideos] drive=%s update last_crawl_at: %v", driveID, err)
+	}
+
 	a.mu.Lock()
 	worker := a.workers[driveID]
 	thumbWorker := a.thumbWorkers[driveID]

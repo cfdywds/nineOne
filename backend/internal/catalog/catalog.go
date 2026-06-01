@@ -614,7 +614,13 @@ func (c *Catalog) ListVideoFileIDsByDrive(ctx context.Context, driveID string) (
 // 用途：crawler 把这个集合写到 seen 文件，让 Python/Go 跳过已爬过的视频，
 // 配合 --target-new 真正凑出 N 个未爬过的视频。
 func (c *Catalog) ListSpider91Viewkeys(ctx context.Context, driveID string) ([]string, error) {
-	prefix := "spider91-" + driveID + "-"
+	return c.ListVideoIDSuffixesByPrefix(ctx, "spider91", driveID)
+}
+
+// ListVideoIDSuffixesByPrefix 列出来源型本地爬虫 drive 历史上爬过的所有 ID 后缀。
+// kindPrefix 对应 videos.id 的第一段，例如 "spider91" 或 "spiderxvideos"。
+func (c *Catalog) ListVideoIDSuffixesByPrefix(ctx context.Context, kindPrefix, driveID string) ([]string, error) {
+	prefix := strings.TrimSpace(kindPrefix) + "-" + driveID + "-"
 	rows, err := c.db.QueryContext(ctx,
 		`SELECT SUBSTR(id, ?) FROM videos WHERE id LIKE ? || '%'`,
 		len(prefix)+1, prefix)

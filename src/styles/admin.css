@@ -1827,6 +1827,7 @@
 .admin-drive-card__brand-icon[data-kind="onedrive"] { background: var(--drive-onedrive); }
 .admin-drive-card__brand-icon[data-kind="localstorage"] { background: var(--drive-localstorage); }
 .admin-drive-card__brand-icon[data-kind="spider91"] { background: var(--accent); }
+.admin-drive-card__brand-icon[data-kind="spiderxvideos"] { background: var(--accent); }
 
 .admin-drive-card__info {
   display: grid;

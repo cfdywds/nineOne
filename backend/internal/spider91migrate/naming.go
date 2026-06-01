@@ -130,3 +130,15 @@ func desiredPikPakName(title, viewkey, ext string) string {
 	}
 	return clean + "-" + suffix + "." + ext
 }
+
+func desiredMigratedName(title, videoID, ext string) string {
+	name := desiredPikPakName(title, extractViewKey(videoID), ext)
+	if strings.HasPrefix(videoID, "spiderxvideos-") {
+		return "xvideos-" + name
+	}
+	return name
+}
+
+func isCrawlerVideoID(videoID string) bool {
+	return strings.HasPrefix(videoID, "spider91-") || strings.HasPrefix(videoID, "spiderxvideos-")
+}

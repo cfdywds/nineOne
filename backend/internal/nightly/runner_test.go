@@ -106,6 +106,13 @@ func TestRunPipelineHonoursPhaseOrder(t *testing.T) {
 		RunSpider91Crawl: func(_ context.Context, id string) {
 			rec.push("crawl:" + id)
 		},
+		ListSpiderXVideosDrives: func(context.Context) []string {
+			rec.push("list-xvideos")
+			return []string{"xv-1"}
+		},
+		RunSpiderXVideosCrawl: func(_ context.Context, id string) {
+			rec.push("crawl-xvideos:" + id)
+		},
 		WaitPreviewQueuesIdle: func(context.Context) error {
 			rec.push("wait-idle")
 			return nil
@@ -129,7 +136,9 @@ func TestRunPipelineHonoursPhaseOrder(t *testing.T) {
 		"scan:drive-b",
 		"wait-idle", // after phase 1
 		"list-spider",
+		"list-xvideos",
 		"crawl:sp-1",
+		"crawl-xvideos:xv-1",
 		"wait-idle", // after phase 2
 		"migrate",
 		"dedupe-cleanup",
@@ -182,6 +191,44 @@ func TestRunPipelineSkipsMigrationWhenNoSpider91(t *testing.T) {
 	}
 	if !foundCleanup {
 		t.Fatalf("dedupe cleanup should still run when spider91 is absent; calls=%v", rec.snapshot())
+	}
+}
+
+func TestRunPipelineRunsSpiderXVideosCrawlerWhenSpider91Absent(t *testing.T) {
+	rec := &recorder{}
+
+	r := New(Config{
+		Settings:                  newStubSettings(),
+		ListScanTargets:           func(context.Context) []string { return nil },
+		ListSpider91Drives:        func(context.Context) []string { return nil },
+		RunSpider91Crawl:          func(context.Context, string) { rec.push("crawl-spider91") },
+		ListSpiderXVideosDrives:   func(context.Context) []string { return []string{"xv-1"} },
+		RunSpiderXVideosCrawl:     func(_ context.Context, id string) { rec.push("crawl-xvideos:" + id) },
+		WaitPreviewQueuesIdle:     func(context.Context) error { rec.push("wait-idle"); return nil },
+		RunMigration:              func(context.Context) error { rec.push("migrate"); return nil },
+		RunDedupeAssetCleanup:     func(context.Context) error { rec.push("dedupe-cleanup"); return nil },
+	})
+
+	r.runPipeline(context.Background())
+
+	got := rec.snapshot()
+	want := []string{"crawl-xvideos:xv-1", "wait-idle", "migrate", "dedupe-cleanup"}
+	for _, wantCall := range want {
+		found := false
+		for _, gotCall := range got {
+			if gotCall == wantCall {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected call %q in sequence %v", wantCall, got)
+		}
+	}
+	for _, c := range got {
+		if c == "crawl-spider91" {
+			t.Fatalf("spider91 crawl should not run when no spider91 drives; calls=%v", got)
+		}
 	}
 }
 

@@ -295,5 +295,6 @@ function sourceKindFromLabel(label: string): string {
   if (value.includes("沃盘") || value.includes("wopan") || value.includes("联通")) return "wopan";
   if (value.includes("onedrive") || value.includes("one drive")) return "onedrive";
   if (value.includes("本地") || value.includes("localstorage") || value.includes("local storage")) return "localstorage";
+  if (value.includes("xvideos")) return "spiderxvideos";
   return "";
 }

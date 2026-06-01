@@ -357,6 +357,12 @@
   color: var(--drive-localstorage);
 }
 
+.vd-meta__chip[data-tone="spiderxvideos"] {
+  background: var(--accent-softer);
+  border-color: var(--border-accent);
+  color: var(--accent);
+}
+
 /* ---------- Actions toolbar ---------- */
 .vd-actions {
   display: flex;

@@ -24,6 +24,7 @@ import (
 	"github.com/video-site/backend/internal/drives/localstorage"
 	"github.com/video-site/backend/internal/drives/localupload"
 	"github.com/video-site/backend/internal/drives/spider91"
+	"github.com/video-site/backend/internal/drives/spiderxvideos"
 	"github.com/video-site/backend/internal/proxy"
 )
 
@@ -137,6 +138,7 @@ func (s *Server) RegisterRoutes(r chi.Router, a *auth.Authenticator) {
 		r.Get("/p/stream/{driveID}/{fileID}", s.handleStream)
 		r.Get("/p/upload/{videoID}", s.handleUploadedVideo)
 		r.Get("/p/spider91/{videoID}", s.handleSpider91Video)
+		r.Get("/p/spiderxvideos/{videoID}", s.handleSpiderXVideosVideo)
 		r.Get("/p/preview/{videoID}", s.handlePreview)
 		r.Get("/p/thumb/{videoID}", s.handleThumb)
 	})
@@ -775,6 +777,41 @@ func (s *Server) handleSpider91Video(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, path)
 }
 
+func (s *Server) handleSpiderXVideosVideo(w http.ResponseWriter, r *http.Request) {
+	videoID := chi.URLParam(r, "videoID")
+	v, err := s.Catalog.GetVideo(r.Context(), videoID)
+	if err != nil || v.Hidden {
+		http.NotFound(w, r)
+		return
+	}
+	if s.Proxy == nil || s.Proxy.Registry == nil {
+		http.NotFound(w, r)
+		return
+	}
+	d, ok := s.Proxy.Registry.Get(v.DriveID)
+	if !ok || d.Kind() != spiderxvideos.Kind {
+		http.NotFound(w, r)
+		return
+	}
+	sd, ok := d.(*spiderxvideos.Driver)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	path, err := sd.VideoPath(v.FileID)
+	if err != nil {
+		http.Error(w, "invalid video id", http.StatusForbidden)
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || info.Size() == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	http.ServeFile(w, r, path)
+}
+
 func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	videoID := chi.URLParam(r, "videoID")
 	v, err := s.Catalog.GetVideo(r.Context(), videoID)
@@ -875,6 +912,9 @@ func (s *Server) videoSource(v *catalog.Video) string {
 		if d, ok := s.Proxy.Registry.Get(v.DriveID); ok && d.Kind() == spider91.Kind {
 			return "/p/spider91/" + v.ID
 		}
+		if d, ok := s.Proxy.Registry.Get(v.DriveID); ok && d.Kind() == spiderxvideos.Kind {
+			return "/p/spiderxvideos/" + v.ID
+		}
 	}
 	return fmt.Sprintf("/p/stream/%s/%s", v.DriveID, v.FileID)
 }
@@ -904,6 +944,8 @@ func driveKindLabel(kind string) string {
 		return "本地存储"
 	case spider91.Kind:
 		return "91 爬虫"
+	case spiderxvideos.Kind:
+		return "XVideos 爬虫"
 	default:
 		return kind
 	}

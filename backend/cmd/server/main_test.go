@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +18,17 @@ import (
 	"github.com/video-site/backend/internal/preview"
 	"github.com/video-site/backend/internal/proxy"
 )
+
+func TestDefaultCrawlerPythonPathMatchesPlatform(t *testing.T) {
+	got := defaultCrawlerPythonPath()
+	want := "python3"
+	if runtime.GOOS == "windows" {
+		want = "python"
+	}
+	if got != want {
+		t.Fatalf("defaultCrawlerPythonPath() = %q, want %q", got, want)
+	}
+}
 
 func TestRegisterPreviewWorkerBackfillsPendingWhenDriveTeaserEnabled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -327,6 +339,7 @@ func TestNightlyTargetsComeFromCatalogBeforeDriveAttach(t *testing.T) {
 		{ID: "115", Kind: "p115", Name: "115", RootID: "0", TeaserEnabled: true},
 		{ID: "pikpak", Kind: "pikpak", Name: "PikPak", RootID: "0", TeaserEnabled: true},
 		{ID: "91-spider", Kind: "spider91", Name: "91 Spider", RootID: "0", TeaserEnabled: true},
+		{ID: "xvideos-spider", Kind: "spiderxvideos", Name: "XVideos Spider", RootID: "0", TeaserEnabled: true},
 	} {
 		if err := cat.UpsertDrive(ctx, d); err != nil {
 			t.Fatalf("seed drive %s: %v", d.ID, err)
@@ -341,6 +354,10 @@ func TestNightlyTargetsComeFromCatalogBeforeDriveAttach(t *testing.T) {
 	spiderIDs := app.listSpider91DriveIDs(ctx)
 	if len(spiderIDs) != 1 || spiderIDs[0] != "91-spider" {
 		t.Fatalf("spider91 ids = %#v, want catalog spider drive", spiderIDs)
+	}
+	spiderXVideosIDs := app.listSpiderXVideosDriveIDs(ctx)
+	if len(spiderXVideosIDs) != 1 || spiderXVideosIDs[0] != "xvideos-spider" {
+		t.Fatalf("spiderxvideos ids = %#v, want catalog xvideos spider drive", spiderXVideosIDs)
 	}
 }
 
@@ -576,6 +593,9 @@ func TestEnqueueUploadedVideoQueuesLocalGenerationByDefault(t *testing.T) {
 func TestShouldScanDriveSkipsLocalUpload(t *testing.T) {
 	if shouldScanDrive(&serverLocalUploadFakeDrive{}) {
 		t.Fatal("local upload drive should not be scanned")
+	}
+	if shouldScanDrive(&serverSpiderXVideosFakeDrive{}) {
+		t.Fatal("spiderxvideos drive should not be scanned")
 	}
 	if !shouldScanDrive(&serverFakeDrive{}) {
 		t.Fatal("normal drive should be scanned")
@@ -880,6 +900,12 @@ type serverLocalUploadFakeDrive struct {
 }
 
 func (d *serverLocalUploadFakeDrive) ID() string { return "local-upload" }
+
+type serverSpiderXVideosFakeDrive struct {
+	serverFakeDrive
+}
+
+func (d *serverSpiderXVideosFakeDrive) Kind() string { return "spiderxvideos" }
 
 // seedDriveWithTeaser 在 catalog 里 upsert 一个测试用的 drive 行，把 TeaserEnabled
 // 设为 enabled。teaser 入队判断现在按 per-drive 而不是全局 setting，所以涉及到

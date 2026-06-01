@@ -413,7 +413,7 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 			}
 			userCredKeys++
 		}
-		hasCred = userCredKeys > 0 || d.Kind == "spider91"
+		hasCred = userCredKeys > 0 || d.Kind == "spider91" || d.Kind == "spiderxvideos"
 
 		var lastCrawlAt int64
 		if d.Credentials != nil {

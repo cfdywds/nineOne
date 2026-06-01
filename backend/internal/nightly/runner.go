@@ -79,6 +79,13 @@ type Config struct {
 	// teaser enqueue) for a single spider91 drive.
 	RunSpider91Crawl func(ctx context.Context, driveID string)
 
+	// ListSpiderXVideosDrives returns spiderxvideos drive IDs to crawl in Phase 2.
+	ListSpiderXVideosDrives func(ctx context.Context) []string
+
+	// RunSpiderXVideosCrawl synchronously runs one crawl cycle for a single
+	// spiderxvideos drive.
+	RunSpiderXVideosCrawl func(ctx context.Context, driveID string)
+
 	// WaitPreviewQueuesIdle blocks until both the thumbnail and teaser queues
 	// across all drives are drained (queue empty + no in-flight task). It must
 	// honor ctx cancellation.
@@ -246,19 +253,35 @@ func (r *Runner) runPipeline(ctx context.Context) {
 	if r.cfg.ListSpider91Drives != nil {
 		spiderIDs = r.cfg.ListSpider91Drives(ctx)
 	}
-	if len(spiderIDs) == 0 {
-		log.Printf("[nightly] phase 2/3 skipped: no spider91 drive configured")
+	spiderXVideosIDs := []string{}
+	if r.cfg.ListSpiderXVideosDrives != nil {
+		spiderXVideosIDs = r.cfg.ListSpiderXVideosDrives(ctx)
+	}
+	if len(spiderIDs) == 0 && len(spiderXVideosIDs) == 0 {
+		log.Printf("[nightly] phase 2/3 skipped: no crawler drive configured")
 		r.runDedupeAssetCleanupPhase(ctx)
 		return
 	}
-	log.Printf("[nightly] phase 2: crawling %d spider91 drive(s)", len(spiderIDs))
+	log.Printf("[nightly] phase 2: crawling %d spider91 drive(s), %d spiderxvideos drive(s)", len(spiderIDs), len(spiderXVideosIDs))
 	for _, id := range spiderIDs {
 		if ctx.Err() != nil {
 			log.Printf("[nightly] phase 2 aborted by ctx: %v", ctx.Err())
 			return
 		}
 		log.Printf("[nightly] phase 2: crawling drive=%s", id)
-		r.cfg.RunSpider91Crawl(ctx, id)
+		if r.cfg.RunSpider91Crawl != nil {
+			r.cfg.RunSpider91Crawl(ctx, id)
+		}
+	}
+	for _, id := range spiderXVideosIDs {
+		if ctx.Err() != nil {
+			log.Printf("[nightly] phase 2 aborted by ctx: %v", ctx.Err())
+			return
+		}
+		log.Printf("[nightly] phase 2: crawling drive=%s", id)
+		if r.cfg.RunSpiderXVideosCrawl != nil {
+			r.cfg.RunSpiderXVideosCrawl(ctx, id)
+		}
 	}
 	log.Printf("[nightly] phase 2: waiting for teaser queue to drain")
 	if err := r.waitIdle(ctx, "phase 2"); err != nil {

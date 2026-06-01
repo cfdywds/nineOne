@@ -7,11 +7,22 @@ const drivesPageSource = readFileSync(
   "utf8"
 );
 
-test("spider91 drive form does not expose advanced crawler credentials", () => {
-  assert.doesNotMatch(drivesPageSource, /target_new/);
-  assert.doesNotMatch(drivesPageSource, /crawl_hour/);
-  assert.doesNotMatch(drivesPageSource, /python_path/);
-  assert.doesNotMatch(drivesPageSource, /script_path/);
+test("crawler drive forms expose managed crawler credentials", () => {
+  assert.match(drivesPageSource, /case "spider91":\s*return \[/);
+  assert.match(drivesPageSource, /key: "target_new"/);
+  assert.match(drivesPageSource, /key: "python_path"/);
+  assert.match(drivesPageSource, /key: "script_path"/);
+  assert.match(drivesPageSource, /case "spiderxvideos":\s*return \[/);
+  assert.match(drivesPageSource, /key: "keyword"/);
+  assert.match(drivesPageSource, /key: "start_url"/);
+  assert.match(drivesPageSource, /key: "min_size"/);
+  assert.match(drivesPageSource, /key: "max_size"/);
+  assert.match(drivesPageSource, /key: "min_duration"/);
+  assert.match(drivesPageSource, /key: "max_duration"/);
+  assert.match(drivesPageSource, /key: "merge_hls"/);
+  assert.match(drivesPageSource, /key: "quality"/);
+  assert.match(drivesPageSource, /key: "cookie"/);
+  assert.match(drivesPageSource, /Windows 默认 python，其他系统默认 python3/);
 });
 
 test("spider91 upload target uses explicit local-save option instead of auto target", () => {
@@ -27,7 +38,7 @@ test("spider91 upload target uses explicit local-save option instead of auto tar
 test("onedrive drive form only exposes required default-app fields", () => {
   assert.match(
     drivesPageSource,
-    /form\.kind !== "spider91" &&\s*form\.kind !== "onedrive" &&\s*form\.kind !== "localstorage" &&\s*form\.kind !== "pikpak"/
+    /!isSpiderCrawlerKind\(form\.kind\) &&\s*form\.kind !== "onedrive" &&\s*form\.kind !== "localstorage" &&\s*form\.kind !== "pikpak"/
   );
 
   const match =
@@ -75,6 +86,7 @@ test("localstorage drive form asks for a server directory path", () => {
   assert.match(fields, /key: "path"/);
   assert.match(fields, /label: "本地目录路径"/);
   assert.match(drivesPageSource, /if \(kind === "localstorage"\) return "\/"/);
+  assert.match(drivesPageSource, /if \(isSpiderCrawlerKind\(kind\)\) return "\/"/);
 });
 
 test("drive type selector keeps primary source order", () => {
@@ -82,7 +94,7 @@ test("drive type selector keeps primary source order", () => {
     drivesPageSource.matchAll(/<option value="([^"]+)">([^<]+)<\/option>/g),
     (match) => ({ value: match[1], label: match[2] })
   );
-  const driveOptions = options.slice(0, 7);
+  const driveOptions = options.slice(0, 8);
 
   assert.deepEqual(driveOptions, [
     { value: "p115", label: "115 网盘" },
@@ -90,6 +102,7 @@ test("drive type selector keeps primary source order", () => {
     { value: "onedrive", label: "OneDrive" },
     { value: "localstorage", label: "本地存储" },
     { value: "spider91", label: "91 Spider" },
+    { value: "spiderxvideos", label: "XVideos Spider" },
     { value: "quark", label: "夸克网盘" },
     { value: "wopan", label: "联通沃盘" },
   ]);
