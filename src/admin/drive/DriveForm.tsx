@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useId, useMemo } from "react";
 import { P123QRCodeLogin } from "./P123QRCodeLogin";
 import { Spider91UploadTargetField } from "./Spider91UploadTargetField";
 import {
@@ -17,14 +17,22 @@ export function DriveForm({
   onChange,
   isEdit,
   uploadTargets,
+  nameError,
+  onNameBlur,
 }: {
   form: FormState;
   onChange: (f: FormState) => void;
   isEdit: boolean;
   uploadTargets: api.AdminDrive[];
+  nameError?: string;
+  onNameBlur?: () => void;
 }) {
+  const idPrefix = useId();
   const fields = useMemo(() => credentialFields(form.kind), [form.kind]);
   const help = credentialHelp(form.kind, isEdit);
+  const nameId = `${idPrefix}-drive-name`;
+  const kindId = `${idPrefix}-drive-kind`;
+  const rootId = `${idPrefix}-drive-root`;
 
   function set<K extends keyof FormState>(k: K, v: FormState[K]) {
     onChange({ ...form, [k]: v });
@@ -44,16 +52,27 @@ export function DriveForm({
   return (
     <div className="admin-form">
       <div className="admin-form__row">
-        <label>名称 *</label>
+        <label htmlFor={nameId}>名称 *</label>
         <input
+          id={nameId}
           value={form.name}
           onChange={(e) => set("name", e.target.value)}
+          onBlur={onNameBlur}
           placeholder="给这个盘起个名字"
+          className={nameError ? "is-invalid" : undefined}
+          aria-invalid={nameError ? "true" : undefined}
+          aria-describedby={nameError ? `${nameId}-error` : undefined}
         />
+        {nameError && (
+          <div className="admin-form__error" id={`${nameId}-error`}>
+            {nameError}
+          </div>
+        )}
       </div>
       <div className="admin-form__row">
-        <label>类型</label>
+        <label htmlFor={kindId}>类型</label>
         <select
+          id={kindId}
           value={form.kind}
           onChange={(e) => setKind(e.target.value as Kind)}
           disabled={isEdit}
@@ -72,8 +91,9 @@ export function DriveForm({
       </div>
       {usesRootDirectoryID(form.kind) && (
         <div className="admin-form__row">
-          <label>根目录 ID</label>
+          <label htmlFor={rootId}>根目录 ID</label>
           <input
+            id={rootId}
             value={form.rootId}
             onChange={(e) => set("rootId", e.target.value)}
             placeholder={rootIdPlaceholder(form.kind)}
@@ -100,15 +120,20 @@ export function DriveForm({
 
           {fields.map((f) => (
             <div key={f.key} className="admin-form__row">
-              <label>{f.label}{f.required && " *"}</label>
+              <label htmlFor={`${idPrefix}-credential-${f.key}`}>
+                {f.label}{f.required && " *"}
+              </label>
               {f.multiline ? (
                 <textarea
+                  id={`${idPrefix}-credential-${f.key}`}
                   value={form.creds[f.key] ?? ""}
                   onChange={(e) => setCred(f.key, e.target.value)}
                   placeholder={f.placeholder}
                 />
               ) : (
                 <input
+                  id={`${idPrefix}-credential-${f.key}`}
+                  type={credentialInputType(f.key)}
                   value={form.creds[f.key] ?? ""}
                   onChange={(e) => setCred(f.key, e.target.value)}
                   placeholder={f.placeholder}
@@ -132,4 +157,8 @@ export function DriveForm({
       )}
     </div>
   );
+}
+
+function credentialInputType(key: string): string {
+  return /password|token|secret/i.test(key) ? "password" : "text";
 }

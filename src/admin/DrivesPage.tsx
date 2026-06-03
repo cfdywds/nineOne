@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   ChevronRight,
@@ -13,6 +13,7 @@ import {
 import * as api from "./api";
 import { useToast } from "./ToastContext";
 import { Modal } from "./Modal";
+import { ConfirmModal } from "./ConfirmModal";
 import { formatBytes } from "./storageFormat";
 import { makeUniqueDriveId } from "./driveId";
 import {
@@ -43,9 +44,13 @@ export function DrivesPage() {
   const [nightlyStatus, setNightlyStatus] =
     useState<api.NightlyJobStatus>(idleNightlyStatus);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
   const [modalOpen, setModalOpen] = useState(false);
+  const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<api.AdminDrive | null>(null);
   const [form, setForm] = useState<FormState>(emptyForm);
+  const [initialForm, setInitialForm] = useState<FormState>(emptyForm);
+  const [nameTouched, setNameTouched] = useState(false);
   const [saving, setSaving] = useState(false);
   const [deletingId, setDeletingId] = useState("");
   const [regenFailedId, setRegenFailedId] = useState("");
@@ -53,9 +58,15 @@ export function DrivesPage() {
   const [regenFailedFingerprintId, setRegenFailedFingerprintId] = useState("");
   const [togglingTeaserId, setTogglingTeaserId] = useState("");
   const [scanningAll, setScanningAll] = useState(false);
+  const [trackingNightly, setTrackingNightly] = useState(false);
+  const [scanningDriveId, setScanningDriveId] = useState("");
   const [selectedDriveId, setSelectedDriveId] = useState<string | null>(null);
   const { show } = useToast();
+  const pollConnectionLost = useRef(false);
   const nightlyBusy = scanningAll || nightlyStatus.running || nightlyStatus.queued;
+  const nameMissing = form.name.trim().length === 0;
+  const nameError = nameTouched && nameMissing ? "请填写网盘名称" : "";
+  const formDirty = !sameForm(form, initialForm);
 
   const uploadTargets = useMemo(
     () => list.filter((d) => d.kind === "pikpak" || d.kind === "p115" || d.kind === "onedrive"),
@@ -64,6 +75,7 @@ export function DrivesPage() {
 
   async function refresh() {
     setLoading(true);
+    setLoadError("");
     try {
       const [data, storageData, settingsData, jobStatus] = await Promise.all([
         api.listDrives(),
@@ -76,7 +88,9 @@ export function DrivesPage() {
       if (settingsData) setSettings(settingsData);
       if (jobStatus) setNightlyStatus(jobStatus);
     } catch (e) {
-      show(e instanceof Error ? e.message : "加载失败", "error");
+      const message = e instanceof Error ? e.message : "加载失败";
+      setLoadError(message);
+      show(message, "error");
     } finally {
       setLoading(false);
     }
@@ -90,43 +104,93 @@ export function DrivesPage() {
       ]);
       setList(data ?? []);
       if (jobStatus) setNightlyStatus(jobStatus);
+      if (pollConnectionLost.current) {
+        pollConnectionLost.current = false;
+        show("连接已恢复，网盘数据已更新", "success");
+      }
     } catch {
+      if (!pollConnectionLost.current) {
+        pollConnectionLost.current = true;
+        show("连接中断，网盘数据可能不是最新", "error");
+      }
     }
   }
 
   useEffect(() => {
     refresh();
+  }, []);
+
+  useEffect(() => {
     const timer = window.setInterval(() => {
-      if (!document.hidden) {
+      if (!document.hidden && !modalOpen) {
         refreshDriveList();
       }
     }, 5000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [modalOpen]);
+
+  useEffect(() => {
+    if (!trackingNightly) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const status = await api.getNightlyJobStatus();
+        setNightlyStatus(status);
+        if (status.running || (!status.queued && !status.running)) {
+          setTrackingNightly(false);
+        }
+      } catch {
+        // The normal drive polling already reports connection loss.
+      }
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [trackingNightly]);
 
   function openCreate() {
-    setForm({
+    const nextForm = {
       ...emptyForm,
       spider91UploadDriveId: settings?.spider91UploadDriveId ?? "",
-    });
+    };
+    setForm(nextForm);
+    setInitialForm(nextForm);
+    setNameTouched(false);
     setModalOpen(true);
   }
 
   function openEdit(d: api.AdminDrive) {
-    setForm({
+    const nextForm: FormState = {
       id: d.id,
       kind: d.kind,
       name: d.name,
       rootId: d.rootId,
       creds: d.kind === "spider91" ? { proxy: d.spider91Proxy ?? "" } : {},
       spider91UploadDriveId: settings?.spider91UploadDriveId ?? "",
-    });
+    };
+    setForm(nextForm);
+    setInitialForm(nextForm);
+    setNameTouched(false);
     setModalOpen(true);
+  }
+
+  function requestCloseDriveModal() {
+    if (saving) return;
+    if (formDirty) {
+      setDiscardConfirmOpen(true);
+      return;
+    }
+    setModalOpen(false);
+  }
+
+  function discardDriveChanges() {
+    setDiscardConfirmOpen(false);
+    setModalOpen(false);
+    setForm(initialForm);
+    setNameTouched(false);
   }
 
   async function handleSave() {
     const name = form.name.trim();
     if (!name || !form.kind) {
+      setNameTouched(true);
       show("请填名称和类型", "error");
       return;
     }
@@ -161,6 +225,7 @@ export function DrivesPage() {
             "error"
           );
           setModalOpen(false);
+          setInitialForm(form);
           refresh();
           return;
         }
@@ -172,6 +237,7 @@ export function DrivesPage() {
         show("已保存", "success");
       }
       setModalOpen(false);
+      setInitialForm(form);
       refresh();
     } catch (e) {
       show(e instanceof Error ? e.message : "保存失败", "error");
@@ -200,6 +266,8 @@ export function DrivesPage() {
   }
 
   async function handleRescan(d: api.AdminDrive) {
+    if (scanningDriveId) return;
+    setScanningDriveId(d.id);
     try {
       await api.rescan(d.id);
       if (isSpiderCrawlerKind(d.kind)) {
@@ -209,6 +277,8 @@ export function DrivesPage() {
       }
     } catch (e) {
       show(e instanceof Error ? e.message : "触发失败", "error");
+    } finally {
+      setScanningDriveId("");
     }
   }
 
@@ -222,6 +292,7 @@ export function DrivesPage() {
       const resp = await api.runNightlyJob();
       setNightlyStatus(resp.status);
       if (resp.accepted) {
+        setTrackingNightly(!resp.status.running);
         show("已触发扫描所有网盘，耗时较长，可在任务状态和 backend 日志观察进度", "success");
       } else {
         show("当前已有扫描所有网盘任务", "info");
@@ -379,21 +450,28 @@ export function DrivesPage() {
               </div>
 
               <div className="admin-detail-actions">
-                <button className="admin-btn is-primary" onClick={() => handleRescan(d)}>
+                <button
+                  type="button"
+                  className="admin-btn is-primary"
+                  onClick={() => handleRescan(d)}
+                  disabled={!!scanningDriveId}
+                >
                   {isSpiderCrawlerKind(d.kind) ? (
                     <>
-                      <Download size={13} /> 立即抓取
+                      <Download size={13} className={scanningDriveId === d.id ? "admin-spin" : undefined} />
+                      {scanningDriveId === d.id ? "触发中..." : "立即抓取"}
                     </>
                   ) : (
                     <>
-                      <RefreshCw size={13} /> 立即重扫
+                      <RefreshCw size={13} className={scanningDriveId === d.id ? "admin-spin" : undefined} />
+                      {scanningDriveId === d.id ? "触发中..." : "立即重扫"}
                     </>
                   )}
                 </button>
-                <button className="admin-btn" onClick={() => openEdit(d)}>
+                <button type="button" className="admin-btn" onClick={() => openEdit(d)}>
                   {isSpiderCrawlerKind(d.kind) ? "编辑配置" : "编辑配置凭证"}
                 </button>
-                <button className="admin-btn is-danger" onClick={() => setDeleteTarget(d)} style={{ marginLeft: "auto" }}>
+                <button type="button" className="admin-btn is-danger" onClick={() => setDeleteTarget(d)} style={{ marginLeft: "auto" }}>
                   <Trash2 size={13} /> 删除网盘
                 </button>
               </div>
@@ -458,16 +536,17 @@ export function DrivesPage() {
         <Modal
           open={modalOpen}
           title="编辑网盘"
-          onClose={() => setModalOpen(false)}
+          onClose={requestCloseDriveModal}
           footer={
             <>
-              <button className="admin-btn" onClick={() => setModalOpen(false)}>
+              <button type="button" className="admin-btn" onClick={requestCloseDriveModal}>
                 取消
               </button>
               <button
+                type="button"
                 className="admin-btn is-primary"
                 onClick={handleSave}
-                disabled={saving}
+                disabled={saving || nameMissing}
               >
                 {saving ? "保存中..." : "保存"}
               </button>
@@ -479,6 +558,8 @@ export function DrivesPage() {
             onChange={setForm}
             isEdit={true}
             uploadTargets={uploadTargets}
+            nameError={nameError}
+            onNameBlur={() => setNameTouched(true)}
           />
         </Modal>
         <DeleteDriveModal
@@ -490,6 +571,15 @@ export function DrivesPage() {
             }
           }}
           onConfirm={confirmDeleteDrive}
+        />
+        <ConfirmModal
+          open={discardConfirmOpen}
+          title="放弃未保存更改"
+          message="当前网盘配置有未保存的更改，确定要放弃吗？"
+          confirmText="放弃更改"
+          danger
+          onCancel={() => setDiscardConfirmOpen(false)}
+          onConfirm={discardDriveChanges}
         />
       </section>
     );
@@ -510,7 +600,7 @@ export function DrivesPage() {
           >
             <PlayCircle size={14} /> {nightlyButtonText(nightlyStatus, scanningAll)}
           </button>
-          <button className="admin-btn is-primary" onClick={openCreate}>
+          <button type="button" className="admin-btn is-primary" onClick={openCreate}>
             <Plus size={14} /> 新建网盘
           </button>
         </div>
@@ -520,6 +610,14 @@ export function DrivesPage() {
 
       {loading ? (
         <div className="admin-empty">加载中...</div>
+      ) : loadError ? (
+        <div className="admin-error-state">
+          <strong>网盘数据加载失败</strong>
+          <span>{loadError}</span>
+          <button type="button" className="admin-btn" onClick={refresh}>
+            <RefreshCw size={13} /> 重试
+          </button>
+        </div>
       ) : list.length === 0 ? (
         <div className="admin-card admin-empty">
           还没有配置任何网盘。点击右上角「新建」，选择夸克 / 115 / PikPak / 沃盘 / OneDrive / 本地存储，填入凭证或路径即可。
@@ -527,10 +625,12 @@ export function DrivesPage() {
       ) : (
         <div className="admin-drives-grid">
           {list.map((d) => (
-            <div
+            <button
+              type="button"
               key={d.id}
               className="admin-drive-card"
               onClick={() => setSelectedDriveId(d.id)}
+              aria-label={`管理网盘 ${d.name || d.id}`}
             >
               <div className="admin-drive-card__header">
                 <div className="admin-drive-card__title">
@@ -550,7 +650,7 @@ export function DrivesPage() {
                   管理 <ChevronRight size={14} />
                 </span>
               </div>
-            </div>
+            </button>
           ))}
         </div>
       )}
@@ -558,16 +658,17 @@ export function DrivesPage() {
       <Modal
         open={modalOpen}
         title={form.id && list.find((x) => x.id === form.id) ? "编辑网盘" : "新建网盘"}
-        onClose={() => setModalOpen(false)}
+        onClose={requestCloseDriveModal}
         footer={
           <>
-            <button className="admin-btn" onClick={() => setModalOpen(false)}>
+            <button type="button" className="admin-btn" onClick={requestCloseDriveModal}>
               取消
             </button>
             <button
+              type="button"
               className="admin-btn is-primary"
               onClick={handleSave}
-              disabled={saving}
+              disabled={saving || nameMissing}
             >
               {saving ? "保存中..." : "保存"}
             </button>
@@ -579,6 +680,8 @@ export function DrivesPage() {
           onChange={setForm}
           isEdit={!!list.find((x) => x.id === form.id)}
           uploadTargets={uploadTargets}
+          nameError={nameError}
+          onNameBlur={() => setNameTouched(true)}
         />
       </Modal>
       <DeleteDriveModal
@@ -591,6 +694,34 @@ export function DrivesPage() {
         }}
         onConfirm={confirmDeleteDrive}
       />
+      <ConfirmModal
+        open={discardConfirmOpen}
+        title="放弃未保存更改"
+        message="当前网盘配置有未保存的更改，确定要放弃吗？"
+        confirmText="放弃更改"
+        danger
+        onCancel={() => setDiscardConfirmOpen(false)}
+        onConfirm={discardDriveChanges}
+      />
     </section>
   );
+}
+
+function sameForm(a: FormState, b: FormState): boolean {
+  return (
+    a.id === b.id &&
+    a.kind === b.kind &&
+    a.name === b.name &&
+    a.rootId === b.rootId &&
+    a.spider91UploadDriveId === b.spider91UploadDriveId &&
+    sameRecord(a.creds, b.creds)
+  );
+}
+
+function sameRecord(a: Record<string, string>, b: Record<string, string>): boolean {
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const key of keys) {
+    if ((a[key] ?? "") !== (b[key] ?? "")) return false;
+  }
+  return true;
 }

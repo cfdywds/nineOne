@@ -1,3 +1,4 @@
+import { useId } from "react";
 import { kindLabel } from "./constants";
 import * as api from "../api";
 
@@ -10,10 +11,12 @@ export function Spider91UploadTargetField({
   onChange: (v: string) => void;
   uploadTargets: api.AdminDrive[];
 }) {
+  const targetId = useId();
+
   return (
     <div className="admin-form__row">
-      <label>视频上传目标</label>
-      <select value={value} onChange={(e) => onChange(e.target.value)}>
+      <label htmlFor={targetId}>视频上传目标</label>
+      <select id={targetId} value={value} onChange={(e) => onChange(e.target.value)}>
         <option value="">本地保存，不上传</option>
         {uploadTargets.map((d) => (
           <option key={d.id} value={d.id}>

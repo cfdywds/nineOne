@@ -16,6 +16,7 @@ export function LoginPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const { show } = useToast();
+  const passwordMismatch = setupRequired === true && p2.length > 0 && p !== p2;
 
   useEffect(() => {
     let active = true;
@@ -83,8 +84,9 @@ export function LoginPage() {
         </h1>
         <div className="admin-form">
           <div className="admin-form__row">
-            <label>用户名</label>
+            <label htmlFor="admin-login-username">用户名</label>
             <input
+              id="admin-login-username"
               autoFocus
               value={u}
               onChange={(e) => setU(e.target.value)}
@@ -92,8 +94,9 @@ export function LoginPage() {
             />
           </div>
           <div className="admin-form__row">
-            <label>密码</label>
+            <label htmlFor="admin-login-password">密码</label>
             <input
+              id="admin-login-password"
               type="password"
               value={p}
               onChange={(e) => setP(e.target.value)}
@@ -102,19 +105,28 @@ export function LoginPage() {
           </div>
           {setupRequired && (
             <div className="admin-form__row">
-              <label>确认密码</label>
+              <label htmlFor="admin-login-password-confirm">确认密码</label>
               <input
+                id="admin-login-password-confirm"
                 type="password"
                 value={p2}
                 onChange={(e) => setP2(e.target.value)}
                 autoComplete="new-password"
+                className={passwordMismatch ? "is-invalid" : undefined}
+                aria-invalid={passwordMismatch ? "true" : undefined}
+                aria-describedby={passwordMismatch ? "admin-login-password-confirm-error" : undefined}
               />
+              {passwordMismatch && (
+                <div className="admin-form__error" id="admin-login-password-confirm-error">
+                  密码不一致
+                </div>
+              )}
             </div>
           )}
           <button
             className="admin-btn is-primary"
             type="submit"
-            disabled={loading || !u || !p || (setupRequired && !p2)}
+            disabled={loading || !u || !p || (setupRequired && (!p2 || passwordMismatch))}
           >
             {loading
               ? setupRequired

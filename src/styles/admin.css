@@ -285,7 +285,8 @@
   gap: 6px;
 }
 
-.admin-form__row label {
+.admin-form__row label,
+.admin-form__label {
   font-size: var(--font-sm);
   font-weight: var(--weight-medium);
   color: var(--text-default);
@@ -315,6 +316,18 @@
   outline: none;
   border-color: var(--border-accent);
   box-shadow: 0 0 0 3px var(--accent-soft), 0 0 12px rgba(255, 138, 60, 0.15);
+}
+
+.admin-form__row input.is-invalid,
+.admin-form__row select.is-invalid,
+.admin-form__row textarea.is-invalid {
+  border-color: var(--danger);
+}
+
+.admin-form__error {
+  color: var(--danger);
+  font-size: var(--font-xs);
+  line-height: var(--line-relaxed);
 }
 
 .admin-form__row textarea {
@@ -409,6 +422,15 @@
   border-color: var(--border-strong);
   color: var(--text-strong);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.admin-btn:focus-visible,
+.admin-nav__link:focus-visible,
+.admin-sidebar__check-update:focus-visible,
+.admin-sidebar__logout:focus-visible,
+.admin-sidebar__mobile-menu:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .admin-btn:active:not(:disabled) {
@@ -653,6 +675,7 @@
  * ========================================================= */
 .admin-login {
   min-height: 100vh;
+  min-height: 100dvh;
   display: grid;
   place-items: center;
   background:
@@ -660,6 +683,7 @@
     radial-gradient(900px 500px at 10% 90%, rgba(120, 80, 200, 0.10), transparent 60%),
     var(--bg-page);
   padding: var(--space-4);
+  padding-bottom: calc(var(--space-4) + env(safe-area-inset-bottom));
 }
 
 .admin-login__card {
@@ -802,13 +826,66 @@
   line-height: 1.7;
 }
 
+.admin-confirm {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: start;
+}
+
+.admin-confirm__icon {
+  width: 42px;
+  height: 42px;
+  border-radius: var(--radius-sm);
+  display: grid;
+  place-items: center;
+  color: var(--warning);
+  background: var(--warning-soft);
+  border: 1px solid rgba(255, 184, 77, 0.34);
+}
+
+.admin-confirm__icon.is-danger {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: rgba(241, 85, 108, 0.34);
+}
+
+.admin-confirm__content {
+  min-width: 0;
+}
+
+.admin-confirm__message {
+  margin: 0 0 10px;
+  color: var(--text-strong);
+  font-size: var(--font-md);
+  font-weight: var(--weight-semibold);
+  line-height: var(--line-relaxed);
+}
+
+.admin-confirm__list {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-default);
+  font-size: var(--font-sm);
+  line-height: 1.7;
+}
+
 /* =========================================================
  * Toast
  * ========================================================= */
-.admin-toast {
+.admin-toast-stack {
   position: fixed;
-  bottom: 24px;
   right: 24px;
+  bottom: 24px;
+  z-index: var(--z-toast);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  pointer-events: none;
+}
+
+.admin-toast {
   padding: 12px 18px;
   background: var(--bg-elevated);
   color: var(--text-strong);
@@ -817,8 +894,8 @@
   font-size: var(--font-sm);
   font-weight: var(--weight-medium);
   box-shadow: var(--shadow-lg);
-  z-index: var(--z-toast);
   animation: toast-in var(--duration-normal) var(--ease-out);
+  pointer-events: auto;
 }
 
 @keyframes toast-in {
@@ -846,6 +923,49 @@
   text-align: center;
   color: var(--text-muted);
   font-size: var(--font-sm);
+}
+
+.admin-error-state {
+  display: grid;
+  justify-items: center;
+  gap: var(--space-2);
+  padding: var(--space-7);
+  text-align: center;
+  color: var(--text-muted);
+  font-size: var(--font-sm);
+  border: 1px solid rgba(241, 85, 108, 0.3);
+  border-radius: var(--radius-md);
+  background: var(--danger-soft);
+}
+
+.admin-error-state strong {
+  color: var(--danger);
+  font-size: var(--font-md);
+}
+
+.admin-spin {
+  animation: admin-update-spin 0.9s linear infinite;
+}
+
+.admin-table-checkbox-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.admin-table-checkbox-btn:hover,
+.admin-table-checkbox-btn:focus-visible {
+  background: var(--bg-elevated);
+  color: var(--text-strong);
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .admin-pills {
@@ -1352,10 +1472,14 @@
     flex: 1 1 auto;
   }
 
-  .admin-toast {
+  .admin-toast-stack {
     left: 16px;
     right: 16px;
     bottom: 16px;
+    align-items: stretch;
+  }
+
+  .admin-toast {
     text-align: center;
   }
 }
@@ -1913,6 +2037,10 @@
 }
 
 .admin-drive-card {
+  appearance: none;
+  width: 100%;
+  font: inherit;
+  text-align: left;
   background: var(--bg-surface);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
@@ -1926,9 +2054,15 @@
   position: relative;
 }
 
-.admin-drive-card:hover {
+.admin-drive-card:hover,
+.admin-drive-card:focus-visible {
   border-color: var(--border-accent);
   box-shadow: var(--shadow-md);
+  outline: none;
+}
+
+.admin-drive-card:focus-visible {
+  box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-md);
 }
 
 .admin-drive-card__header {
@@ -1942,9 +2076,17 @@
   display: flex;
   align-items: center;
   gap: 10px;
+  min-width: 0;
   font-size: var(--font-lg);
   font-weight: var(--weight-bold);
   color: var(--text-strong);
+}
+
+.admin-drive-card__title > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .admin-drive-card__brand-icon {
@@ -2063,6 +2205,8 @@
   display: flex;
   align-items: center;
   gap: var(--space-3);
+  min-width: 0;
+  max-width: 100%;
 }
 
 .admin-drive-detail__title {
@@ -2070,6 +2214,10 @@
   font-weight: var(--weight-bold);
   color: var(--text-strong);
   margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .admin-detail-card {
@@ -2245,6 +2393,9 @@
   padding: 3px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border-subtle);
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .admin-tags-filter-tab {
@@ -2256,6 +2407,7 @@
   font-weight: var(--weight-medium);
   color: var(--text-muted);
   cursor: pointer;
+  white-space: nowrap;
   transition: all var(--transition-fast);
 }
 
@@ -2297,6 +2449,11 @@
 .admin-tag-card.is-selectable {
   cursor: pointer;
   user-select: none;
+}
+
+.admin-tag-card.is-selectable:focus-within {
+  border-color: var(--border-accent);
+  box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-md);
 }
 
 .admin-tag-card.is-selected {
