@@ -337,11 +337,12 @@ export type AdminVideoList = {
   size: number;
 };
 
-export function listVideos(params: { driveId?: string; page?: number; size?: number } = {}) {
+export function listVideos(params: { driveId?: string; page?: number; size?: number; keyword?: string } = {}) {
   const qs = new URLSearchParams();
   if (params.driveId) qs.set("driveId", params.driveId);
   if (params.page) qs.set("page", String(params.page));
   if (params.size) qs.set("size", String(params.size));
+  if (params.keyword) qs.set("keyword", params.keyword);
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
   return request<AdminVideoList>(`/videos${suffix}`);
 }
