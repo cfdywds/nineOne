@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  AlertTriangle,
   ArrowLeft,
   ChevronDown,
   ChevronRight,
@@ -10,6 +11,7 @@ import {
   Plus,
   Power,
   PowerOff,
+  QrCode,
   RefreshCw,
   RotateCcw,
   Trash2,
@@ -23,9 +25,11 @@ import { makeUniqueDriveId } from "./driveId";
 const kindLabel: Record<string, string> = {
   quark: "夸克网盘",
   p115: "115 网盘",
+  p123: "123 云盘",
   pikpak: "PikPak",
   wopan: "联通沃盘",
   onedrive: "OneDrive",
+  googledrive: "Google Drive",
   localstorage: "本地存储",
   spider91: "91 爬虫",
   spiderxvideos: "XVideos 爬虫",
@@ -42,7 +46,6 @@ type FormState = {
   kind: Kind;
   name: string;
   rootId: string;
-  scanRootId: string;
   creds: Record<string, string>;
   /**
    * spider91 专用字段：把视频迁移到云盘的目标 drive ID。
@@ -59,8 +62,7 @@ const emptyForm: FormState = {
   id: "",
   kind: "p115",
   name: "",
-  rootId: "0",
-  scanRootId: "0",
+  rootId: "",
   creds: {},
   spider91UploadDriveId: "",
 };
@@ -69,22 +71,47 @@ function isSpiderCrawlerKind(kind: string): boolean {
   return kind === "spider91" || kind === "spiderxvideos";
 }
 
+const idleNightlyStatus: api.NightlyJobStatus = {
+  state: "idle",
+  running: false,
+  queued: false,
+};
+
+function nightlyButtonText(status: api.NightlyJobStatus, triggering: boolean) {
+  if (triggering) return "触发中...";
+  if (status.running) return "扫描运行中";
+  if (status.queued) return "扫描已排队";
+  return "扫描所有网盘";
+}
+
+function nightlyBusyText(status: api.NightlyJobStatus) {
+  if (status.running) return "扫描任务正在运行";
+  if (status.queued) return "扫描任务已排队";
+  return "";
+}
+
 export function DrivesPage() {
   const [list, setList] = useState<api.AdminDrive[]>([]);
   const [storage, setStorage] = useState<api.AdminDriveStorage | null>(null);
   const [settings, setSettings] = useState<api.Settings | null>(null);
+  const [nightlyStatus, setNightlyStatus] =
+    useState<api.NightlyJobStatus>(idleNightlyStatus);
   const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<api.AdminDrive | null>(null);
   const [form, setForm] = useState<FormState>(emptyForm);
   const [saving, setSaving] = useState(false);
+  const [deletingId, setDeletingId] = useState("");
   const [regenFailedId, setRegenFailedId] = useState("");
-  // 与 regenFailedId 并列：失败封面重新入队按钮的 disable 状态。两套独立按钮 →
-  // 两个 state 互不阻塞，避免操作 teaser 时锁住封面那条按钮（反之亦然）。
+  // 失败重试按钮各自维护 pending 状态，避免操作 teaser / 封面 / 指纹时互相锁住。
   const [regenFailedThumbId, setRegenFailedThumbId] = useState("");
+  const [regenFailedFingerprintId, setRegenFailedFingerprintId] = useState("");
   // togglingTeaserId 在请求未返回前禁用按钮，避免连点导致两次切换互相覆盖。
   const [togglingTeaserId, setTogglingTeaserId] = useState("");
+  const [scanningAll, setScanningAll] = useState(false);
   const [selectedDriveId, setSelectedDriveId] = useState<string | null>(null);
   const { show } = useToast();
+  const nightlyBusy = scanningAll || nightlyStatus.running || nightlyStatus.queued;
 
   // 当前系统中可作为 spider91 上传目标的 drive 列表（pikpak ∪ p115 ∪ onedrive）。
   // 用户保存 spider91 drive 时从这里挑一个；空表示本地保存不上传。
@@ -96,14 +123,16 @@ export function DrivesPage() {
   async function refresh() {
     setLoading(true);
     try {
-      const [data, storageData, settingsData] = await Promise.all([
+      const [data, storageData, settingsData, jobStatus] = await Promise.all([
         api.listDrives(),
         api.getDriveStorage(),
         api.getSettings().catch(() => null),
+        api.getNightlyJobStatus().catch(() => null),
       ]);
       setList(data ?? []);
       setStorage(storageData);
       if (settingsData) setSettings(settingsData);
+      if (jobStatus) setNightlyStatus(jobStatus);
     } catch (e) {
       show(e instanceof Error ? e.message : "加载失败", "error");
     } finally {
@@ -113,8 +142,12 @@ export function DrivesPage() {
 
   async function refreshDriveList() {
     try {
-      const data = await api.listDrives();
+      const [data, jobStatus] = await Promise.all([
+        api.listDrives(),
+        api.getNightlyJobStatus().catch(() => null),
+      ]);
       setList(data ?? []);
+      if (jobStatus) setNightlyStatus(jobStatus);
     } catch {
       // 保持当前页面状态，下一次轮询或手动操作再刷新。
     }
@@ -146,8 +179,7 @@ export function DrivesPage() {
       kind: d.kind,
       name: d.name,
       rootId: d.rootId,
-      scanRootId: d.scanRootId || d.rootId,
-      creds: {},
+      creds: d.kind === "spider91" ? { proxy: d.spider91Proxy ?? "" } : {},
       spider91UploadDriveId: settings?.spider91UploadDriveId ?? "",
     });
     setModalOpen(true);
@@ -163,6 +195,9 @@ export function DrivesPage() {
     const driveID = existing
       ? form.id
       : makeUniqueDriveId(form.kind, name, list);
+    const rootId = usesRootDirectoryID(form.kind)
+      ? form.rootId.trim() || defaultRootId(form.kind)
+      : defaultRootId(form.kind);
     // 若编辑且没有提供凭证，提示一下但仍允许保存（不改凭证）
     setSaving(true);
     try {
@@ -170,8 +205,7 @@ export function DrivesPage() {
         id: driveID,
         kind: form.kind,
         name,
-        rootId: form.rootId || defaultRootId(form.kind),
-        scanRootId: form.scanRootId || form.rootId || defaultRootId(form.kind),
+        rootId,
         credentials: form.creds,
       });
 
@@ -211,14 +245,22 @@ export function DrivesPage() {
     }
   }
 
-  async function handleDelete(d: api.AdminDrive) {
-    if (!window.confirm(`确定删除 ${d.name || d.id}？\n这会移除盘配置，但不会删除其中的视频元数据。`)) return;
+  async function confirmDeleteDrive() {
+    if (!deleteTarget) return;
+    const d = deleteTarget;
+    setDeletingId(d.id);
     try {
-      await api.deleteDrive(d.id);
-      show("已删除", "success");
+      const resp = await api.deleteDrive(d.id, { deleteVideos: true });
+      show(`已删除，并清理 ${resp.deletedVideos ?? 0} 个视频`, "success");
+      setDeleteTarget(null);
+      if (selectedDriveId === d.id) {
+        setSelectedDriveId(null);
+      }
       refresh();
     } catch (e) {
       show(e instanceof Error ? e.message : "删除失败", "error");
+    } finally {
+      setDeletingId("");
     }
   }
 
@@ -238,14 +280,26 @@ export function DrivesPage() {
   /**
    * 立即触发完整凌晨流水线（Phase1 扫所有云盘 → Phase2 spider91 爬虫 →
    * Phase3 spider91 → 云盘迁移）。后端立即返回 202；进度看 backend 日志。
-   * 如果当前已有流水线在跑，后端最多保留一个待触发请求，当前轮结束后再跑一轮。
+   * 如果当前已有流水线在跑或已排队，前端只提示，不再提交新任务。
    */
   async function handleRunNightly() {
+    if (nightlyBusy) {
+      show(nightlyBusyText(nightlyStatus) || "当前已有扫描所有网盘任务", "info");
+      return;
+    }
+    setScanningAll(true);
     try {
-      await api.runNightlyJob();
-      show("已触发扫描所有网盘，耗时较长，可在 backend 日志观察进度", "success");
+      const resp = await api.runNightlyJob();
+      setNightlyStatus(resp.status);
+      if (resp.accepted) {
+        show("已触发扫描所有网盘，耗时较长，可在任务状态和 backend 日志观察进度", "success");
+      } else {
+        show("当前已有扫描所有网盘任务", "info");
+      }
     } catch (e) {
       show(e instanceof Error ? e.message : "触发失败", "error");
+    } finally {
+      setScanningAll(false);
     }
   }
 
@@ -273,6 +327,19 @@ export function DrivesPage() {
       show(e instanceof Error ? e.message : "触发失败", "error");
     } finally {
       setRegenFailedThumbId("");
+    }
+  }
+
+  async function handleRegenFailedFingerprints(d: api.AdminDrive) {
+    setRegenFailedFingerprintId(d.id);
+    try {
+      await api.regenFailedFingerprints(d.id);
+      show("已触发失败指纹重新生成", "success");
+      refresh();
+    } catch (e) {
+      show(e instanceof Error ? e.message : "触发失败", "error");
+    } finally {
+      setRegenFailedFingerprintId("");
     }
   }
 
@@ -316,6 +383,19 @@ export function DrivesPage() {
   const selectedDrive = useMemo(() => {
     return selectedDriveId ? list.find((d) => d.id === selectedDriveId) : null;
   }, [selectedDriveId, list]);
+
+  const deleteModal = (
+    <DeleteDriveModal
+      drive={deleteTarget}
+      deleting={deletingId === deleteTarget?.id}
+      onCancel={() => {
+        if (!deletingId) {
+          setDeleteTarget(null);
+        }
+      }}
+      onConfirm={confirmDeleteDrive}
+    />
+  );
 
   if (selectedDriveId && selectedDrive) {
     const d = selectedDrive;
@@ -361,15 +441,11 @@ export function DrivesPage() {
                   <span className="admin-detail-label">网盘 ID</span>
                   <span className="admin-detail-value admin-mono-cell">{d.id}</span>
                 </div>
-                {!isSpiderCrawlerKind(d.kind) && (
+                {usesRootDirectoryID(d.kind) && (
                   <>
                     <div className="admin-detail-row">
                       <span className="admin-detail-label">根目录 ID</span>
                       <span className="admin-detail-value admin-mono-cell">{d.rootId}</span>
-                    </div>
-                    <div className="admin-detail-row">
-                      <span className="admin-detail-label">扫描起点 ID</span>
-                      <span className="admin-detail-value admin-mono-cell">{d.scanRootId || d.rootId}</span>
                     </div>
                   </>
                 )}
@@ -406,10 +482,7 @@ export function DrivesPage() {
                 <button className="admin-btn" onClick={() => openEdit(d)}>
                   {isSpiderCrawlerKind(d.kind) ? "编辑配置" : "编辑配置凭证"}
                 </button>
-                <button className="admin-btn is-danger" onClick={() => {
-                  handleDelete(d);
-                  setSelectedDriveId(null);
-                }} style={{ marginLeft: "auto" }}>
+                <button className="admin-btn is-danger" onClick={() => setDeleteTarget(d)} style={{ marginLeft: "auto" }}>
                   <Trash2 size={13} /> 删除网盘
                 </button>
               </div>
@@ -449,14 +522,14 @@ export function DrivesPage() {
                     style={{ padding: "4px 10px", fontSize: "11px" }}
                   >
                     {d.teaserEnabled ? <Power size={11} /> : <PowerOff size={11} />}
-                    <span>{d.teaserEnabled ? "Teaser: 开" : "Teaser: 关"}</span>
+                    <span>{d.teaserEnabled ? "预览视频生成：开" : "预览视频生成：关"}</span>
                   </button>
                 </div>
               </header>
 
               <div className="admin-detail-grid">
                 <div className="admin-detail-row">
-                  <span className="admin-detail-label">封面状态</span>
+                  <span className="admin-detail-label">封面生成状态</span>
                   <div className="admin-detail-value">
                     <GenerationStatusLine label="封面" status={d.thumbnailGenerationStatus} />
                   </div>
@@ -468,17 +541,18 @@ export function DrivesPage() {
                       ready={d.thumbnailReadyCount}
                       pending={d.thumbnailPendingCount}
                       failed={d.thumbnailFailedCount}
+                      durationPending={d.thumbnailDurationPendingCount}
                     />
                   </div>
                 </div>
                 <div className="admin-detail-row">
-                  <span className="admin-detail-label">Teaser 状态</span>
+                  <span className="admin-detail-label">预览视频生成状态</span>
                   <div className="admin-detail-value">
                     <GenerationStatusLine label="预览" status={d.previewGenerationStatus} />
                   </div>
                 </div>
                 <div className="admin-detail-row">
-                  <span className="admin-detail-label">Teaser 数量</span>
+                  <span className="admin-detail-label">预览视频数量</span>
                   <div className="admin-detail-value">
                     <GenerationCounts
                       ready={d.teaserReadyCount}
@@ -488,13 +562,13 @@ export function DrivesPage() {
                   </div>
                 </div>
                 <div className="admin-detail-row">
-                  <span className="admin-detail-label">指纹状态</span>
+                  <span className="admin-detail-label">视频指纹生成状态</span>
                   <div className="admin-detail-value">
                     <GenerationStatusLine label="指纹" status={d.fingerprintGenerationStatus} />
                   </div>
                 </div>
                 <div className="admin-detail-row">
-                  <span className="admin-detail-label">指纹数量</span>
+                  <span className="admin-detail-label">视频指纹数量</span>
                   <div className="admin-detail-value">
                     <GenerationCounts
                       ready={d.fingerprintReadyCount}
@@ -508,19 +582,30 @@ export function DrivesPage() {
               <div className="admin-detail-actions">
                 <button
                   className="admin-btn"
-                  disabled={(d.teaserFailedCount ?? 0) <= 0 || regenFailedId === d.id}
-                  onClick={() => handleRegenFailed(d)}
-                >
-                  <RotateCcw size={13} />
-                  <span>重试失败 Teaser</span>
-                </button>
-                <button
-                  className="admin-btn"
                   disabled={(d.thumbnailFailedCount ?? 0) <= 0 || regenFailedThumbId === d.id}
                   onClick={() => handleRegenFailedThumbnails(d)}
                 >
                   <RotateCcw size={13} />
                   <span>重试失败封面</span>
+                </button>
+                <button
+                  className="admin-btn"
+                  disabled={(d.teaserFailedCount ?? 0) <= 0 || regenFailedId === d.id}
+                  onClick={() => handleRegenFailed(d)}
+                >
+                  <RotateCcw size={13} />
+                  <span>重试失败预览视频</span>
+                </button>
+                <button
+                  className="admin-btn"
+                  disabled={
+                    (d.fingerprintFailedCount ?? 0) <= 0 ||
+                    regenFailedFingerprintId === d.id
+                  }
+                  onClick={() => handleRegenFailedFingerprints(d)}
+                >
+                  <RotateCcw size={13} />
+                  <span>重试失败指纹</span>
                 </button>
               </div>
             </div>
@@ -539,7 +624,7 @@ export function DrivesPage() {
                   <span className="admin-detail-value">{formatBytes(driveStorage?.thumbnailBytes ?? 0)}</span>
                 </div>
                 <div className="admin-detail-row">
-                  <span className="admin-detail-label">Teaser 占用</span>
+                  <span className="admin-detail-label">预览视频占用</span>
                   <span className="admin-detail-value">{formatBytes(driveStorage?.teaserBytes ?? 0)}</span>
                 </div>
                 <div className="admin-detail-row">
@@ -579,6 +664,7 @@ export function DrivesPage() {
             uploadTargets={uploadTargets}
           />
         </Modal>
+        {deleteModal}
       </section>
     );
   }
@@ -592,9 +678,10 @@ export function DrivesPage() {
             type="button"
             className="admin-btn"
             onClick={handleRunNightly}
-            title="立即扫描所有网盘。耗时较长，期间不要重复触发。"
+            disabled={scanningAll}
+            title={nightlyBusyText(nightlyStatus) || "立即扫描所有网盘。耗时较长，期间不要重复触发。"}
           >
-            <PlayCircle size={14} /> 扫描所有网盘
+            <PlayCircle size={14} /> {nightlyButtonText(nightlyStatus, scanningAll)}
           </button>
           <button className="admin-btn is-primary" onClick={openCreate}>
             <Plus size={14} /> 新建网盘
@@ -695,6 +782,7 @@ export function DrivesPage() {
           uploadTargets={uploadTargets}
         />
       </Modal>
+      {deleteModal}
     </section>
   );
 }
@@ -707,7 +795,7 @@ function StorageSummary({ storage }: { storage: api.AdminDriveStorage }) {
         <strong>{formatBytes(storage.thumbnailBytes)}</strong>
       </div>
       <div className="admin-storage-summary__metric">
-        <span>Teaser 占用</span>
+        <span>预览视频占用</span>
         <strong>{formatBytes(storage.teaserBytes)}</strong>
       </div>
       <div className="admin-storage-summary__metric">
@@ -726,10 +814,12 @@ function GenerationCounts({
   ready,
   pending,
   failed,
+  durationPending,
 }: {
   ready?: number;
   pending?: number;
   failed?: number;
+  durationPending?: number;
 }) {
   return (
     <div className="admin-generation-counts">
@@ -742,6 +832,11 @@ function GenerationCounts({
       <span className="admin-drive-teaser__metric is-failed">
         失败 {failed ?? 0}
       </span>
+      {(durationPending ?? 0) > 0 && (
+        <span className="admin-drive-teaser__metric">
+          待补时长 {durationPending}
+        </span>
+      )}
     </div>
   );
 }
@@ -757,7 +852,7 @@ function GenerationStatusLine({
   const queueLength = status?.queueLength ?? 0;
   const detail = generationDetail(status);
   const title = generationTitle(status, detail);
-  const countText = queueLength > 0 ? `${label === "封面" ? "剩余" : "队列"} ${queueLength}` : "";
+  const countText = queueLength > 0 ? `${label === "封面" ? "待处理" : "队列"} ${queueLength}` : "";
 
   return (
     <div className="admin-generation-row" title={title}>
@@ -855,6 +950,75 @@ function StatusTag({
   return <span className="admin-status">{status || "未连接"}</span>;
 }
 
+function DeleteDriveModal({
+  drive,
+  deleting,
+  onCancel,
+  onConfirm,
+}: {
+  drive: api.AdminDrive | null;
+  deleting: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const name = drive?.name || drive?.id || "";
+  const isSpider91 = drive?.kind === "spider91";
+  const isLocalStorage = drive?.kind === "localstorage";
+  const title = isSpider91 ? "删除 91Spider" : "删除存储";
+  const primaryText = deleting ? "删除中..." : "确认删除并清理";
+
+  return (
+    <Modal
+      open={!!drive}
+      title={title}
+      onClose={onCancel}
+      footer={
+        <>
+          <button className="admin-btn" onClick={onCancel} disabled={deleting}>
+            取消
+          </button>
+          <button className="admin-btn is-danger" onClick={onConfirm} disabled={deleting}>
+            <Trash2 size={13} />
+            {primaryText}
+          </button>
+        </>
+      }
+    >
+      <div className="admin-delete-confirm">
+        <div className="admin-delete-confirm__icon">
+          <AlertTriangle size={20} />
+        </div>
+        <div className="admin-delete-confirm__content">
+          <p className="admin-delete-confirm__title">
+            {isSpider91
+              ? `确定删除「${name}」吗？`
+              : `确定删除「${name}」并清理该存储的视频数据吗？`}
+          </p>
+          <p className="admin-delete-confirm__text">
+            取消或关闭此弹窗不会删除存储配置，也不会清理任何文件。
+          </p>
+          <ul className="admin-delete-confirm__list">
+            <li>删除该存储配置</li>
+            <li>删除数据库中的相关视频记录，网站首页、列表、标签页和详情页不再展示这些视频</li>
+            <li>删除本机保存的封面图和预览视频</li>
+            {isSpider91 && (
+              <li>删除通过 91Spider 爬取到的本机 91 视频文件</li>
+            )}
+            {isLocalStorage && (
+              <li>不会删除用户配置的本地目录中的原始视频文件</li>
+            )}
+          </ul>
+          {!isSpider91 && !isLocalStorage && (
+            <p className="admin-delete-confirm__text">
+              此操作只清理本项目生成和记录的数据，不会删除云盘上的原始视频文件。
+            </p>
+          )}
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 function DriveForm({
   form,
   onChange,
@@ -868,11 +1032,7 @@ function DriveForm({
 }) {
   const fields = useMemo(() => credentialFields(form.kind), [form.kind]);
   const help = credentialHelp(form.kind, isEdit);
-  const showDirectoryFields =
-    !isSpiderCrawlerKind(form.kind) &&
-    form.kind !== "onedrive" &&
-    form.kind !== "localstorage" &&
-    form.kind !== "pikpak";
+
 
   function set<K extends keyof FormState>(k: K, v: FormState[K]) {
     onChange({ ...form, [k]: v });
@@ -884,8 +1044,7 @@ function DriveForm({
     onChange({
       ...form,
       kind: v,
-      rootId: defaultRootId(v),
-      scanRootId: defaultRootId(v),
+      rootId: "",
       creds: {},
     });
   }
@@ -908,8 +1067,10 @@ function DriveForm({
           disabled={isEdit}
         >
           <option value="p115">115 网盘</option>
+          <option value="p123">123 云盘</option>
           <option value="pikpak">PikPak</option>
           <option value="onedrive">OneDrive</option>
+          <option value="googledrive">Google Drive</option>
           <option value="localstorage">本地存储</option>
           <option value="spider91">91 Spider</option>
           <option value="spiderxvideos">XVideos Spider</option>
@@ -917,28 +1078,18 @@ function DriveForm({
           <option value="wopan">联通沃盘</option>
         </select>
       </div>
-      {showDirectoryFields && (
-        <>
-          <div className="admin-form__row">
-            <label>根目录 ID</label>
-            <input
-              value={form.rootId}
-              onChange={(e) => set("rootId", e.target.value)}
-              placeholder={form.kind === "pikpak" ? "留空表示根目录" : form.kind === "onedrive" ? "root" : "0"}
-            />
+      {usesRootDirectoryID(form.kind) && (
+        <div className="admin-form__row">
+          <label>根目录 ID</label>
+          <input
+            value={form.rootId}
+            onChange={(e) => set("rootId", e.target.value)}
+            placeholder={rootIdPlaceholder(form.kind)}
+          />
+          <div className="admin-form__help">
+            留空时使用该网盘类型的默认根目录，具体目录ID获取方式请参考OpenList文档
           </div>
-          <div className="admin-form__row">
-            <label>扫描起点目录 ID</label>
-            <input
-              value={form.scanRootId}
-              onChange={(e) => set("scanRootId", e.target.value)}
-              placeholder="留空则使用根目录"
-            />
-            <div className="admin-form__help">
-              可以指定一个子目录作为视频库入口，避免扫描整个网盘
-            </div>
-          </div>
-        </>
+        </div>
       )}
 
       {(help || fields.length > 0) && (
@@ -949,6 +1100,12 @@ function DriveForm({
             <div className="admin-form__help admin-form__help--lead">
               {help}
             </div>
+          )}
+
+          {form.kind === "p123" && (
+            <P123QRCodeLogin
+              onToken={(token) => setCred("access_token", token)}
+            />
           )}
 
           {fields.map((f) => (
@@ -985,6 +1142,144 @@ function DriveForm({
       )}
     </div>
   );
+}
+
+function P123QRCodeLogin({ onToken }: { onToken: (token: string) => void }) {
+  const { show } = useToast();
+  const [session, setSession] = useState<api.P123QRSession | null>(null);
+  const [status, setStatus] = useState<api.P123QRStatus | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [pollingError, setPollingError] = useState("");
+  const [completed, setCompleted] = useState(false);
+
+  async function start() {
+    setStarting(true);
+    setPollingError("");
+    setCompleted(false);
+    setStatus(null);
+    try {
+      const next = await api.startP123QRLogin();
+      setSession(next);
+    } catch (e) {
+      setSession(null);
+      show(e instanceof Error ? e.message : "生成二维码失败", "error");
+    } finally {
+      setStarting(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!session || completed) return;
+    const activeSession = session;
+    let stopped = false;
+    let inFlight = false;
+    let timer: number | undefined;
+
+    async function poll() {
+      if (stopped || inFlight) return;
+      inFlight = true;
+      try {
+        const next = await api.getP123QRStatus(activeSession.uniID, activeSession.loginUuid);
+        if (stopped) return;
+        setStatus(next);
+        setPollingError("");
+        if (next.accessToken) {
+          stopped = true;
+          if (timer) window.clearInterval(timer);
+          setCompleted(true);
+          onToken(next.accessToken);
+          show("扫码成功，已填入 access_token，保存后生效", "success");
+          return;
+        }
+        if (next.loginStatus === 2 || next.loginStatus === 4) {
+          stopped = true;
+          if (timer) window.clearInterval(timer);
+        }
+      } catch (e) {
+        if (stopped) return;
+        setPollingError(e instanceof Error ? e.message : "查询扫码状态失败");
+      } finally {
+        inFlight = false;
+      }
+    }
+
+    poll();
+    timer = window.setInterval(poll, 1800);
+    return () => {
+      stopped = true;
+      if (timer) window.clearInterval(timer);
+    };
+  }, [session, completed, onToken, show]);
+
+  const statusText = completed
+    ? "已获取 token"
+    : pollingError || status?.statusText || (session ? "等待扫码" : "未生成二维码");
+  const statusClass = p123QRStatusClass(status, completed, pollingError);
+  const platform = status?.platformText ? ` · ${status.platformText}` : "";
+
+  return (
+    <div className="admin-form__row">
+      <label>扫码登录</label>
+      <div className="admin-p123-qr">
+        <div className="admin-p123-qr__actions">
+          <button
+            type="button"
+            className="admin-btn"
+            onClick={start}
+            disabled={starting}
+          >
+            <QrCode size={14} />
+            {starting ? "生成中..." : session ? "重新生成二维码" : "生成二维码"}
+          </button>
+          <span className={`admin-status ${statusClass}`}>
+            {statusText}
+            {platform}
+          </span>
+        </div>
+
+        {session && (
+          <div className="admin-p123-qr__body">
+            <img
+              className="admin-p123-qr__image"
+              src={session.qrImageDataUrl}
+              alt="123 云盘扫码登录二维码"
+            />
+            <div className="admin-p123-qr__meta">
+              <div className="admin-form__help">
+                使用微信或 123 云盘 App 扫码并确认登录；确认后系统会自动填入 access_token。
+              </div>
+              {session.expiresAt && (
+                <div className="admin-form__help">
+                  过期时间：{new Date(session.expiresAt).toLocaleTimeString("zh-CN", {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                    second: "2-digit",
+                  })}
+                </div>
+              )}
+              {(status?.loginStatus === 2 || status?.loginStatus === 4) && (
+                <div className="admin-form__help">
+                  当前二维码{status.loginStatus === 2 ? "已被拒绝" : "已过期"}，请重新生成。
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function p123QRStatusClass(
+  status: api.P123QRStatus | null,
+  completed: boolean,
+  error: string
+): string {
+  if (completed || status?.loginStatus === 3) return "is-ok";
+  if (error || status?.loginStatus === 2 || status?.loginStatus === 4) {
+    return "is-error";
+  }
+  return "is-pending";
 }
 
 /**
@@ -1031,16 +1326,20 @@ function credentialHelp(kind: Kind, isEdit: boolean): string {
       return `在 pan.quark.cn 登录后，F12 → Network → 任意请求 → Request Headers 里复制整段 Cookie 粘贴到下方。${note}`;
     case "p115":
       return `登录 115.com 后复制 Cookie，形如 "UID=...; CID=...; SEID=...; KID=..."。${note}`;
+    case "p123":
+      return `推荐使用扫码登录自动获取 access_token；账号密码登录被 123 云盘风控拦截时，也可以只填写 access_token。播放走 302 跳转到 123 云盘返回的短期 CDN 地址。${note}`;
     case "pikpak":
       return `填写 PikPak 账号和密码即可。平台、设备 ID、验证码 token 和 refresh token 会由服务端自动处理并保存。${note}`;
     case "wopan":
       return `需要 access_token 和 refresh_token。后续会加扫码/短信登录入口，第一版只能手工粘贴。${note}`;
     case "onedrive":
       return `按 OpenList 默认应用在线挂载，只需要 refresh_token；保存时会自动刷新并保存 token。${note}`;
+    case "googledrive":
+      return `按 OpenList 在线 API 挂载，只需要 Google Drive refresh_token；保存时会自动刷新并保存 token。播放不走 302，会由后端带 Authorization 代理转发。${note}`;
     case "localstorage":
       return `把服务器上的一个已有目录作为视频来源扫描。填写绝对路径，例如 /mnt/videos；系统会读取该目录及子目录中的视频，并生成封面、Teaser 和指纹。${note}`;
     case "spider91":
-      return "91 爬虫会把定时抓取到的视频和封面先保存到本机，并作为一个视频来源接入站点；它不是外部网盘，不需要填写 Cookie 或目录 ID。后续流水线会把较早的视频上传到你选择的 115 / PikPak / OneDrive 目标盘。";
+      return "91 爬虫会把定时抓取到的视频和封面先保存到本机，并作为一个视频来源接入站点；可配置每轮新增数量、代理、Python 和脚本路径。后续流水线会把较早的视频上传到你选择的 115 / PikPak / OneDrive 目标盘。";
     case "spiderxvideos":
       return "XVideos 爬虫会按起始 URL 定时抓取视频和封面，先保存到本机并作为视频来源接入站点；可配置 Cookie、代理、清晰度和每轮新增数量。后续流水线会把较早的视频上传到你选择的 115 / PikPak / OneDrive 目标盘。";
     default:
@@ -1075,6 +1374,26 @@ function credentialFields(kind: Kind): Array<{
           placeholder: "UID=xxx; CID=xxx; SEID=xxx; KID=xxx",
           multiline: true,
           required: true,
+        },
+      ];
+    case "p123":
+      return [
+        {
+          key: "username",
+          label: "用户名 / 邮箱（可选）",
+          placeholder: "user@example.com",
+        },
+        {
+          key: "password",
+          label: "密码（可选）",
+          placeholder: "123 云盘密码",
+        },
+        {
+          key: "access_token",
+          label: "access_token（推荐用于风控场景）",
+          placeholder: "Bearer eyJ... 或直接粘贴 token",
+          multiline: true,
+          help: "扫码成功后会自动填入该字段；如果 token 过期，重新扫码后保存即可。",
         },
       ];
     case "pikpak":
@@ -1122,6 +1441,16 @@ function credentialFields(kind: Kind): Array<{
           required: true,
         },
       ];
+    case "googledrive":
+      return [
+        {
+          key: "refresh_token",
+          label: "refresh_token",
+          placeholder: "OpenList Google Drive refresh_token",
+          multiline: true,
+          required: true,
+        },
+      ];
     case "localstorage":
       return [
         {
@@ -1143,10 +1472,10 @@ function credentialFields(kind: Kind): Array<{
         },
         {
           key: "proxy",
-          label: "代理 URL",
+          label: "代理地址（可选）",
           placeholder: "http://127.0.0.1:7890",
           required: false,
-          help: "可选；为空时后端使用 HTTPS_PROXY / HTTP_PROXY 环境变量。",
+          help: "仅用于 91Spider 的列表/详情请求和视频、封面下载；留空则使用服务器环境变量 HTTP_PROXY / HTTPS_PROXY 或直连。支持 http://、https://、socks5:// 或 socks5h://。",
         },
         {
           key: "python_path",
@@ -1163,74 +1492,74 @@ function credentialFields(kind: Kind): Array<{
           help: "可选；为空时后端自动查找内置脚本。",
         },
       ];
-        case "spiderxvideos":
-          return [
-            {
-              key: "keyword",
-              label: "关键词",
-              placeholder: "keyword",
-              required: false,
-              help: "可选；为空时使用起始 URL 或首页。",
-            },
-            {
-              key: "start_url",
-              label: "起始 URL",
-              placeholder: "https://www.xvideos.com/",
-              required: false,
-              help: "首页、搜索页或分类页 URL；为空默认首页。",
-            },
-            {
-              key: "min_size",
-              label: "最小文件大小",
-              placeholder: "500MB",
-              required: false,
-              help: "可选；支持字节、KB、MB、GB。",
-            },
-            {
-              key: "max_size",
-              label: "最大文件大小",
-              placeholder: "2GB",
-              required: false,
-              help: "可选；支持字节、KB、MB、GB。",
-            },
-            {
-              key: "min_duration",
-              label: "最小时长",
-              placeholder: "01:00",
-              required: false,
-              help: "可选；支持秒数或 mm:ss / hh:mm:ss。",
-            },
-            {
-              key: "max_duration",
-              label: "最大时长",
-              placeholder: "10:00",
-              required: false,
-              help: "可选；支持秒数或 mm:ss / hh:mm:ss。",
-            },
-            {
-              key: "target_new",
-              label: "每轮新增数量",
-              placeholder: "15",
-              required: false,
-              help: "立即抓取或凌晨任务每轮最多新增多少个视频；为空默认 15。",
-            },
-            {
-              key: "quality",
-              label: "清晰度",
-              placeholder: "best",
-              required: false,
-              help: "best / hd / high / low / hls；默认 best。开启 merge_hls 时可合并 HLS。",
-            },
-            {
-              key: "merge_hls",
-              label: "合并 HLS",
-              placeholder: "true",
-              required: false,
-              help: "可选；填 true/1/yes 时使用 ffmpeg 合并 HLS 分片。",
-            },
-            {
-              key: "proxy",
-              label: "代理 URL",
+    case "spiderxvideos":
+      return [
+        {
+          key: "keyword",
+          label: "关键词",
+          placeholder: "keyword",
+          required: false,
+          help: "可选；为空时使用起始 URL 或首页。",
+        },
+        {
+          key: "start_url",
+          label: "起始 URL",
+          placeholder: "https://www.xvideos.com/",
+          required: false,
+          help: "首页、搜索页或分类页 URL；为空默认首页。",
+        },
+        {
+          key: "min_size",
+          label: "最小文件大小",
+          placeholder: "500MB",
+          required: false,
+          help: "可选；支持字节、KB、MB、GB。",
+        },
+        {
+          key: "max_size",
+          label: "最大文件大小",
+          placeholder: "2GB",
+          required: false,
+          help: "可选；支持字节、KB、MB、GB。",
+        },
+        {
+          key: "min_duration",
+          label: "最小时长",
+          placeholder: "01:00",
+          required: false,
+          help: "可选；支持秒数或 mm:ss / hh:mm:ss。",
+        },
+        {
+          key: "max_duration",
+          label: "最大时长",
+          placeholder: "10:00",
+          required: false,
+          help: "可选；支持秒数或 mm:ss / hh:mm:ss。",
+        },
+        {
+          key: "target_new",
+          label: "每轮新增数量",
+          placeholder: "15",
+          required: false,
+          help: "立即抓取或凌晨任务每轮最多新增多少个视频；为空默认 15。",
+        },
+        {
+          key: "quality",
+          label: "清晰度",
+          placeholder: "best",
+          required: false,
+          help: "best / hd / high / low / hls；默认 best。开启 merge_hls 时可合并 HLS。",
+        },
+        {
+          key: "merge_hls",
+          label: "合并 HLS",
+          placeholder: "true",
+          required: false,
+          help: "可选；填 true/1/yes 时使用 ffmpeg 合并 HLS 分片。",
+        },
+        {
+          key: "proxy",
+          label: "代理地址（可选）",
           placeholder: "http://127.0.0.1:7890",
           required: false,
           help: "可选；为空时后端使用 HTTPS_PROXY / HTTP_PROXY 环境变量。",
@@ -1264,9 +1593,19 @@ function credentialFields(kind: Kind): Array<{
 function defaultRootId(kind: Kind): string {
   if (kind === "pikpak") return "";
   if (kind === "onedrive") return "root";
+  if (kind === "googledrive") return "root";
   if (kind === "localstorage") return "/";
   if (isSpiderCrawlerKind(kind)) return "/";
   return "0";
+}
+
+function usesRootDirectoryID(kind: Kind): boolean {
+  return kind !== "localstorage" && !isSpiderCrawlerKind(kind);
+}
+
+function rootIdPlaceholder(kind: Kind): string {
+  const rootId = defaultRootId(kind);
+  return rootId ? `默认：${rootId}` : "留空表示根目录";
 }
 
 
@@ -1397,7 +1736,7 @@ function SelectedDirsChips({
         className="admin-text-faint"
         style={{ fontSize: "13px", padding: "6px 0" }}
       >
-        当前未勾选任何跳过目录（{drive.kind === "p115" ? "115 网盘" : drive.kind}{" "}
+        当前未勾选任何跳过目录（{kindLabel[drive.kind] ?? drive.kind}{" "}
         将完整扫描）。
       </div>
     );

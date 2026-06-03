@@ -77,10 +77,19 @@ export function checkUpdate() {
 
 export type AdminDrive = {
   id: string;
-  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "localstorage" | "spider91" | "spiderxvideos";
+  kind:
+    | "quark"
+    | "p115"
+    | "p123"
+    | "pikpak"
+    | "wopan"
+    | "onedrive"
+    | "googledrive"
+    | "localstorage"
+    | "spider91"
+    | "spiderxvideos";
   name: string;
   rootId: string;
-  scanRootId: string;
   status: string;
   lastError?: string;
   hasCredential: boolean;
@@ -94,12 +103,15 @@ export type AdminDrive = {
   skipDirIds: string[];
   // spider91 上次成功爬取时间（unix 秒）；其它 kind 留空。
   lastCrawlAt?: number;
+  // spider91 专用代理地址；仅后台管理接口返回，用于编辑表单回显。
+  spider91Proxy?: string;
   thumbnailGenerationStatus?: DriveGenerationStatus;
   previewGenerationStatus?: DriveGenerationStatus;
   fingerprintGenerationStatus?: DriveGenerationStatus;
   thumbnailReadyCount: number;
   thumbnailPendingCount: number;
   thumbnailFailedCount: number;
+  thumbnailDurationPendingCount: number;
   teaserReadyCount: number;
   teaserPendingCount: number;
   teaserFailedCount: number;
@@ -137,10 +149,19 @@ export function getDriveStorage() {
 
 export type UpsertDriveInput = {
   id: string;
-  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "localstorage" | "spider91" | "spiderxvideos";
+  kind:
+    | "quark"
+    | "p115"
+    | "p123"
+    | "pikpak"
+    | "wopan"
+    | "onedrive"
+    | "googledrive"
+    | "localstorage"
+    | "spider91"
+    | "spiderxvideos";
   name: string;
   rootId: string;
-  scanRootId: string;
   credentials: Record<string, string>;
   /**
    * 可选：写入"扫描跳过目录"集合。`undefined` 表示不变（沿用服务端旧值），
@@ -157,9 +178,14 @@ export function upsertDrive(body: UpsertDriveInput) {
   });
 }
 
-export function deleteDrive(id: string) {
-  return request<{ ok: boolean }>(`/drives/${encodeURIComponent(id)}`, {
+export type DeleteDriveInput = {
+  deleteVideos: true;
+};
+
+export function deleteDrive(id: string, body: DeleteDriveInput) {
+  return request<{ ok: boolean; deletedVideos: number }>(`/drives/${encodeURIComponent(id)}`, {
     method: "DELETE",
+    body: JSON.stringify(body),
   });
 }
 
@@ -167,6 +193,33 @@ export function rescan(id: string) {
   return request<{ ok: boolean }>(
     `/drives/${encodeURIComponent(id)}/rescan`,
     { method: "POST" }
+  );
+}
+
+export type P123QRSession = {
+  loginUuid: string;
+  uniID: string;
+  qrCodeUrl: string;
+  qrImageDataUrl: string;
+  expiresAt?: string;
+};
+
+export type P123QRStatus = {
+  loginStatus: number;
+  statusText: string;
+  scanPlatform?: number;
+  platformText?: string;
+  accessToken?: string;
+};
+
+export function startP123QRLogin() {
+  return request<P123QRSession>("/drives/p123/qr", { method: "POST" });
+}
+
+export function getP123QRStatus(uniID: string, loginUuid: string) {
+  const qs = new URLSearchParams({ loginUuid });
+  return request<P123QRStatus>(
+    `/drives/p123/qr/${encodeURIComponent(uniID)}?${qs.toString()}`
   );
 }
 
@@ -240,6 +293,13 @@ export function regenFailedPreviews(id: string) {
 export function regenFailedThumbnails(id: string) {
   return request<{ ok: boolean }>(
     `/drives/${encodeURIComponent(id)}/thumbnails/failed/regenerate`,
+    { method: "POST" }
+  );
+}
+
+export function regenFailedFingerprints(id: string) {
+  return request<{ ok: boolean }>(
+    `/drives/${encodeURIComponent(id)}/fingerprints/failed/regenerate`,
     { method: "POST" }
   );
 }
@@ -333,6 +393,13 @@ export function createTag(label: string, aliases: string[]) {
   });
 }
 
+export function deleteTag(id: number) {
+  return request<{ ok: boolean; removedVideos: number }>(
+    `/tags/${encodeURIComponent(String(id))}`,
+    { method: "DELETE" }
+  );
+}
+
 // ---------- Settings ----------
 
 export type Theme = "dark" | "pink";
@@ -369,10 +436,25 @@ export function updateSettings(body: Partial<Settings>) {
 
 /**
  * 立即触发一次完整的凌晨流水线（Phase1 扫盘 + Phase2 91 爬虫 + Phase3 迁移），
- * 不论当前时间或今日是否已跑。立即返回 202；进度通过 backend 日志观察。
+ * 不论当前时间或今日是否已跑。立即返回 202；进度通过任务状态和 backend 日志观察。
  *
- * 流水线已在跑时后端最多保留一个待触发请求；已有待触发请求时，新的点击会被忽略。
+ * 流水线已在跑或已排队时，后端会拒绝重复触发。
  */
+export type NightlyJobStatus = {
+  state: "idle" | "queued" | "running" | "running_queued";
+  running: boolean;
+  queued: boolean;
+  startedAt?: string;
+  lastFinishedAt?: string;
+};
+
+export function getNightlyJobStatus() {
+  return request<NightlyJobStatus>("/jobs/nightly/status");
+}
+
 export function runNightlyJob() {
-  return request<{ ok: boolean }>("/jobs/nightly/run", { method: "POST" });
+  return request<{ ok: boolean; accepted: boolean; status: NightlyJobStatus }>(
+    "/jobs/nightly/run",
+    { method: "POST" }
+  );
 }
