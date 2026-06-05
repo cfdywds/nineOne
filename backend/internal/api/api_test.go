@@ -17,6 +17,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/video-site/backend/internal/catalog"
+	"github.com/video-site/backend/internal/mediaasset"
 	"github.com/video-site/backend/internal/proxy"
 )
 
@@ -236,6 +237,63 @@ func TestHandleHomeExcludesRecentlyShownVideos(t *testing.T) {
 		}
 		if !strings.HasPrefix(item.ID, "ready-video-") {
 			t.Fatalf("home returned %q without a ready thumbnail; items=%#v", item.ID, got)
+		}
+	}
+}
+
+func TestHandleHomeStartsNewRoundWhenRecentExcludesAllVisibleVideos(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	excludes := make([]string, 0, homePageSize+2)
+	for i := 0; i < homePageSize+2; i++ {
+		id := "ready-video-" + strconv.Itoa(i)
+		excludes = append(excludes, "exclude="+id)
+		if err := cat.UpsertVideo(ctx, &catalog.Video{
+			ID:           id,
+			DriveID:      "drive",
+			FileID:       id,
+			Title:        id,
+			ThumbnailURL: "https://thumb.example/" + id + ".jpg",
+			PublishedAt:  now.Add(time.Duration(i) * time.Minute),
+			CreatedAt:    now.Add(time.Duration(i) * time.Minute),
+			UpdatedAt:    now.Add(time.Duration(i) * time.Minute),
+		}); err != nil {
+			t.Fatalf("seed ready video %s: %v", id, err)
+		}
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/home?"+strings.Join(excludes, "&"), nil)
+	(&Server{Catalog: cat}).handleHome(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got []VideoDTO
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != homePageSize {
+		t.Fatalf("home items = %d, want %d; body=%s", len(got), homePageSize, rr.Body.String())
+	}
+	seen := map[string]bool{}
+	for _, item := range got {
+		if seen[item.ID] {
+			t.Fatalf("home returned duplicate video %q; items=%#v", item.ID, got)
+		}
+		seen[item.ID] = true
+		if !strings.HasPrefix(item.ID, "ready-video-") {
+			t.Fatalf("home returned unexpected video %q; items=%#v", item.ID, got)
 		}
 	}
 }
@@ -549,6 +607,34 @@ func TestHandlePreviewIgnoresRemotePreviewFileIDAndServesLocalFile(t *testing.T)
 	}
 	if got := rr.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+}
+
+func TestHandleThumbServesHashedPathForLongVideoID(t *testing.T) {
+	localDir := t.TempDir()
+	longID := "localstorage-" + strings.Repeat("x", 240)
+	thumbPath := mediaasset.ThumbnailPath(localDir, longID)
+	if err := os.MkdirAll(filepath.Dir(thumbPath), 0o755); err != nil {
+		t.Fatalf("mkdir thumb dir: %v", err)
+	}
+	if err := os.WriteFile(thumbPath, []byte("thumb-bytes"), 0o644); err != nil {
+		t.Fatalf("write thumb: %v", err)
+	}
+
+	server := &Server{
+		LocalDir: localDir,
+		Proxy:    proxy.New(proxy.NewRegistry()),
+	}
+	req := requestWithRouteParam(http.MethodGet, "/p/thumb/"+longID, "videoID", longID, strings.NewReader(``))
+	rr := httptest.NewRecorder()
+
+	server.handleThumb(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if rr.Body.String() != "thumb-bytes" {
+		t.Fatalf("body = %q, want thumb bytes", rr.Body.String())
 	}
 }
 

@@ -7,11 +7,17 @@ type Props = {
   onClose: () => void;
   children: ReactNode;
   footer?: ReactNode;
+  className?: string;
 };
 
-export function Modal({ open, title, onClose, children, footer }: Props) {
+export function Modal({ open, title, onClose, children, footer, className = "" }: Props) {
   const dialogRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
   const titleId = useId();
+
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
 
   useEffect(() => {
     if (!open) return;
@@ -24,7 +30,7 @@ export function Modal({ open, title, onClose, children, footer }: Props) {
 
       if (e.key === "Escape") {
         e.preventDefault();
-        onClose();
+        onCloseRef.current();
         return;
       }
 
@@ -50,7 +56,7 @@ export function Modal({ open, title, onClose, children, footer }: Props) {
       }
     }
 
-    window.setTimeout(() => {
+    const focusTimer = window.setTimeout(() => {
       const dialog = dialogRef.current;
       if (!dialog || !isTopDialog(dialog)) return;
       const first = getFocusableElements(dialog)[0];
@@ -59,12 +65,13 @@ export function Modal({ open, title, onClose, children, footer }: Props) {
 
     document.addEventListener("keydown", onKeyDown);
     return () => {
+      window.clearTimeout(focusTimer);
       document.removeEventListener("keydown", onKeyDown);
       if (previousFocus?.isConnected) {
         previousFocus.focus();
       }
     };
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
   return (
@@ -76,7 +83,7 @@ export function Modal({ open, title, onClose, children, footer }: Props) {
     >
       <div
         ref={dialogRef}
-        className="admin-modal"
+        className={`admin-modal${className ? ` ${className}` : ""}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}

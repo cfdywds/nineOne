@@ -10,6 +10,19 @@ export type Kind =
   | "spider91"
   | "spiderxvideos";
 
+export const kindAbbr: Record<string, string> = {
+  quark: "Qk",
+  p115: "115",
+  p123: "123",
+  pikpak: "Pk",
+  wopan: "Wo",
+  onedrive: "OD",
+  googledrive: "GD",
+  localstorage: "Lo",
+  spider91: "91",
+  spiderxvideos: "XV",
+};
+
 export const kindLabel: Record<string, string> = {
   quark: "夸克网盘",
   p115: "115 网盘",
@@ -151,11 +164,11 @@ export function credentialHelp(kind: Kind, isEdit: boolean): string {
     case "googledrive":
       return `按 OpenList 在线 API 挂载，只需要 Google Drive refresh_token；保存时会自动刷新并保存 token。播放不走 302，会由后端带 Authorization 代理转发。${note}`;
     case "localstorage":
-      return `把服务器上的一个已有目录作为视频来源扫描。填写绝对路径，例如 /mnt/videos；系统会读取该目录及子目录中的视频，并生成封面、Teaser 和指纹。${note}`;
+      return `把服务器上的一个已有目录作为视频来源扫描。填写绝对路径，例如 /mnt/videos；系统会读取该目录及子目录中的视频，并生成封面、预览视频和指纹。${note}`;
     case "spider91":
-      return "91 爬虫会把定时抓取到的视频和封面先保存到本机，并作为一个视频来源接入站点；可配置每轮新增数量、代理、Python 和脚本路径。后续流水线会把较早的视频上传到你选择的 115 / PikPak / OneDrive 目标盘。";
+      return "91 爬虫会把定时抓取到的视频和封面先保存到本机，并作为一个视频来源接入站点；可按服务器网络情况单独配置代理。后续流水线会把较早的视频上传到你选择的 115 / PikPak / OneDrive 目标盘。";
     case "spiderxvideos":
-      return "XVideos 爬虫会按起始 URL 定时抓取视频和封面，先保存到本机并作为视频来源接入站点；可配置 Cookie、代理、清晰度和每轮新增数量。后续流水线会把较早的视频上传到你选择的 115 / PikPak / OneDrive 目标盘。";
+      return "XVideos 爬虫会把定时抓取到的视频和封面先保存到本机，并作为一个视频来源接入站点；可按服务器网络情况单独配置代理和过滤条件。";
     default:
       return "";
   }
@@ -171,54 +184,181 @@ export function credentialFields(kind: Kind): Array<{
 }> {
   switch (kind) {
     case "quark":
-      return [{ key: "cookie", label: "Cookie", placeholder: "__pus=...; __puus=...; ...", multiline: true, required: true }];
+      return [
+        {
+          key: "cookie",
+          label: "Cookie",
+          placeholder: "__pus=...; __puus=...; ...",
+          multiline: true,
+          required: true,
+        },
+      ];
     case "p115":
-      return [{ key: "cookie", label: "Cookie", placeholder: "UID=xxx; CID=xxx; SEID=xxx; KID=xxx", multiline: true, required: true }];
+      return [
+        {
+          key: "cookie",
+          label: "Cookie",
+          placeholder: "UID=xxx; CID=xxx; SEID=xxx; KID=xxx",
+          multiline: true,
+          required: true,
+        },
+      ];
     case "p123":
       return [
-        { key: "username", label: "用户名 / 邮箱（可选）", placeholder: "user@example.com" },
-        { key: "password", label: "密码（可选）", placeholder: "123 云盘密码" },
-        { key: "access_token", label: "access_token（推荐用于风控场景）", placeholder: "Bearer eyJ... 或直接粘贴 token", multiline: true, help: "扫码成功后会自动填入该字段；如果 token 过期，重新扫码后保存即可。" },
+        {
+          key: "username",
+          label: "用户名 / 邮箱（可选）",
+          placeholder: "user@example.com",
+        },
+        {
+          key: "password",
+          label: "密码（可选）",
+          placeholder: "123 云盘密码",
+        },
+        {
+          key: "access_token",
+          label: "access_token（推荐用于风控场景）",
+          placeholder: "Bearer eyJ... 或直接粘贴 token",
+          multiline: true,
+          help: "扫码成功后会自动填入该字段；如果 token 过期，重新扫码后保存即可。",
+        },
       ];
     case "pikpak":
       return [
-        { key: "username", label: "用户名 / 邮箱", placeholder: "user@example.com", required: true },
-        { key: "password", label: "密码", placeholder: "PikPak 密码", required: true },
+        {
+          key: "username",
+          label: "用户名 / 邮箱",
+          placeholder: "user@example.com",
+          required: true,
+        },
+        {
+          key: "password",
+          label: "密码",
+          placeholder: "PikPak 密码",
+          required: true,
+        },
       ];
     case "wopan":
       return [
-        { key: "access_token", label: "access_token", placeholder: "", required: true },
-        { key: "refresh_token", label: "refresh_token", placeholder: "", required: true },
-        { key: "family_id", label: "family_id（家庭空间可选）", placeholder: "留空走个人空间" },
+        {
+          key: "access_token",
+          label: "access_token",
+          placeholder: "",
+          required: true,
+        },
+        {
+          key: "refresh_token",
+          label: "refresh_token",
+          placeholder: "",
+          required: true,
+        },
+        {
+          key: "family_id",
+          label: "family_id（家庭空间可选）",
+          placeholder: "留空走个人空间",
+        },
       ];
     case "onedrive":
-      return [{ key: "refresh_token", label: "refresh_token", placeholder: "OpenList OneDrive refresh_token", multiline: true, required: true }];
+      return [
+        {
+          key: "refresh_token",
+          label: "refresh_token",
+          placeholder: "OpenList OneDrive refresh_token",
+          multiline: true,
+          required: true,
+        },
+      ];
     case "googledrive":
-      return [{ key: "refresh_token", label: "refresh_token", placeholder: "OpenList Google Drive refresh_token", multiline: true, required: true }];
+      return [
+        {
+          key: "refresh_token",
+          label: "refresh_token",
+          placeholder: "OpenList Google Drive refresh_token",
+          multiline: true,
+          required: true,
+        },
+      ];
     case "localstorage":
-      return [{ key: "path", label: "本地目录路径", placeholder: "/mnt/videos", required: true, help: "路径必须是后端服务器上的已有目录；保存后可手动重扫，系统会递归扫描支持的视频格式。" }];
+      return [
+        {
+          key: "path",
+          label: "本地目录路径",
+          placeholder: "/mnt/videos",
+          required: true,
+          help: "路径必须是后端服务器上的已有目录；保存后可手动重扫，系统会递归扫描支持的视频格式。",
+        },
+      ];
     case "spider91":
       return [
-        { key: "target_new", label: "每轮新增数量", placeholder: "15", required: false, help: "立即抓取或凌晨任务每轮最多新增多少个视频；为空默认 15。" },
-        { key: "proxy", label: "代理地址（可选）", placeholder: "http://127.0.0.1:7890", required: false, help: "仅用于 91Spider 的列表/详情请求和视频、封面下载；留空则使用服务器环境变量 HTTP_PROXY / HTTPS_PROXY 或直连。支持 http://、https://、socks5:// 或 socks5h://。" },
-        { key: "python_path", label: "Python 路径", placeholder: "python", required: false, help: "可选；为空时 Windows 默认 python，其他系统默认 python3。" },
-        { key: "script_path", label: "脚本路径", placeholder: "/opt/video-site-91/91VideoSpider/spider_91porn.py", required: false, help: "可选；为空时后端自动查找内置脚本。" },
+        {
+          key: "proxy",
+          label: "代理地址（可选）",
+          placeholder: "http://127.0.0.1:7890",
+          help: "支持 http://、https://、socks5://、socks5h://代理",
+        },
       ];
     case "spiderxvideos":
       return [
-        { key: "keyword", label: "关键词", placeholder: "keyword", required: false, help: "可选；为空时使用起始 URL 或首页。" },
-        { key: "start_url", label: "起始 URL", placeholder: "https://www.xvideos.com/", required: false, help: "首页、搜索页或分类页 URL；为空默认首页。" },
-        { key: "min_size", label: "最小文件大小", placeholder: "500MB", required: false, help: "可选；支持字节、KB、MB、GB。" },
-        { key: "max_size", label: "最大文件大小", placeholder: "2GB", required: false, help: "可选；支持字节、KB、MB、GB。" },
-        { key: "min_duration", label: "最小时长", placeholder: "01:00", required: false, help: "可选；支持秒数或 mm:ss / hh:mm:ss。" },
-        { key: "max_duration", label: "最大时长", placeholder: "10:00", required: false, help: "可选；支持秒数或 mm:ss / hh:mm:ss。" },
-        { key: "target_new", label: "每轮新增数量", placeholder: "15", required: false, help: "立即抓取或凌晨任务每轮最多新增多少个视频；为空默认 15。" },
-        { key: "quality", label: "清晰度", placeholder: "best", required: false, help: "best / hd / high / low / hls；默认 best。开启 merge_hls 时可合并 HLS。" },
-        { key: "merge_hls", label: "合并 HLS", placeholder: "true", required: false, help: "可选；填 true/1/yes 时使用 ffmpeg 合并 HLS 分片。" },
-        { key: "proxy", label: "代理地址（可选）", placeholder: "http://127.0.0.1:7890", required: false, help: "可选；为空时后端使用 HTTPS_PROXY / HTTP_PROXY 环境变量。" },
-        { key: "cookie", label: "Cookie", placeholder: "key=value; ...", required: false, multiline: true, help: "可选；遇到站点侧限制时从浏览器复制 Cookie。" },
-        { key: "python_path", label: "Python 路径", placeholder: "python", required: false, help: "可选；为空时 Windows 默认 python，其他系统默认 python3。" },
-        { key: "script_path", label: "脚本路径", placeholder: "/opt/video-site-91/91VideoSpider/spider_xvideos.py", required: false, help: "可选；为空时后端自动查找内置脚本。" },
+        {
+          key: "start_url",
+          label: "起始 URL",
+          placeholder: "https://www.xvideos.com/",
+          help: "首页、搜索页或分类页 URL；为空默认首页。",
+        },
+        {
+          key: "keyword",
+          label: "搜索关键词",
+          placeholder: "可选；填写后优先按关键词搜索",
+        },
+        {
+          key: "quality",
+          label: "清晰度",
+          placeholder: "best",
+          help: "best、hd、high 或 low；默认 best。",
+        },
+        {
+          key: "min_duration",
+          label: "最小时长",
+          placeholder: "例如 5m、300s",
+        },
+        {
+          key: "max_duration",
+          label: "最大时长",
+          placeholder: "例如 30m、1800s",
+        },
+        {
+          key: "min_size",
+          label: "最小文件大小",
+          placeholder: "例如 50MB",
+        },
+        {
+          key: "max_size",
+          label: "最大文件大小",
+          placeholder: "例如 2GB",
+        },
+        {
+          key: "merge_hls",
+          label: "合并 HLS",
+          placeholder: "true / false",
+          help: "需要 ffmpeg；默认 false。",
+        },
+        {
+          key: "proxy",
+          label: "代理地址（可选）",
+          placeholder: "http://127.0.0.1:7890",
+          help: "支持 http://、https://、socks5://、socks5h://代理",
+        },
+        {
+          key: "cookie",
+          label: "Cookie（可选）",
+          placeholder: "用于需要登录态的页面",
+        },
+        {
+          key: "script_path",
+          label: "脚本路径",
+          placeholder: "/opt/video-site-91/91VideoSpider/spider_xvideos.py",
+          help: "可选；为空时后端自动查找内置脚本。",
+        },
       ];
   }
 }

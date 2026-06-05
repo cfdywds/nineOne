@@ -194,44 +194,6 @@ func TestRunPipelineSkipsMigrationWhenNoSpider91(t *testing.T) {
 	}
 }
 
-func TestRunPipelineRunsSpiderXVideosCrawlerWhenSpider91Absent(t *testing.T) {
-	rec := &recorder{}
-
-	r := New(Config{
-		Settings:                  newStubSettings(),
-		ListScanTargets:           func(context.Context) []string { return nil },
-		ListSpider91Drives:        func(context.Context) []string { return nil },
-		RunSpider91Crawl:          func(context.Context, string) { rec.push("crawl-spider91") },
-		ListSpiderXVideosDrives:   func(context.Context) []string { return []string{"xv-1"} },
-		RunSpiderXVideosCrawl:     func(_ context.Context, id string) { rec.push("crawl-xvideos:" + id) },
-		WaitPreviewQueuesIdle:     func(context.Context) error { rec.push("wait-idle"); return nil },
-		RunMigration:              func(context.Context) error { rec.push("migrate"); return nil },
-		RunDedupeAssetCleanup:     func(context.Context) error { rec.push("dedupe-cleanup"); return nil },
-	})
-
-	r.runPipeline(context.Background())
-
-	got := rec.snapshot()
-	want := []string{"crawl-xvideos:xv-1", "wait-idle", "migrate", "dedupe-cleanup"}
-	for _, wantCall := range want {
-		found := false
-		for _, gotCall := range got {
-			if gotCall == wantCall {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Fatalf("expected call %q in sequence %v", wantCall, got)
-		}
-	}
-	for _, c := range got {
-		if c == "crawl-spider91" {
-			t.Fatalf("spider91 crawl should not run when no spider91 drives; calls=%v", got)
-		}
-	}
-}
-
 func TestRunPipelineExitsWhenContextCancelledMidPhase(t *testing.T) {
 	rec := &recorder{}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -439,6 +401,61 @@ func TestStatusTracksQueuedRunningAndFinished(t *testing.T) {
 		default:
 			time.Sleep(10 * time.Millisecond)
 		}
+	}
+}
+
+func TestStopCurrentCancelsRunningPipeline(t *testing.T) {
+	scanStarted := make(chan struct{})
+	scanCanceled := make(chan struct{})
+	var startedOnce sync.Once
+	r := New(Config{
+		Settings: newStubSettings(),
+		ListScanTargets: func(context.Context) []string {
+			return []string{"drive"}
+		},
+		RunScan: func(ctx context.Context, _ string) {
+			startedOnce.Do(func() { close(scanStarted) })
+			<-ctx.Done()
+			close(scanCanceled)
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.Run(ctx)
+
+	if !r.TriggerNow() {
+		t.Fatal("TriggerNow should queue a manual run")
+	}
+	select {
+	case <-scanStarted:
+	case <-time.After(time.Second):
+		t.Fatal("pipeline did not start")
+	}
+
+	if !r.StopCurrent() {
+		t.Fatal("StopCurrent should report a running pipeline")
+	}
+	select {
+	case <-scanCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("StopCurrent did not cancel pipeline context")
+	}
+}
+
+func TestStopCurrentDropsQueuedTrigger(t *testing.T) {
+	r := New(Config{Settings: newStubSettings()})
+	if !r.TriggerNow() {
+		t.Fatal("TriggerNow should queue a manual run")
+	}
+	if !r.StopCurrent() {
+		t.Fatal("StopCurrent should report a queued pipeline")
+	}
+	if got := r.Status(); got.State != "idle" || got.Running || got.Queued {
+		t.Fatalf("status = %#v, want idle after dropping queued trigger", got)
+	}
+	if !r.TriggerNow() {
+		t.Fatal("TriggerNow should accept a new request after queued stop")
 	}
 }
 

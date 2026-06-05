@@ -149,6 +149,10 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 }
 
 func isTransient115ListError(err error) bool {
+	return isTransient115UpstreamError(err)
+}
+
+func isTransient115UpstreamError(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -248,11 +252,11 @@ func (d *Driver) streamURLWithUA(ctx context.Context, fileID string, ua string) 
 	// 需要先拿到 pickCode
 	f, err := d.client.GetFile(fileID)
 	if err != nil {
-		return nil, fmt.Errorf("115 get file: %w", err)
+		return nil, wrap115StreamTransientError("115 get file", err)
 	}
 	info, ua, err := d.downloadInfo(f.PickCode, ua)
 	if err != nil {
-		return nil, fmt.Errorf("115 download url: %w", err)
+		return nil, wrap115StreamTransientError("115 download url", err)
 	}
 	if info == nil || info.Url.Url == "" {
 		return nil, errors.New("115 download url: empty")
@@ -286,6 +290,18 @@ func (d *Driver) downloadInfo(pickCode string, ua string) (*sdk.DownloadInfo, st
 		return nil, "", err
 	}
 	return info, ua, nil
+}
+
+func wrap115StreamTransientError(op string, err error) error {
+	wrapped := fmt.Errorf("%s: %w", op, err)
+	if !isTransient115UpstreamError(err) {
+		return wrapped
+	}
+	return &drives.RateLimitError{
+		Provider:   "p115",
+		RetryAfter: p115ListCooldown,
+		Err:        wrapped,
+	}
 }
 
 func (d *Driver) Upload(ctx context.Context, parentID, name string, r io.Reader, size int64) (string, error) {

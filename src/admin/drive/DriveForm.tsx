@@ -1,4 +1,5 @@
-import { useId, useMemo } from "react";
+import { useId, useMemo, useState } from "react";
+import { ArrowLeft } from "lucide-react";
 import { P123QRCodeLogin } from "./P123QRCodeLogin";
 import { Spider91UploadTargetField } from "./Spider91UploadTargetField";
 import {
@@ -12,6 +13,26 @@ import {
 } from "./constants";
 import * as api from "../api";
 
+type DriveOption = {
+  kind: Kind;
+  label: string;
+  abbr: string;
+  desc: string;
+};
+
+const DRIVE_OPTIONS: DriveOption[] = [
+  { kind: "p115", label: "115 网盘", abbr: "115", desc: "302直链，不占带宽" },
+  { kind: "p123", label: "123 云盘", abbr: "123", desc: "扫码登录，302直链" },
+  { kind: "pikpak", label: "PikPak", abbr: "Pk", desc: "302直链，稳定快速" },
+  { kind: "onedrive", label: "OneDrive", abbr: "OD", desc: "302直链，微软网盘" },
+  { kind: "googledrive", label: "Google Drive", abbr: "GD", desc: "服务器中转模式" },
+  { kind: "localstorage", label: "本地存储", abbr: "Lo", desc: "本机文件目录" },
+  { kind: "spider91", label: "91 爬虫", abbr: "91", desc: "自动抓取热门视频" },
+  { kind: "spiderxvideos", label: "XVideos Spider", abbr: "XV", desc: "按规则抓取 XVideos" },
+  { kind: "quark", label: "夸克网盘", abbr: "Qk", desc: "302直链" },
+  { kind: "wopan", label: "联通沃盘", abbr: "Wo", desc: "302直链" },
+];
+
 export function DriveForm({
   form,
   onChange,
@@ -19,6 +40,7 @@ export function DriveForm({
   uploadTargets,
   nameError,
   onNameBlur,
+  onBack,
 }: {
   form: FormState;
   onChange: (f: FormState) => void;
@@ -26,12 +48,13 @@ export function DriveForm({
   uploadTargets: api.AdminDrive[];
   nameError?: string;
   onNameBlur?: () => void;
+  onBack?: () => void;
 }) {
   const idPrefix = useId();
   const fields = useMemo(() => credentialFields(form.kind), [form.kind]);
   const help = credentialHelp(form.kind, isEdit);
+  const [step, setStep] = useState<"type" | "form">(isEdit ? "form" : "type");
   const nameId = `${idPrefix}-drive-name`;
-  const kindId = `${idPrefix}-drive-kind`;
   const rootId = `${idPrefix}-drive-root`;
 
   function set<K extends keyof FormState>(k: K, v: FormState[K]) {
@@ -48,65 +71,102 @@ export function DriveForm({
       creds: {},
     });
   }
+  function selectType(kind: Kind) {
+    setKind(kind);
+    setStep("form");
+  }
+  function goBack() {
+    setStep("type");
+    onChange({
+      ...form,
+      name: "",
+      rootId: "",
+      creds: {},
+    });
+    onBack?.();
+  }
+
+  const selectedOption = DRIVE_OPTIONS.find((o) => o.kind === form.kind);
+
+  if (step === "type" && !isEdit) {
+    return (
+      <div className="admin-drive-type-picker">
+        <div className="admin-drive-type-grid">
+          {DRIVE_OPTIONS.map((opt) => (
+            <button
+              key={opt.kind}
+              type="button"
+              className="admin-drive-type-card"
+              data-kind={opt.kind}
+              onClick={() => selectType(opt.kind)}
+            >
+              <span className="admin-drive-type-card__icon" data-kind={opt.kind}>
+                {opt.abbr}
+              </span>
+              <span className="admin-drive-type-card__label">{opt.label}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="admin-form">
-      <div className="admin-form__row">
-        <label htmlFor={nameId}>名称 *</label>
-        <input
-          id={nameId}
-          value={form.name}
-          onChange={(e) => set("name", e.target.value)}
-          onBlur={onNameBlur}
-          placeholder="给这个盘起个名字"
-          className={nameError ? "is-invalid" : undefined}
-          aria-invalid={nameError ? "true" : undefined}
-          aria-describedby={nameError ? `${nameId}-error` : undefined}
-        />
-        {nameError && (
-          <div className="admin-form__error" id={`${nameId}-error`}>
-            {nameError}
+      {!isEdit && selectedOption && (
+        <div className="admin-drive-selected-bar" data-kind={form.kind}>
+          <span className="admin-drive-selected-bar__icon" data-kind={form.kind}>
+            {selectedOption.abbr}
+          </span>
+          <div className="admin-drive-selected-bar__text">
+            <span className="admin-drive-selected-bar__name">{selectedOption.label}</span>
+            <span className="admin-drive-selected-bar__desc">{selectedOption.desc}</span>
           </div>
-        )}
-      </div>
-      <div className="admin-form__row">
-        <label htmlFor={kindId}>类型</label>
-        <select
-          id={kindId}
-          value={form.kind}
-          onChange={(e) => setKind(e.target.value as Kind)}
-          disabled={isEdit}
-        >
-          <option value="p115">115 网盘</option>
-          <option value="p123">123 云盘</option>
-          <option value="pikpak">PikPak</option>
-          <option value="onedrive">OneDrive</option>
-          <option value="googledrive">Google Drive</option>
-          <option value="localstorage">本地存储</option>
-          <option value="spider91">91 Spider</option>
-          <option value="spiderxvideos">XVideos Spider</option>
-          <option value="quark">夸克网盘</option>
-          <option value="wopan">联通沃盘</option>
-        </select>
-      </div>
-      {usesRootDirectoryID(form.kind) && (
-        <div className="admin-form__row">
-          <label htmlFor={rootId}>根目录 ID</label>
-          <input
-            id={rootId}
-            value={form.rootId}
-            onChange={(e) => set("rootId", e.target.value)}
-            placeholder={rootIdPlaceholder(form.kind)}
-          />
-          <div className="admin-form__help">
-            留空时使用该网盘类型的默认根目录，具体目录ID获取方式请参考OpenList文档
-          </div>
+          <button type="button" className="admin-drive-selected-bar__back" onClick={goBack}>
+            <ArrowLeft size={12} /> 重选类型
+          </button>
         </div>
       )}
 
+      <div className="admin-form__section">
+        <div className="admin-form__row">
+          <label htmlFor={nameId}>名称 *</label>
+          <input
+            id={nameId}
+            value={form.name}
+            onChange={(e) => set("name", e.target.value)}
+            onBlur={onNameBlur}
+            placeholder="给这个盘起个名字"
+            className={nameError ? "is-invalid" : undefined}
+            aria-invalid={nameError ? "true" : undefined}
+            aria-describedby={nameError ? `${nameId}-error` : undefined}
+          />
+          {nameError && (
+            <div className="admin-form__error" id={`${nameId}-error`}>
+              {nameError}
+            </div>
+          )}
+        </div>
+
+        {usesRootDirectoryID(form.kind) && (
+          <div className="admin-form__row">
+            <label htmlFor={rootId}>根目录 ID</label>
+            <input
+              id={rootId}
+              value={form.rootId}
+              onChange={(e) => set("rootId", e.target.value)}
+              placeholder={rootIdPlaceholder(form.kind)}
+            />
+            <div className="admin-form__help">
+              留空时使用该网盘类型的默认根目录
+            </div>
+          </div>
+        )}
+      </div>
+
       {(help || fields.length > 0) && (
-        <>
-          <hr className="admin-form__divider" />
+        <div className="admin-form__section">
+          <h3 className="admin-form__section-label">凭证配置</h3>
 
           {help && (
             <div className="admin-form__help admin-form__help--lead">
@@ -115,13 +175,16 @@ export function DriveForm({
           )}
 
           {form.kind === "p123" && (
-            <P123QRCodeLogin onToken={(token) => setCred("access_token", token)} />
+            <P123QRCodeLogin
+              onToken={(token) => setCred("access_token", token)}
+            />
           )}
 
           {fields.map((f) => (
             <div key={f.key} className="admin-form__row">
               <label htmlFor={`${idPrefix}-credential-${f.key}`}>
-                {f.label}{f.required && " *"}
+                {f.label}
+                {f.required && " *"}
               </label>
               {f.multiline ? (
                 <textarea
@@ -142,18 +205,18 @@ export function DriveForm({
               {f.help && <div className="admin-form__help">{f.help}</div>}
             </div>
           ))}
-        </>
+        </div>
       )}
 
       {isSpiderCrawlerKind(form.kind) && (
-        <>
-          <hr className="admin-form__divider" />
+        <div className="admin-form__section">
+          <h3 className="admin-form__section-label">上传设置</h3>
           <Spider91UploadTargetField
             value={form.spider91UploadDriveId}
             onChange={(v) => set("spider91UploadDriveId", v)}
             uploadTargets={uploadTargets}
           />
-        </>
+        </div>
       )}
     </div>
   );

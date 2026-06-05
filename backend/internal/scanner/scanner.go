@@ -23,7 +23,7 @@ type Scanner struct {
 	//
 	// nil / 空集合 → 行为等同于不跳过任何目录。
 	SkipDirIDs map[string]struct{}
-	// 回调：新视频被加入后触发 teaser 生成
+	// 回调：新视频被加入后触发预览视频生成
 	OnNewVideo func(v *catalog.Video)
 	// ProgressInterval 控制扫描内部 heartbeat 的最小输出间隔。
 	// 0 → 默认 30s；< 0 → 关闭 heartbeat（仅留外层 start / done 两行）。
@@ -128,7 +128,7 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, stats *Stats,
 
 	for _, e := range entries {
 		if e.IsDir {
-			// 跳过 previews 目录，避免扫到自己生成的 teaser
+			// 跳过 previews 目录，避免扫到自己生成的预览视频
 			if strings.EqualFold(e.Name, "previews") {
 				continue
 			}
@@ -154,6 +154,14 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, stats *Stats,
 		stats.SeenFileIDs[e.ID] = struct{}{}
 
 		id := s.Drive.Kind() + "-" + s.Drive.ID() + "-" + e.ID
+		if deleted, err := s.Catalog.IsDeletedVideoCandidate(ctx, id, s.Drive.ID(), e.ID, e.Hash, e.Name, e.Size); err != nil {
+			stats.Errors++
+			log.Printf("[scanner] check deleted video %s error: %v", id, err)
+			continue
+		} else if deleted {
+			continue
+		}
+
 		parsed := Parse(e.Name)
 		if parsed.Title == "" {
 			parsed.Title = strings.TrimSuffix(e.Name, ext)

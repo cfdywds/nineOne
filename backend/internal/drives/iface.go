@@ -30,7 +30,7 @@ type Drive interface {
 	StreamURL(ctx context.Context, fileID string) (*StreamLink, error)
 
 	// Upload 把本地流写入指定目录，返回新文件 fileID。
-	// 当前 teaser 和封面只保存在本地，不再通过该方法写回网盘。
+	// 当前预览视频和封面只保存在本地，不再通过该方法写回网盘。
 	Upload(ctx context.Context, parentID, name string, r io.Reader, size int64) (string, error)
 
 	// EnsureDir 保证指定路径存在（相对根目录），返回最终目录 fileID。

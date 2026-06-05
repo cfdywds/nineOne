@@ -216,7 +216,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, link *drives.Strea
 	_, _ = io.Copy(w, resp.Body)
 }
 
-// ServeLocal 服务本地 teaser 文件
+// ServeLocal 服务本地预览视频文件
 func (p *Proxy) ServeLocal(w http.ResponseWriter, r *http.Request, path string) {
 	http.ServeFile(w, r, path)
 }

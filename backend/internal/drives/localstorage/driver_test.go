@@ -95,8 +95,13 @@ func TestPathForIDAllowsRootPathSlash(t *testing.T) {
 	if rel != "tmp" {
 		t.Fatalf("rel = %q, want tmp", rel)
 	}
-	if path != filepath.Join(string(os.PathSeparator), "tmp") {
-		t.Fatalf("path = %q, want /tmp", path)
+	root, err := drv.root()
+	if err != nil {
+		t.Fatalf("root: %v", err)
+	}
+	want := filepath.Join(root, "tmp")
+	if path != want {
+		t.Fatalf("path = %q, want %q", path, want)
 	}
 }
 

@@ -3,7 +3,7 @@
 视频聚合站的 Go 后端。提供三件事：
 
 1. 多家网盘统一抽象（夸克 / 115 / PikPak / 联通沃盘 / OneDrive / Google Drive / 本地存储）
-2. 视频元数据目录（SQLite）+ 扫描 + teaser 预生成
+2. 视频元数据目录（SQLite）+ 扫描 + 预览视频预生成
 3. REST API（前台）+ 管理后台 + 直链代理
 4. 标签池、视频隐藏、按网盘统计和详情页来源网盘类型展示能力
 
@@ -24,7 +24,7 @@ internal/
     googledrive/            Google Drive（OpenList 在线续期 + Google Drive API；播放走后端代理）
     localstorage/           本地目录扫描（服务器已有视频目录）
   scanner/                  扫目录 → 落库
-  preview/                  ffmpeg 抽封面和生成多段 teaser
+  preview/                  ffmpeg 抽封面和生成多段预览视频
   proxy/                    /p/stream/*、/p/preview/* 代理
   auth/                     管理员 session
   api/                      REST 路由
@@ -81,7 +81,7 @@ go run ./cmd/server 后端 9192
 
 ## 添加一个盘
 
-推荐在前端管理后台 `/admin/drives` 新增网盘。保存后会立即挂载并触发扫描；视频结果可在 `/admin/videos` 按网盘查看，每页 100 条，页面会同时显示各网盘 Teaser 已生成、待生成、失败数量。
+推荐在前端管理后台 `/admin/drives` 新增网盘。保存后会立即挂载并触发扫描；视频结果可在 `/admin/videos` 按网盘查看，每页 100 条，页面会同时显示各网盘预览视频已生成、待生成、失败数量。
 
 也可以直接调用后端接口：
 
@@ -149,18 +149,18 @@ Google Drive 按 OpenList 在线 API 调用 `https://api.oplist.org/googleui/ren
 
 `sampled_sha256` 是文件级去重：适合识别同一个视频文件被复制到 115 / PikPak / OneDrive 等不同网盘的情况。它不会删除任何网盘文件，也不用于识别转码、裁剪、加水印后的同源视频。
 
-封面和 teaser 仍然优先生成，不等待指纹完成。夜间流水线最后会做一次重复资产清理：对 `size_bytes + sampled_sha256` 命中的非 canonical 视频，只删除本机生成的重复封面和 teaser，并把对应字段重置为 `pending`。网盘原文件和视频元数据记录不会被删除；如果 canonical 视频以后被移除，这些重复项会重新进入生成队列。
+封面和预览视频仍然优先生成，不等待指纹完成。夜间流水线最后会做一次重复资产清理：对 `size_bytes + sampled_sha256` 命中的非 canonical 视频，只删除本机生成的重复封面和预览视频，并把对应字段重置为 `pending`。网盘原文件和视频元数据记录不会被删除；如果 canonical 视频以后被移除，这些重复项会重新进入生成队列。
 
 ## 管理能力
 
 - `/admin/drives`：新增、编辑、删除网盘，触发扫描。
-- `/admin/videos`：按网盘筛选视频，每页 100 条分页，查看各网盘 Teaser 统计，编辑标题/作者/分类/标签，单条或全量重生 teaser。
+- `/admin/videos`：按网盘筛选视频，每页 100 条分页，查看各网盘预览视频统计，编辑标题/作者/分类/标签，单条或全量重生预览视频。
 - `/admin/tags`：新增标签并用内置规则自动匹配已有视频；删除非系统标签时会从所有视频上同步移除该标签。
 - 播放页视频信息会展示来源网盘类型；同时提供“不再展示”，点击后会把视频标记为全局隐藏。隐藏视频不会再出现在首页、列表、搜索、相关推荐和详情接口中。目前没有管理后台恢复入口，如需恢复可把数据库里对应视频的 `hidden` 字段改回 `0`。
 
-## Teaser 生成
+## 预览视频生成
 
-scanner 扫到新视频会把 `(driveID, videoID)` 丢进 worker 队列。worker 会先用 `ffprobe` 探测时长，再用 `ffmpeg` 抽封面和生成无声 teaser：
+scanner 扫到新视频会把 `(driveID, videoID)` 丢进 worker 队列。worker 会先用 `ffprobe` 探测时长，再用 `ffmpeg` 抽封面和生成无声预览视频：
 
 ```
 ffmpeg -ss <起点> -headers "UA/Cookie/Referer" -i <直链> \
@@ -168,9 +168,9 @@ ffmpeg -ss <起点> -headers "UA/Cookie/Referer" -i <直链> \
        -movflags +faststart -y <local>.mp4
 ```
 
-当前策略是每段固定 3 秒；30 秒以下最多 3 段，30 秒及以上固定 4 段；长视频在 20% 到 80% 区间均匀取段。生成的 teaser 和封面都只保存在本地 `data/previews/`，不会回写到网盘；旧数据中的 `preview_file_id` 会被忽略。
+当前策略是每段固定 3 秒；30 秒以下最多 3 段，30 秒及以上固定 4 段；长视频在 20% 到 80% 区间均匀取段。生成的预览视频和封面都只保存在本地 `data/previews/`，不会回写到网盘；旧数据中的 `preview_file_id` 会被忽略。
 
-服务启动或网盘重新挂载时，如果 Teaser 开关已开启，后端会把历史 `pending` 任务重新入队，避免重启后长期停在“待生成”。OneDrive 扫盘和直链生成 teaser / 封面时可能触发 Microsoft Graph 429、`TooManyRequests`、`activityLimitReached` 或 throttled 文本；后端会识别这类错误并让当前网盘进入冷却期，保留任务为 `pending`，避免连续请求触发更严重限流。扫盘阶段会按 `Retry-After` 或默认冷却时间等待后继续当前目录。
+服务启动或网盘重新挂载时，如果预览视频开关已开启，后端会把历史 `pending` 任务重新入队，避免重启后长期停在“待生成”。OneDrive 扫盘和直链生成预览视频 / 封面时可能触发 Microsoft Graph 429、`TooManyRequests`、`activityLimitReached` 或 throttled 文本；后端会识别这类错误并让当前网盘进入冷却期，保留任务为 `pending`，避免连续请求触发更严重限流。扫盘阶段会按 `Retry-After` 或默认冷却时间等待后继续当前目录。
 
 前端卡片的 `previewSrc` 统一指向 `/p/preview/<videoID>`，后端只从本地 `preview_local` 文件读取。
 

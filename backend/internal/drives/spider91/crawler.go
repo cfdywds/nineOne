@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/video-site/backend/internal/catalog"
+	"github.com/video-site/backend/internal/mediaasset"
 	"golang.org/x/net/proxy"
 )
 
@@ -61,7 +62,7 @@ type CrawlerConfig struct {
 	// DownloadTimeout 限制单条视频/封面下载的耗时。
 	DownloadTimeout time.Duration
 
-	// OnNewVideo 是新视频成功入库后的回调，用于触发 teaser worker。
+	// OnNewVideo 是新视频成功入库后的回调，用于触发预览视频 worker。
 	OnNewVideo func(v *catalog.Video)
 }
 
@@ -235,7 +236,7 @@ type spiderVideoEntry struct {
 //  3. Go 端 bufio.Scanner 按行读：每行立即下载视频和封面、入库。
 //     这样 "Python 翻页找下一个" 与 "Go 下载当前一个" 在时间上重叠，缩短整轮耗时；
 //     更重要的是不会让前几个下载耽误后面签名链接 e= 过期。
-//  4. 全部消费完 + 子进程退出 → 返回 CrawlResult。teaser 不在此处入队，
+//  4. 全部消费完 + 子进程退出 → 返回 CrawlResult。预览视频不在此处入队，
 //     由调用方 (App.runSpider91Crawl) 在 RunOnce 后统一调 enqueueDriveGeneration。
 //
 // targetNew <= 0 会被规范化成 spider91DefaultTargetNew（15）。
@@ -330,6 +331,16 @@ func (c *Crawler) RunOnce(ctx context.Context, targetNew int) (*CrawlResult, err
 			break
 		}
 		videoID := buildVideoID(c.cfg.Driver.ID(), sourceID)
+		deleted, err := c.cfg.Catalog.IsVideoDeleted(ctx, videoID)
+		if err != nil {
+			log.Printf("[spider91] drive=%s viewkey=%s source_id=%s check deleted: %v", c.cfg.Driver.ID(), item.Viewkey, sourceID, err)
+			result.Failed++
+			continue
+		}
+		if deleted {
+			result.Skipped++
+			continue
+		}
 		if existing, _ := c.cfg.Catalog.GetVideo(ctx, videoID); existing != nil {
 			result.Skipped++
 			continue
@@ -525,7 +536,7 @@ func (c *Crawler) processOne(ctx context.Context, videoID string, item spiderVid
 			log.Printf("[spider91] drive=%s mkdir common thumbs: %v", c.cfg.Driver.ID(), err)
 			thumbReady = false
 		} else {
-			dst := filepath.Join(c.cfg.CommonThumbDir, videoID+".jpg")
+			dst := mediaasset.ThumbnailPathInDir(c.cfg.CommonThumbDir, videoID)
 			if err := copyFileAtomic(thumbPath, dst); err != nil {
 				log.Printf("[spider91] drive=%s viewkey=%s source_id=%s copy thumb to common dir: %v", c.cfg.Driver.ID(), viewkey, sourceID, err)
 				thumbReady = false

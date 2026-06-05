@@ -296,6 +296,75 @@ func TestHandleNightlyJobStatusDefaultsToIdle(t *testing.T) {
 	}
 }
 
+func TestHandleStopDriveTasksInvokesHookWithDriveID(t *testing.T) {
+	calledWith := ""
+	server := &AdminServer{
+		OnStopDriveTasks: func(driveID string) bool {
+			calledWith = driveID
+			return true
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives/PikPak/tasks/stop", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "PikPak")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+	server.handleStopDriveTasks(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if calledWith != "PikPak" {
+		t.Fatalf("hook called with %q, want PikPak", calledWith)
+	}
+	var got struct {
+		OK      bool `json:"ok"`
+		Stopped bool `json:"stopped"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !got.OK || !got.Stopped {
+		t.Fatalf("response = %#v, want stopped", got)
+	}
+}
+
+func TestHandleStopAllTasksInvokesHookAndReturnsStatus(t *testing.T) {
+	called := false
+	server := &AdminServer{
+		OnStopAllTasks: func() int {
+			called = true
+			return 2
+		},
+		GetNightlyJobStatus: func() NightlyJobStatus {
+			return NightlyJobStatus{State: "running", Running: true}
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/tasks/stop", nil)
+	rr := httptest.NewRecorder()
+	server.handleStopAllTasks(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if !called {
+		t.Fatal("OnStopAllTasks was not called")
+	}
+	var got struct {
+		OK            bool             `json:"ok"`
+		StoppedDrives int              `json:"stoppedDrives"`
+		Status        NightlyJobStatus `json:"status"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !got.OK || got.StoppedDrives != 2 || got.Status.State != "running" || !got.Status.Running {
+		t.Fatalf("response = %#v, want stopped drives and status", got)
+	}
+}
+
 func TestHandleUpsertDrivePreservesExistingCredentialsWhenRequestCredentialsEmpty(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")

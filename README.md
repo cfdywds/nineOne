@@ -185,7 +185,6 @@ docker compose up -d         # 更新并重启
 | 文档 | 内容 |
 |------|------|
 | [backend/README.md](backend/README.md) | 后端实现、接口说明、网盘字段 |
-| [video-site-implementation-plan.md](video-site-implementation-plan.md) | 完整实现方案 |
 
 ---
 

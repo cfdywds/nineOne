@@ -77,23 +77,13 @@ export function checkUpdate() {
 
 export type AdminDrive = {
   id: string;
-  kind:
-    | "quark"
-    | "p115"
-    | "p123"
-    | "pikpak"
-    | "wopan"
-    | "onedrive"
-    | "googledrive"
-    | "localstorage"
-    | "spider91"
-    | "spiderxvideos";
+  kind: "quark" | "p115" | "p123" | "pikpak" | "wopan" | "onedrive" | "googledrive" | "localstorage" | "spider91" | "spiderxvideos";
   name: string;
   rootId: string;
   status: string;
   lastError?: string;
   hasCredential: boolean;
-  /** 当前是否给该盘生成 teaser/封面（per-drive 开关，替代旧的全局 preview.enabled）。 */
+  /** 当前是否给该盘生成预览视频/封面（per-drive 开关，替代旧的全局 preview.enabled）。 */
   teaserEnabled: boolean;
   /**
    * 用户在 admin 配置的"扫描跳过目录"集合（drive 侧目录 fileID 列表）。
@@ -149,17 +139,7 @@ export function getDriveStorage() {
 
 export type UpsertDriveInput = {
   id: string;
-  kind:
-    | "quark"
-    | "p115"
-    | "p123"
-    | "pikpak"
-    | "wopan"
-    | "onedrive"
-    | "googledrive"
-    | "localstorage"
-    | "spider91"
-    | "spiderxvideos";
+  kind: "quark" | "p115" | "p123" | "pikpak" | "wopan" | "onedrive" | "googledrive" | "localstorage" | "spider91" | "spiderxvideos";
   name: string;
   rootId: string;
   credentials: Record<string, string>;
@@ -196,6 +176,13 @@ export function rescan(id: string) {
   );
 }
 
+export function stopDriveTasks(id: string) {
+  return request<{ ok: boolean; stopped: boolean }>(
+    `/drives/${encodeURIComponent(id)}/tasks/stop`,
+    { method: "POST" }
+  );
+}
+
 export type P123QRSession = {
   loginUuid: string;
   uniID: string;
@@ -224,9 +211,9 @@ export function getP123QRStatus(uniID: string, loginUuid: string) {
 }
 
 /**
- * 切换某个云盘的 teaser 生成开关。点击网盘列表里行内的 toggle 按钮时调用。
+ * 切换某个云盘的预览视频生成开关。点击网盘列表里行内的 toggle 按钮时调用。
  *
- * 后端会写 catalog.drives.teaser_enabled，并在从关到开时立刻补扫该盘 pending teaser；
+ * 后端会写 catalog.drives.teaser_enabled，并在从关到开时立刻补扫该盘 pending 预览视频；
  * 关闭分支不补做任何事，新的入队判断会自动停。
  */
 export function setDriveTeaserEnabled(id: string, enabled: boolean) {
@@ -285,7 +272,7 @@ export function regenFailedPreviews(id: string) {
 
 /**
  * 触发某 drive 下所有 thumbnail_status=failed 的封面重新入队生成。
- * 与 regenFailedPreviews 行为对称（一个管 teaser，一个管封面）。
+ * 与 regenFailedPreviews 行为对称（一个管预览视频，一个管封面）。
  *
  * 后端立即返回 202；实际状态变化在下次 listDrives 拉到的 thumbnailFailedCount /
  * thumbnailGenerationStatus 字段里观察。
@@ -366,6 +353,13 @@ export function updateVideo(id: string, body: UpdateVideoInput) {
   });
 }
 
+export function deleteVideo(id: string) {
+  return request<{ ok: boolean; deletedSource: boolean }>(
+    `/videos/${encodeURIComponent(id)}`,
+    { method: "DELETE" }
+  );
+}
+
 export function regenPreview(id: string) {
   return request<{ ok: boolean }>(
     `/videos/${encodeURIComponent(id)}/regen-preview`,
@@ -408,9 +402,9 @@ export type Theme = "dark" | "pink";
 export type Settings = {
   theme: Theme;
   /**
-   * spider91 视频迁移到云盘时的目标 drive ID（必须是已挂载的 pikpak、p115 或 onedrive drive）。
+   * spider91 视频迁移到云盘时的目标 drive ID（必须是已挂载的 pikpak、p115、p123 或 onedrive drive）。
    * - 空字符串：本地保存，不上传到云盘。
-   * - 非空：显式指定。后端会校验 drive 存在且 kind ∈ {pikpak, p115, onedrive}。
+   * - 非空：显式指定。后端会校验 drive 存在且 kind ∈ {pikpak, p115, p123, onedrive}。
    */
   spider91UploadDriveId: string;
 };
@@ -456,6 +450,13 @@ export function getNightlyJobStatus() {
 export function runNightlyJob() {
   return request<{ ok: boolean; accepted: boolean; status: NightlyJobStatus }>(
     "/jobs/nightly/run",
+    { method: "POST" }
+  );
+}
+
+export function stopAllTasks() {
+  return request<{ ok: boolean; stoppedDrives: number; status: NightlyJobStatus }>(
+    "/tasks/stop",
     { method: "POST" }
   );
 }

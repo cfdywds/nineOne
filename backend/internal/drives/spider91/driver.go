@@ -138,7 +138,7 @@ func (d *Driver) Stat(ctx context.Context, fileID string) (*drives.Entry, error)
 
 // StreamURL 返回本地视频文件路径，给 ffmpeg / 上层服务使用。
 // 注意：proxy.serve 不能直接处理本地路径，回放要走 api.handleSpider91Video。
-// teaser/封面 worker 通过 localPreviewLink 兜底走本地文件，刚好兼容 path 形式的 URL。
+// 预览视频/封面 worker 通过 localPreviewLink 兜底走本地文件，刚好兼容 path 形式的 URL。
 func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLink, error) {
 	path, err := d.VideoPath(fileID)
 	if err != nil {

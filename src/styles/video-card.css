@@ -323,7 +323,7 @@
 }
 .source-badge[data-kind="spiderxvideos"] {
   --drive-color: var(--accent);
-  --drive-bg: var(--accent-softer);
+  --drive-bg: var(--accent-soft);
   --drive-text: var(--accent);
   --drive-border: var(--border-accent);
   --drive-shadow: var(--accent-glow);

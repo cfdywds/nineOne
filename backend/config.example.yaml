@@ -22,7 +22,7 @@ server:
 storage:
   # SQLite 数据库文件路径
   db_path: "./data/video-site.db"
-  # 本地 teaser 和封面目录
+  # 本地预览视频和封面目录
   local_preview_dir: "./data/previews"
 
 scanner:
@@ -38,24 +38,24 @@ scanner:
 nightly:
   # 凌晨流水线触发整点（0-23），默认 1 即每天 01:00。流程：
   #   Phase 1  扫所有非 spider91 / 非 localupload 网盘 → 检测新增 / 删除
-  #            → 入队封面和 teaser → 等所有队列 idle
-  #   Phase 2  spider91 爬虫（如配置）→ 入队 teaser → 等队列 idle
+  #            → 入队封面和预览视频 → 等所有队列 idle
+  #   Phase 2  spider91 爬虫（如配置）→ 入队预览视频 → 等队列 idle
   #   Phase 3  spider91 → 云盘迁移（一次性 sweep）
   cron_hour: 1
   # 单次流水线总耗时上限（软超时）；超过后当前 phase 跑完不启动后续 phase。
   max_duration: 6h
 
 preview:
-  # 是否启用 ffmpeg 抽帧生成 teaser
+  # 是否启用 ffmpeg 抽帧生成预览视频
   enabled: true
   # ffmpeg / ffprobe 可执行文件名或绝对路径
   ffmpeg_path: "ffmpeg"
   ffprobe_path: "ffprobe"
-  # teaser 每段时长（秒），实际生成时每段最多 3 秒
+  # 预览视频每段时长（秒），实际生成时每段最多 3 秒
   duration_seconds: 3
   # 兼容旧配置；当前 30 秒以下最多 3 段，30 秒及以上固定 4 段
   segments: 3
-  # teaser 视频宽度
+  # 预览视频宽度
   width: 480
 
 # 盘列表。上线后请通过管理后台添加，本文件可留空。

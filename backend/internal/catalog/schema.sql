@@ -19,8 +19,8 @@ CREATE TABLE IF NOT EXISTS videos (
     thumbnail_url    TEXT,
     thumbnail_status TEXT DEFAULT 'pending',    -- pending / ready / failed / skipped
     thumbnail_failures INTEGER DEFAULT 0,        -- consecutive transient thumbnail generation failures
-    preview_file_id  TEXT,                      -- deprecated: 旧版回写网盘后的 teaser file id
-    preview_local    TEXT,                      -- 本地 teaser 路径（兜底）
+    preview_file_id  TEXT,                      -- deprecated: 旧版回写网盘后的预览视频 file id
+    preview_local    TEXT,                      -- 本地预览视频路径（兜底）
     preview_status   TEXT DEFAULT 'pending',    -- pending / ready / failed
     views            INTEGER DEFAULT 0,
     favorites        INTEGER DEFAULT 0,
@@ -70,6 +70,25 @@ CREATE TABLE IF NOT EXISTS deleted_tags (
     deleted_at INTEGER NOT NULL
 );
 
+-- 管理员显式删除过的视频。用于防止后续扫描 / spider91 爬虫把同一个源文件
+-- 再次入库；不代表原始云盘文件已被删除。
+CREATE TABLE IF NOT EXISTS deleted_videos (
+    id           TEXT PRIMARY KEY,
+    drive_id     TEXT NOT NULL DEFAULT '',
+    file_id      TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL DEFAULT '',
+    file_name    TEXT NOT NULL DEFAULT '',
+    size_bytes   INTEGER NOT NULL DEFAULT 0,
+    deleted_at   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_deleted_videos_drive_file
+    ON deleted_videos(drive_id, file_id);
+CREATE INDEX IF NOT EXISTS idx_deleted_videos_drive_hash
+    ON deleted_videos(drive_id, content_hash);
+CREATE INDEX IF NOT EXISTS idx_deleted_videos_drive_signature
+    ON deleted_videos(drive_id, file_name, size_bytes);
+
 -- 网盘账户
 CREATE TABLE IF NOT EXISTS drives (
     id            TEXT PRIMARY KEY,
@@ -80,7 +99,7 @@ CREATE TABLE IF NOT EXISTS drives (
     credentials   TEXT,                          -- JSON: cookie / refresh_token 等
     status        TEXT DEFAULT 'disconnected',   -- disconnected / ok / error
     last_error    TEXT,
-    -- 是否给该盘生成 teaser/封面：1 开 / 0 关。
+    -- 是否给该盘生成预览视频/封面：1 开 / 0 关。
     -- 替代了早期的全局 preview.enabled 设置（保留旧 setting 行不再读）。
     teaser_enabled INTEGER NOT NULL DEFAULT 1,
     -- 扫描时要跳过的目录 ID 集合（JSON array of string）。命中其中任意一个的目录及其

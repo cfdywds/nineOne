@@ -364,7 +364,7 @@
 }
 
 .vd-meta__chip[data-tone="spiderxvideos"] {
-  background: var(--accent-softer);
+  background: var(--accent-soft);
   border-color: var(--border-accent);
   color: var(--accent);
 }

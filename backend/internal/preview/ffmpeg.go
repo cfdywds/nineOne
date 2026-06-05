@@ -21,15 +21,16 @@ import (
 
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/mediaasset"
 )
 
 type Config struct {
 	FFmpegPath      string
 	FFprobePath     string
-	DurationSeconds int // 兼容旧配置；当前 teaser 每段固定 3 秒
+	DurationSeconds int // 兼容旧配置；当前预览视频每段固定 3 秒
 	Width           int
 	Segments        int    // 兼容旧配置；当前 30 秒及以上视频固定使用 4 段
-	LocalDir        string // 本地 teaser 和封面目录
+	LocalDir        string // 本地预览视频和封面目录
 }
 
 type Generator struct {
@@ -236,7 +237,7 @@ func appendUniqueStart(starts []float64, start, eachSec float64) []float64 {
 	return append(starts, start)
 }
 
-// thumbnailOffsets 选封面抽帧的时间点（秒）。独立于 teaser。
+// thumbnailOffsets 选封面抽帧的时间点（秒）。独立于预览视频。
 // 默认取视频中间帧；时长未知时退回早期帧。
 func thumbnailOffsets(duration float64) []float64 {
 	if duration <= 0 {
@@ -269,7 +270,7 @@ func (g *Generator) GenerateThumbnail(ctx context.Context, link *drives.StreamLi
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	dst := filepath.Join(dir, videoID+".jpg")
+	dst := mediaasset.ThumbnailPath(g.cfg.LocalDir, videoID)
 
 	var lastErr error
 	offsets := thumbnailOffsets(duration)
@@ -383,9 +384,9 @@ func (g *Generator) Probe(ctx context.Context, link *drives.StreamLink) (float64
 	return strconv.ParseFloat(raw, 64)
 }
 
-// --- Teaser ---
+// --- 预览视频 ---
 
-// Generate 拉取 teaser 到本地临时文件，返回路径。
+// Generate 拉取预览视频到本地临时文件，返回路径。
 // 根据 Config.Segments 和视频时长决定是单段还是多段拼接。
 func (g *Generator) Generate(ctx context.Context, link *drives.StreamLink, duration float64) (string, error) {
 	return g.generate(ctx, duration, func(int) (*drives.StreamLink, error) {
@@ -966,7 +967,10 @@ func ffmpegOutputLooksRateLimited(output []byte) bool {
 
 // MoveToLocal 把临时文件改名到稳定位置，返回最终路径
 func (g *Generator) MoveToLocal(tmpPath, videoID string) (string, error) {
-	dst := filepath.Join(g.cfg.LocalDir, videoID+".mp4")
+	if err := os.MkdirAll(g.cfg.LocalDir, 0o755); err != nil {
+		return "", err
+	}
+	dst := mediaasset.PreviewPath(g.cfg.LocalDir, videoID)
 	if err := os.Rename(tmpPath, dst); err != nil {
 		// 跨盘 rename 可能失败，fallback 到 copy
 		if cerr := copyFile(tmpPath, dst); cerr != nil {
@@ -1358,12 +1362,19 @@ func (w *ThumbWorker) Run(ctx context.Context) {
 
 func (w *Worker) processQueued(ctx context.Context, v *catalog.Video) {
 	defer w.queue.release(v)
-	w.activity.start(v)
+	if w.Catalog == nil || v == nil || v.ID == "" {
+		return
+	}
+	current, err := w.Catalog.GetVideo(ctx, v.ID)
+	if err != nil || current.Hidden {
+		return
+	}
+	w.activity.start(current)
 	defer w.activity.done()
 	if !waitForRateLimitCooldown(ctx, &w.rateLimit, "preview", w.Drive) {
 		return
 	}
-	w.process(ctx, v)
+	w.process(ctx, current)
 }
 
 func (w *ThumbWorker) processQueued(ctx context.Context, v *catalog.Video) {
@@ -1506,7 +1517,7 @@ func driveErrorShouldCooldown(d drives.Drive, err error) bool {
 			strings.Contains(text, "request has been blocked") ||
 			strings.Contains(text, "访问被阻断")
 	case "pikpak":
-		// PikPak 在 teaser / 封面生成阶段（取链或拉直链字节）可能命中：
+		// PikPak 在预览视频 / 封面生成阶段（取链或拉直链字节）可能命中：
 		//   - error_code=10  操作频繁
 		//   - HTTP 429 / 5xx / 509 限流和服务端不可用
 		//   - 通用文本：rate limit / too many requests / blocked
@@ -1524,7 +1535,6 @@ func driveErrorShouldCooldown(d drives.Drive, err error) bool {
 			strings.Contains(text, "too many requests") ||
 			strings.Contains(text, "rate limit") ||
 			strings.Contains(text, "blocked") ||
-			strings.Contains(text, "moov atom not found") ||
 			strings.Contains(text, "partial file") ||
 			strings.Contains(text, "service unavailable")
 	case "p123":
@@ -1558,18 +1568,22 @@ func (w *ThumbWorker) process(ctx context.Context, v *catalog.Video) bool {
 	if w.skipIfRateLimited(v) {
 		return false
 	}
+	if w.Catalog == nil || v == nil || v.ID == "" {
+		return false
+	}
 	queued := v
-	current := v
-	if loaded, err := w.Catalog.GetVideo(ctx, v.ID); err == nil {
-		if loaded.PreviewLocal == "" {
-			loaded.PreviewLocal = queued.PreviewLocal
-		}
-		current = loaded
-		v = loaded
-		if loaded.ThumbnailURL != "" && loaded.DurationSeconds > 0 {
-			_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{ThumbnailStatus: "ready"})
-			return false
-		}
+	loaded, err := w.Catalog.GetVideo(ctx, v.ID)
+	if err != nil || loaded.Hidden {
+		return false
+	}
+	if loaded.PreviewLocal == "" {
+		loaded.PreviewLocal = queued.PreviewLocal
+	}
+	current := loaded
+	v = loaded
+	if loaded.ThumbnailURL != "" && loaded.DurationSeconds > 0 {
+		_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{ThumbnailStatus: "ready"})
+		return false
 	}
 	if current.ThumbnailURL != "" {
 		durationBackfillFailed := false
@@ -1666,13 +1680,18 @@ func (w *ThumbWorker) probeDuration(ctx context.Context, v *catalog.Video, link 
 }
 
 func (w *ThumbWorker) generateThumbnailFromLink(ctx context.Context, v *catalog.Video, link *drives.StreamLink) error {
-	if _, err := w.Gen.GenerateThumbnail(ctx, link, v.ID, float64(v.DurationSeconds)); err != nil {
+	local, err := w.Gen.GenerateThumbnail(ctx, link, v.ID, float64(v.DurationSeconds))
+	if err != nil {
 		return err
 	}
-	_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
+	if err := w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
 		ThumbnailURL:    "/p/thumb/" + v.ID,
 		ThumbnailStatus: "ready",
-	})
+	}); err != nil {
+		_ = os.Remove(local)
+		log.Printf("[thumb] update %s after generate: %v", v.Title, err)
+		return nil
+	}
 	log.Printf("[thumb] ready %s", v.Title)
 	return nil
 }
@@ -1729,7 +1748,7 @@ func (w *Worker) process(ctx context.Context, v *catalog.Video) {
 		}
 	}
 
-	// 2) teaser
+	// 2) 预览视频
 	tmp, err := w.generateTeaser(ctx, v, link, duration)
 	if err != nil {
 		if w.pauseForRecoverableError(err, "generate", v.Title) {
@@ -1747,7 +1766,11 @@ func (w *Worker) process(ctx context.Context, v *catalog.Video) {
 	}
 
 	removePreviousLocalTeaser(v.PreviewLocal, local)
-	w.Catalog.UpdatePreview(ctx, v.ID, local, "ready")
+	if err := w.Catalog.UpdatePreview(ctx, v.ID, local, "ready"); err != nil {
+		removePreviousLocalTeaser(local, "")
+		log.Printf("[preview] update %s after generate: %v", v.Title, err)
+		return
+	}
 	log.Printf("[preview] ready %s (duration=%.1fs)", v.Title, duration)
 }
 

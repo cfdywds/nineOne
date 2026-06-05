@@ -10,6 +10,9 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/video-site/backend/internal/drives"
 )
 
 func TestIsTransient115ListError(t *testing.T) {
@@ -29,6 +32,42 @@ func TestIsTransient115ListError(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := isTransient115ListError(tc.err); got != tc.want {
 				t.Fatalf("isTransient115ListError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWrap115StreamTransientError(t *testing.T) {
+	cases := []struct {
+		name          string
+		err           error
+		wantRateLimit bool
+	}{
+		{name: "unexpected", err: errors.New("unexpected error"), wantRateLimit: true},
+		{name: "405 blocked", err: errors.New("405 request has been blocked"), wantRateLimit: true},
+		{name: "429", err: errors.New("429 too many requests"), wantRateLimit: true},
+		{name: "blocked", err: errors.New("blocked by waf"), wantRateLimit: true},
+		{name: "auth", err: errors.New("invalid credential"), wantRateLimit: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := wrap115StreamTransientError("115 get file", tc.err)
+			var rateLimit *drives.RateLimitError
+			isRateLimit := errors.As(got, &rateLimit)
+			if isRateLimit != tc.wantRateLimit {
+				t.Fatalf("rate limit = %v, want %v; err=%v", isRateLimit, tc.wantRateLimit, got)
+			}
+			if !strings.Contains(got.Error(), "115 get file") {
+				t.Fatalf("err = %v, want operation prefix", got)
+			}
+			if tc.wantRateLimit {
+				if rateLimit.Provider != "p115" {
+					t.Fatalf("provider = %q, want p115", rateLimit.Provider)
+				}
+				if rateLimit.RetryAfter != 10*time.Minute {
+					t.Fatalf("retry after = %s, want 10m", rateLimit.RetryAfter)
+				}
 			}
 		})
 	}

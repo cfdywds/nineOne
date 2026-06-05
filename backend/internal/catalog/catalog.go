@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -546,7 +547,7 @@ func (c *Catalog) ListVideosByThumbnailStatus(ctx context.Context, driveID, stat
 // Besides missing thumbnails, this includes videos with an existing thumbnail but
 // missing duration metadata, because the thumbnail worker probes duration while
 // it already has a stream link.
-// Failed thumbnails are reported separately and should not block teaser generation.
+// Failed thumbnails are reported separately and should not block preview-video generation.
 // Videos whose local assets were cleared because they are fingerprint duplicates
 // stay pending in the DB, but uniqueVideoWhereSQL keeps them out of this queue
 // while their canonical sibling still exists.
@@ -713,8 +714,10 @@ func (c *Catalog) ListSpider91Viewkeys(ctx context.Context, driveID string) ([]s
 func (c *Catalog) ListVideoIDSuffixesByPrefix(ctx context.Context, kindPrefix, driveID string) ([]string, error) {
 	prefix := strings.TrimSpace(kindPrefix) + "-" + driveID + "-"
 	rows, err := c.db.QueryContext(ctx,
-		`SELECT SUBSTR(id, ?) FROM videos WHERE id LIKE ? || '%'`,
-		len(prefix)+1, prefix)
+		`SELECT SUBSTR(id, ?) FROM videos WHERE id LIKE ? || '%'
+		 UNION
+		 SELECT SUBSTR(id, ?) FROM deleted_videos WHERE id LIKE ? || '%'`,
+		len(prefix)+1, prefix, len(prefix)+1, prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -730,6 +733,69 @@ func (c *Catalog) ListVideoIDSuffixesByPrefix(ctx context.Context, kindPrefix, d
 		}
 	}
 	return out, rows.Err()
+}
+
+// DeleteVideoWithTombstone records that an administrator explicitly deleted a
+// video, then removes the visible catalog row. The tombstone is used by
+// scanners/crawlers to avoid importing the same source file again.
+func (c *Catalog) DeleteVideoWithTombstone(ctx context.Context, id string) error {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var v struct {
+		ID          string
+		DriveID     string
+		FileID      string
+		ContentHash string
+		FileName    string
+		Size        int64
+	}
+	row := tx.QueryRowContext(ctx, `
+SELECT id, drive_id, file_id, COALESCE(content_hash, ''), COALESCE(file_name, ''), size_bytes
+  FROM videos
+ WHERE id = ?`, id)
+	if err := row.Scan(&v.ID, &v.DriveID, &v.FileID, &v.ContentHash, &v.FileName, &v.Size); err != nil {
+		return err
+	}
+	v.ContentHash = normalizeContentHash(v.ContentHash)
+
+	// 先记录这次视频关联的 tag_id，便于事务末尾清理孤儿 collection 标签。
+	tagIDs, err := collectVideoTagIDs(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+
+	now := time.Now().UnixMilli()
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO deleted_videos (id, drive_id, file_id, content_hash, file_name, size_bytes, deleted_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+  drive_id     = excluded.drive_id,
+  file_id      = excluded.file_id,
+  content_hash = excluded.content_hash,
+  file_name    = excluded.file_name,
+  size_bytes   = excluded.size_bytes,
+  deleted_at   = excluded.deleted_at`,
+		v.ID, v.DriveID, v.FileID, v.ContentHash, v.FileName, v.Size, now); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM video_tags WHERE video_id = ?`, id); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM videos WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return sql.ErrNoRows
+	}
+	if err := pruneOrphanCollectionTagsByID(ctx, tx, tagIDs); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (c *Catalog) DeleteVideo(ctx context.Context, id string) error {
@@ -763,6 +829,55 @@ func (c *Catalog) DeleteVideo(ctx context.Context, id string) error {
 	}
 
 	return tx.Commit()
+}
+
+func (c *Catalog) IsVideoDeleted(ctx context.Context, id string) (bool, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false, nil
+	}
+	var found int
+	err := c.db.QueryRowContext(ctx, `SELECT 1 FROM deleted_videos WHERE id = ? LIMIT 1`, id).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (c *Catalog) IsDeletedVideoCandidate(ctx context.Context, id, driveID, fileID, contentHash, fileName string, size int64) (bool, error) {
+	id = strings.TrimSpace(id)
+	driveID = strings.TrimSpace(driveID)
+	fileID = strings.TrimSpace(fileID)
+	contentHash = normalizeContentHash(contentHash)
+	fileName = strings.TrimSpace(fileName)
+	if id == "" && driveID == "" {
+		return false, nil
+	}
+
+	var found int
+	err := c.db.QueryRowContext(ctx, `
+SELECT 1
+  FROM deleted_videos
+ WHERE id = ?
+    OR (drive_id = ? AND ? != '' AND file_id = ?)
+    OR (drive_id = ? AND ? != '' AND content_hash = ?)
+    OR (drive_id = ? AND ? != '' AND ? > 0 AND file_name = ? AND size_bytes = ?)
+ LIMIT 1`,
+		id,
+		driveID, fileID, fileID,
+		driveID, contentHash, contentHash,
+		driveID, fileName, size, fileName, size,
+	).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (c *Catalog) FindVideoByContentHash(ctx context.Context, hash string) (*Video, error) {
@@ -1378,7 +1493,7 @@ func (c *Catalog) ListLocalMediaRefs(ctx context.Context) ([]LocalMediaRef, erro
 
 // DuplicateAssetCleanupCandidate points at a non-canonical video in a
 // size+sampled_sha256 duplicate group that still owns generated local assets.
-// The cleanup job uses this to remove duplicate thumbnails/teasers without
+// The cleanup job uses this to remove duplicate thumbnails/preview videos without
 // touching the original cloud file or deleting the catalog row.
 type DuplicateAssetCleanupCandidate struct {
 	VideoID       string
@@ -1506,7 +1621,7 @@ type Drive struct {
 	Credentials map[string]string `json:"credentials,omitempty"`
 	Status      string            `json:"status"`
 	LastError   string            `json:"lastError,omitempty"`
-	// TeaserEnabled 控制是否给本盘生成 teaser/封面。
+	// TeaserEnabled 控制是否给本盘生成预览视频/封面。
 	// 替代早期的全局 preview.enabled 开关；新建 drive 时 UpsertDrive 默认置 true。
 	TeaserEnabled bool `json:"teaserEnabled"`
 	// SkipDirIDs 是用户在管理后台为该盘选定的"扫描跳过目录"集合（网盘侧的目录 fileID）。
@@ -1639,7 +1754,7 @@ func (c *Catalog) DeleteDrive(ctx context.Context, id string) error {
 	return err
 }
 
-// SetDriveTeaserEnabled 切换某盘的 teaser/封面生成开关。
+// SetDriveTeaserEnabled 切换某盘的预览视频/封面生成开关。
 //
 // 与 UpsertDrive 的区别：只动 teaser_enabled + updated_at 一列，不要求调用方
 // 重传 kind / name / credentials 等容易踩坑的字段。

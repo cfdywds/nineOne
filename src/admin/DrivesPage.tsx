@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
   ChevronRight,
+  CircleStop,
   Download,
   FolderTree,
   HardDrive,
@@ -58,20 +60,41 @@ export function DrivesPage() {
   const [regenFailedFingerprintId, setRegenFailedFingerprintId] = useState("");
   const [togglingTeaserId, setTogglingTeaserId] = useState("");
   const [scanningAll, setScanningAll] = useState(false);
+  const [stoppingAll, setStoppingAll] = useState(false);
   const [trackingNightly, setTrackingNightly] = useState(false);
   const [scanningDriveId, setScanningDriveId] = useState("");
-  const [selectedDriveId, setSelectedDriveId] = useState<string | null>(null);
+  const [stoppingDriveId, setStoppingDriveId] = useState("");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const selectedDriveId = searchParams.get("drive") || null;
   const { show } = useToast();
   const pollConnectionLost = useRef(false);
   const nightlyBusy = scanningAll || nightlyStatus.running || nightlyStatus.queued;
   const nameMissing = form.name.trim().length === 0;
   const nameError = nameTouched && nameMissing ? "请填写网盘名称" : "";
-  const formDirty = !sameForm(form, initialForm);
+  const formDirty = form.id
+    ? !sameForm(form, initialForm)
+    : hasCreateFormChanges(form, initialForm);
 
   const uploadTargets = useMemo(
-    () => list.filter((d) => d.kind === "pikpak" || d.kind === "p115" || d.kind === "onedrive"),
+    () => list.filter((d) => d.kind === "pikpak" || d.kind === "p115" || d.kind === "p123" || d.kind === "onedrive"),
     [list]
   );
+
+  function openDriveDetail(id: string) {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.set("drive", id);
+      return next;
+    });
+  }
+
+  function closeDriveDetail(options?: { replace?: boolean }) {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete("drive");
+      return next;
+    }, options);
+  }
 
   async function refresh() {
     setLoading(true);
@@ -187,6 +210,13 @@ export function DrivesPage() {
     setNameTouched(false);
   }
 
+  function handleCreateFormChange(nextForm: FormState) {
+    setForm(nextForm);
+    if (!nextForm.id && !hasCreateFormChanges(nextForm, initialForm)) {
+      setInitialForm(nextForm);
+    }
+  }
+
   async function handleSave() {
     const name = form.name.trim();
     if (!name || !form.kind) {
@@ -255,7 +285,7 @@ export function DrivesPage() {
       show(`已删除，并清理 ${resp.deletedVideos ?? 0} 个视频`, "success");
       setDeleteTarget(null);
       if (selectedDriveId === d.id) {
-        setSelectedDriveId(null);
+        closeDriveDetail({ replace: true });
       }
       refresh();
     } catch (e) {
@@ -304,11 +334,51 @@ export function DrivesPage() {
     }
   }
 
+  async function handleStopAllTasks() {
+    if (stoppingAll) return;
+    setStoppingAll(true);
+    try {
+      const resp = await api.stopAllTasks();
+      setNightlyStatus(resp.status);
+      setTrackingNightly(false);
+      show(
+        resp.stoppedDrives > 0
+          ? `已停止 ${resp.stoppedDrives} 个网盘的当前任务`
+          : "没有正在运行的网盘任务",
+        "success"
+      );
+      refreshDriveList();
+    } catch (e) {
+      show(e instanceof Error ? e.message : "停止失败", "error");
+    } finally {
+      setStoppingAll(false);
+    }
+  }
+
+  async function handleStopDriveTasks(d: api.AdminDrive) {
+    if (stoppingDriveId) return;
+    setStoppingDriveId(d.id);
+    try {
+      const resp = await api.stopDriveTasks(d.id);
+      show(
+        resp.stopped
+          ? `已停止「${d.name || d.id}」的当前任务`
+          : `「${d.name || d.id}」没有正在运行的任务`,
+        "success"
+      );
+      refreshDriveList();
+    } catch (e) {
+      show(e instanceof Error ? e.message : "停止失败", "error");
+    } finally {
+      setStoppingDriveId("");
+    }
+  }
+
   async function handleRegenFailed(d: api.AdminDrive) {
     setRegenFailedId(d.id);
     try {
       await api.regenFailedPreviews(d.id);
-      show("已触发失败 teaser 重新生成", "success");
+      show("已触发预览视频生成", "success");
       refresh();
     } catch (e) {
       show(e instanceof Error ? e.message : "触发失败", "error");
@@ -321,7 +391,7 @@ export function DrivesPage() {
     setRegenFailedThumbId(d.id);
     try {
       await api.regenFailedThumbnails(d.id);
-      show("已触发失败封面重新生成", "success");
+      show("已触发封面生成", "success");
       refresh();
     } catch (e) {
       show(e instanceof Error ? e.message : "触发失败", "error");
@@ -334,7 +404,7 @@ export function DrivesPage() {
     setRegenFailedFingerprintId(d.id);
     try {
       await api.regenFailedFingerprints(d.id);
-      show("已触发失败指纹重新生成", "success");
+      show("已触发指纹生成", "success");
       refresh();
     } catch (e) {
       show(e instanceof Error ? e.message : "触发失败", "error");
@@ -355,8 +425,8 @@ export function DrivesPage() {
       const resp = await api.setDriveTeaserEnabled(d.id, next);
       show(
         resp.teaserEnabled
-          ? `已开启「${d.name || d.id}」的 Teaser 生成`
-          : `已关闭「${d.name || d.id}」的 Teaser 生成`,
+          ? `已开启「${d.name || d.id}」的预览视频生成`
+          : `已关闭「${d.name || d.id}」的预览视频生成`,
         "success"
       );
       setList((prev) =>
@@ -392,16 +462,17 @@ export function DrivesPage() {
           <button
             type="button"
             className="admin-drive-detail__back-btn"
-            onClick={() => setSelectedDriveId(null)}
+            onClick={() => closeDriveDetail({ replace: true })}
             title="返回网盘列表"
           >
             <ArrowLeft size={16} />
           </button>
           <div className="admin-drive-detail__title-wrap">
             <h1 className="admin-drive-detail__title">{d.name || d.id}</h1>
-            <span className="admin-mono-cell" style={{ fontSize: "14px", color: "var(--text-faint)" }}>
-              ({d.id})
-            </span>
+          </div>
+          <div className="admin-drive-detail__header-right">
+            <span className="admin-drive-detail__kind-chip">{kindLabel[d.kind] ?? d.kind}</span>
+            <StatusTag kind={d.kind} status={d.status} error={d.lastError} hasCred={d.hasCredential} />
           </div>
         </header>
 
@@ -411,16 +482,11 @@ export function DrivesPage() {
               <header className="admin-detail-card__title">
                 <div className="admin-detail-card__title-left">
                   <HardDrive size={16} />
-                  <span>基本信息与状态</span>
+                  <span>基本信息</span>
                 </div>
-                <StatusTag kind={d.kind} status={d.status} error={d.lastError} hasCred={d.hasCredential} />
               </header>
 
               <div className="admin-detail-grid">
-                <div className="admin-detail-row">
-                  <span className="admin-detail-label">网盘类型</span>
-                  <span className="admin-detail-value">{kindLabel[d.kind] ?? d.kind}</span>
-                </div>
                 <div className="admin-detail-row">
                   <span className="admin-detail-label">网盘 ID</span>
                   <span className="admin-detail-value admin-mono-cell">{d.id}</span>
@@ -439,39 +505,46 @@ export function DrivesPage() {
                     </span>
                   </div>
                 )}
-                {d.lastError && (
-                  <div className="admin-detail-row" style={{ alignItems: "start" }}>
-                    <span className="admin-detail-label">最后一次错误</span>
-                    <span className="admin-detail-value" style={{ color: "var(--danger)" }}>
-                      {d.lastError}
-                    </span>
-                  </div>
-                )}
               </div>
+              {d.lastError && (
+                <div className="admin-detail-error">{d.lastError}</div>
+              )}
 
               <div className="admin-detail-actions">
-                <button
-                  type="button"
-                  className="admin-btn is-primary"
-                  onClick={() => handleRescan(d)}
-                  disabled={!!scanningDriveId}
-                >
-                  {isSpiderCrawlerKind(d.kind) ? (
-                    <>
-                      <Download size={13} className={scanningDriveId === d.id ? "admin-spin" : undefined} />
-                      {scanningDriveId === d.id ? "触发中..." : "立即抓取"}
-                    </>
-                  ) : (
-                    <>
-                      <RefreshCw size={13} className={scanningDriveId === d.id ? "admin-spin" : undefined} />
-                      {scanningDriveId === d.id ? "触发中..." : "立即重扫"}
-                    </>
-                  )}
-                </button>
+                <div className="admin-task-controls" aria-label="当前网盘任务控制">
+                  <button
+                    type="button"
+                    className="admin-btn is-primary"
+                    onClick={() => handleRescan(d)}
+                    disabled={!!scanningDriveId}
+                  >
+                    {isSpiderCrawlerKind(d.kind) ? (
+                      <>
+                        <Download size={13} className={scanningDriveId === d.id ? "admin-spin" : undefined} />
+                        {scanningDriveId === d.id ? "触发中..." : "立即抓取"}
+                      </>
+                    ) : (
+                      <>
+                        <RefreshCw size={13} className={scanningDriveId === d.id ? "admin-spin" : undefined} />
+                        {scanningDriveId === d.id ? "触发中..." : "立即重扫"}
+                      </>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    className="admin-btn is-stop"
+                    onClick={() => handleStopDriveTasks(d)}
+                    disabled={!!stoppingDriveId}
+                    title="停止此网盘当前的扫描、封面、预览视频和视频指纹生成任务。"
+                  >
+                    <CircleStop size={13} />
+                    {stoppingDriveId === d.id ? "停止中..." : "停止所有任务"}
+                  </button>
+                </div>
                 <button type="button" className="admin-btn" onClick={() => openEdit(d)}>
                   {isSpiderCrawlerKind(d.kind) ? "编辑配置" : "编辑配置凭证"}
                 </button>
-                <button type="button" className="admin-btn is-danger" onClick={() => setDeleteTarget(d)} style={{ marginLeft: "auto" }}>
+                <button type="button" className="admin-btn is-danger admin-detail-actions__danger" onClick={() => setDeleteTarget(d)}>
                   <Trash2 size={13} /> 删除网盘
                 </button>
               </div>
@@ -512,21 +585,18 @@ export function DrivesPage() {
                   <span>本地存储占用</span>
                 </div>
               </header>
-
-              <div className="admin-detail-grid">
-                <div className="admin-detail-row">
-                  <span className="admin-detail-label">封面占用</span>
-                  <span className="admin-detail-value">{formatBytes(driveStorage?.thumbnailBytes ?? 0)}</span>
+              <div className="admin-local-storage-metrics">
+                <div className="admin-local-storage-metric">
+                  <span>封面</span>
+                  <strong>{formatBytes(driveStorage?.thumbnailBytes ?? 0)}</strong>
                 </div>
-                <div className="admin-detail-row">
-                  <span className="admin-detail-label">预览视频占用</span>
-                  <span className="admin-detail-value">{formatBytes(driveStorage?.teaserBytes ?? 0)}</span>
+                <div className="admin-local-storage-metric">
+                  <span>预览视频</span>
+                  <strong>{formatBytes(driveStorage?.teaserBytes ?? 0)}</strong>
                 </div>
-                <div className="admin-detail-row">
-                  <span className="admin-detail-label">本地总占用</span>
-                  <span className="admin-detail-value" style={{ fontWeight: "bold" }}>
-                    {formatBytes(driveStorage?.totalBytes ?? 0)}
-                  </span>
+                <div className="admin-local-storage-metric">
+                  <span>合计</span>
+                  <strong>{formatBytes(driveStorage?.totalBytes ?? 0)}</strong>
                 </div>
               </div>
             </div>
@@ -578,6 +648,8 @@ export function DrivesPage() {
           message="当前网盘配置有未保存的更改，确定要放弃吗？"
           confirmText="放弃更改"
           danger
+          centerMessage
+          modalClassName="admin-modal--delete-confirm"
           onCancel={() => setDiscardConfirmOpen(false)}
           onConfirm={discardDriveChanges}
         />
@@ -590,16 +662,27 @@ export function DrivesPage() {
     <section>
       <header className="admin-page__header">
         <h1 className="admin-page__title">网盘管理</h1>
-        <div style={{ display: "flex", gap: "8px" }}>
-          <button
-            type="button"
-            className="admin-btn"
-            onClick={handleRunNightly}
-            disabled={scanningAll}
-            title={nightlyBusyText(nightlyStatus) || "立即扫描所有网盘。耗时较长，期间不要重复触发。"}
-          >
-            <PlayCircle size={14} /> {nightlyButtonText(nightlyStatus, scanningAll)}
-          </button>
+        <div className="admin-page__actions admin-drive-list-actions">
+          <div className="admin-task-controls" aria-label="所有网盘任务控制">
+            <button
+              type="button"
+              className="admin-btn"
+              onClick={handleRunNightly}
+              disabled={scanningAll}
+              title={nightlyBusyText(nightlyStatus) || "立即扫描所有网盘。耗时较长，期间不要重复触发。"}
+            >
+              <PlayCircle size={14} /> {nightlyButtonText(nightlyStatus, scanningAll)}
+            </button>
+            <button
+              type="button"
+              className="admin-btn is-stop"
+              onClick={handleStopAllTasks}
+              disabled={stoppingAll}
+              title="停止所有网盘当前的扫描、封面、预览视频和视频指纹生成任务。"
+            >
+              <CircleStop size={14} /> {stoppingAll ? "停止中..." : "停止所有网盘任务"}
+            </button>
+          </div>
           <button type="button" className="admin-btn is-primary" onClick={openCreate}>
             <Plus size={14} /> 新建网盘
           </button>
@@ -609,7 +692,10 @@ export function DrivesPage() {
       {storage && <StorageSummary storage={storage} />}
 
       {loading ? (
-        <div className="admin-empty">加载中...</div>
+        <div className="admin-loading-state">
+          <RefreshCw size={20} className="admin-spin" />
+          <span>加载中...</span>
+        </div>
       ) : loadError ? (
         <div className="admin-error-state">
           <strong>网盘数据加载失败</strong>
@@ -620,7 +706,7 @@ export function DrivesPage() {
         </div>
       ) : list.length === 0 ? (
         <div className="admin-card admin-empty">
-          还没有配置任何网盘。点击右上角「新建」，选择夸克 / 115 / PikPak / 沃盘 / OneDrive / 本地存储，填入凭证或路径即可。
+          当前还没有配置任何网盘
         </div>
       ) : (
         <div className="admin-drives-grid">
@@ -629,7 +715,7 @@ export function DrivesPage() {
               type="button"
               key={d.id}
               className="admin-drive-card"
-              onClick={() => setSelectedDriveId(d.id)}
+              onClick={() => openDriveDetail(d.id)}
               aria-label={`管理网盘 ${d.name || d.id}`}
             >
               <div className="admin-drive-card__header">
@@ -677,11 +763,12 @@ export function DrivesPage() {
       >
         <DriveForm
           form={form}
-          onChange={setForm}
+          onChange={handleCreateFormChange}
           isEdit={!!list.find((x) => x.id === form.id)}
           uploadTargets={uploadTargets}
           nameError={nameError}
           onNameBlur={() => setNameTouched(true)}
+          onBack={() => setNameTouched(false)}
         />
       </Modal>
       <DeleteDriveModal
@@ -700,6 +787,8 @@ export function DrivesPage() {
         message="当前网盘配置有未保存的更改，确定要放弃吗？"
         confirmText="放弃更改"
         danger
+        centerMessage
+        modalClassName="admin-modal--delete-confirm"
         onCancel={() => setDiscardConfirmOpen(false)}
         onConfirm={discardDriveChanges}
       />
@@ -724,4 +813,11 @@ function sameRecord(a: Record<string, string>, b: Record<string, string>): boole
     if ((a[key] ?? "") !== (b[key] ?? "")) return false;
   }
   return true;
+}
+
+function hasCreateFormChanges(form: FormState, initial: FormState): boolean {
+  if (form.name.trim() !== "") return true;
+  if (form.rootId.trim() !== "") return true;
+  if (form.spider91UploadDriveId !== initial.spider91UploadDriveId) return true;
+  return Object.values(form.creds).some((value) => value.trim() !== "");
 }

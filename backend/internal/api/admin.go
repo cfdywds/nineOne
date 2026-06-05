@@ -39,27 +39,30 @@ type AdminServer struct {
 	SetupRequired func() bool
 	// OnSetup 持久化首次部署时设置的管理员账号密码，并更新运行中认证器。
 	OnSetup func(username, password string) error
-	// LocalPreviewDir is the local directory that stores generated teasers and thumbs.
+	// LocalPreviewDir is the local directory that stores generated preview videos and thumbs.
 	LocalPreviewDir string
 	// Hooks：外层注入实际执行者
 	OnDriveSaved               func(driveID string) error
 	OnDriveDeleteCleanup       func(ctx context.Context, driveID string) (int, error)
 	OnDriveRemoved             func(driveID string)
 	OnScanRequested            func(driveID string)
+	OnStopDriveTasks           func(driveID string) bool
+	OnStopAllTasks             func() int
 	OnRegenPreview             func(videoID string)
 	OnRegenAllPreviews         func()
 	OnRegenFailedPreviews      func(driveID string)
 	OnRegenFailedThumbnails    func(driveID string)
 	OnRegenFailedFingerprints  func(driveID string)
+	OnDeleteVideo              func(ctx context.Context, videoID string) (DeleteVideoResult, error)
 	GetDriveGenerationStatuses func() map[string]DriveGenerationStatuses
-	// OnTeaserEnabledChanged 在 per-drive teaser 开关被切换后调用。
-	// enabled=true 时上层应该重新把 pending teaser 入队（类似旧的全局开关从关到开）；
+	// OnTeaserEnabledChanged 在 per-drive 预览视频开关被切换后调用。
+	// enabled=true 时上层应该重新把 pending 预览视频入队（类似旧的全局开关从关到开）；
 	// enabled=false 时通常不用做事 —— worker 入队前会再次查 catalog，自然停止。
 	OnTeaserEnabledChanged func(driveID string, enabled bool)
 	// Theme 读写（"dark" | "pink"）
 	GetTheme func() string
 	SetTheme func(theme string) error
-	// Spider91 → 115/PikPak 上传目标 drive ID 读写
+	// Spider91 → 115/123/PikPak/OneDrive 上传目标 drive ID 读写
 	GetSpider91UploadDriveID func() string
 	SetSpider91UploadDriveID func(driveID string) error
 	// OnRunNightlyJob 触发一次完整的凌晨流水线（Phase1 扫盘 + Phase2 91 爬虫 +
@@ -105,6 +108,11 @@ type NightlyJobStatus struct {
 	LastFinishedAt string `json:"lastFinishedAt,omitempty"`
 }
 
+type DeleteVideoResult struct {
+	OK            bool `json:"ok"`
+	DeletedSource bool `json:"deletedSource"`
+}
+
 func (a *AdminServer) Register(r chi.Router) {
 	r.Route("/admin/api", func(r chi.Router) {
 		// 登录、登出和首次部署初始化不需要鉴权
@@ -126,6 +134,7 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Get("/drives/p123/qr/{uniID}", a.handleP123QRStatus)
 			r.Delete("/drives/{id}", a.handleDeleteDrive)
 			r.Post("/drives/{id}/rescan", a.handleRescan)
+			r.Post("/drives/{id}/tasks/stop", a.handleStopDriveTasks)
 			r.Post("/drives/{id}/teaser-enabled", a.handleSetDriveTeaserEnabled)
 			r.Post("/drives/{id}/skip-dirs", a.handleSetDriveSkipDirs)
 			r.Get("/drives/{id}/dirtree", a.handleListDriveDirTree)
@@ -136,6 +145,7 @@ func (a *AdminServer) Register(r chi.Router) {
 			// 视频
 			r.Get("/videos", a.handleAdminListVideos)
 			r.Put("/videos/{id}", a.handleUpdateVideo)
+			r.Delete("/videos/{id}", a.handleDeleteVideo)
 			r.Post("/videos/regen-preview", a.handleRegenAllPreviews)
 			r.Post("/videos/{id}/regen-preview", a.handleRegenPreview)
 
@@ -152,6 +162,7 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Get("/update/check", a.handleCheckUpdate)
 			r.Get("/jobs/nightly/status", a.handleNightlyJobStatus)
 			r.Post("/jobs/nightly/run", a.handleRunNightlyJob)
+			r.Post("/tasks/stop", a.handleStopAllTasks)
 		})
 	})
 }
@@ -396,7 +407,7 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		Status        string `json:"status"`
 		LastError     string `json:"lastError,omitempty"`
 		HasCredential bool   `json:"hasCredential"`
-		// TeaserEnabled 控制是否给本盘生成 teaser/封面。前端用它在网盘列表/编辑表单展示开关状态。
+		// TeaserEnabled 控制是否给本盘生成预览视频/封面。前端用它在网盘列表/编辑表单展示开关状态。
 		TeaserEnabled bool `json:"teaserEnabled"`
 		// SkipDirIDs 是用户在 admin 配置的"扫描跳过目录"集合（drive 侧目录 fileID）。
 		// 前端用它在"设置跳过目录"弹窗里回显已选项；JSON 字段名 camelCase 与
@@ -491,7 +502,7 @@ type upsertDriveReq struct {
 	// Deprecated: 扫描起点已固定为 rootId；保留字段只为兼容旧客户端请求体。
 	ScanRootID  string            `json:"scanRootId"`
 	Credentials map[string]string `json:"credentials"`
-	// TeaserEnabled 是 per-drive teaser/封面生成开关。
+	// TeaserEnabled 是 per-drive 预览视频/封面生成开关。
 	// 用 *bool 区分 "未传" / "传了 false"：未传时表示客户端不打算改这个字段，
 	// 沿用 catalog 现有值；新建时未传一律默认开启（true）。
 	TeaserEnabled *bool `json:"teaserEnabled,omitempty"`
@@ -670,6 +681,18 @@ func (a *AdminServer) handleRescan(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
 }
 
+func (a *AdminServer) handleStopDriveTasks(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	stopped := false
+	if a.OnStopDriveTasks != nil {
+		stopped = a.OnStopDriveTasks(id)
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"ok":      true,
+		"stopped": stopped,
+	})
+}
+
 func (a *AdminServer) p123QRClient() *p123.QRClient {
 	return p123.NewQRClient(p123.QRConfig{
 		UserAPIBaseURL: a.P123UserAPIBaseURL,
@@ -722,6 +745,18 @@ func (a *AdminServer) handleNightlyJobStatus(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, a.nightlyJobStatus())
 }
 
+func (a *AdminServer) handleStopAllTasks(w http.ResponseWriter, r *http.Request) {
+	stoppedDrives := 0
+	if a.OnStopAllTasks != nil {
+		stoppedDrives = a.OnStopAllTasks()
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"ok":            true,
+		"stoppedDrives": stoppedDrives,
+		"status":        a.nightlyJobStatus(),
+	})
+}
+
 func (a *AdminServer) nightlyJobStatus() NightlyJobStatus {
 	if a.GetNightlyJobStatus == nil {
 		return NightlyJobStatus{State: "idle"}
@@ -738,11 +773,11 @@ type teaserEnabledReq struct {
 	Enabled bool `json:"enabled"`
 }
 
-// handleSetDriveTeaserEnabled 切换某盘的 teaser 生成开关。
+// handleSetDriveTeaserEnabled 切换某盘的预览视频生成开关。
 //
 // 行为：
 //   - 写 catalog.drives.teaser_enabled
-//   - 调 OnTeaserEnabledChanged（main 注入；从关到开时会重新入队 pending teaser）
+//   - 调 OnTeaserEnabledChanged（main 注入；从关到开时会重新入队 pending 预览视频）
 //   - 返回切换后的新值，方便前端乐观更新但又能以服务端为准
 //
 // 与 upsertDrive 的区别：那条接口要重传 kind / name / rootId 等，开关切换不该
@@ -1003,6 +1038,36 @@ func (a *AdminServer) handleUpdateVideo(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, v)
 }
 
+func (a *AdminServer) handleDeleteVideo(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid video id"))
+		return
+	}
+	var (
+		result DeleteVideoResult
+		err    error
+	)
+	if a.OnDeleteVideo != nil {
+		result, err = a.OnDeleteVideo(r.Context(), id)
+	} else {
+		err = a.Catalog.DeleteVideoWithTombstone(r.Context(), id)
+		result = DeleteVideoResult{OK: err == nil}
+	}
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeErr(w, http.StatusNotFound, err)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !result.OK {
+		result.OK = true
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 func (a *AdminServer) handleRegenPreview(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if a.OnRegenPreview != nil {
@@ -1027,7 +1092,7 @@ func (a *AdminServer) handleRegenFailedPreviews(w http.ResponseWriter, r *http.R
 }
 
 // handleRegenFailedThumbnails 触发某 drive 下所有 thumbnail_status=failed 的封面
-// 重新入队生成。和 handleRegenFailedPreviews 行为对称（一个管 teaser，一个管封面）。
+// 重新入队生成。和 handleRegenFailedPreviews 行为对称（一个管预览视频，一个管封面）。
 //
 // 立即返回 202；实际执行在后台 goroutine 跑，状态可在下次 GET /admin/api/drives
 // 的 thumbnailFailedCount / thumbnailGenerationStatus 看变化。
@@ -1040,7 +1105,7 @@ func (a *AdminServer) handleRegenFailedThumbnails(w http.ResponseWriter, r *http
 }
 
 // handleRegenFailedFingerprints triggers regeneration for all failed sampled
-// fingerprints on a drive. It mirrors the failed teaser/thumbnail retry endpoints.
+// fingerprints on a drive. It mirrors the failed preview-video/thumbnail retry endpoints.
 func (a *AdminServer) handleRegenFailedFingerprints(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if a.OnRegenFailedFingerprints != nil {
@@ -1054,7 +1119,7 @@ func (a *AdminServer) handleRegenFailedFingerprints(w http.ResponseWriter, r *ht
 // settingsDTO 是 GET/PUT /admin/api/settings 的入参/出参。
 //
 // 注意：早期的全局 previewEnabled 字段已经下沉为每盘 teaser_enabled，
-// 不再出现在这里；前端要切换某个盘的 teaser 生成请用 POST /admin/api/drives 上传
+// 不再出现在这里；前端要切换某个盘的预览视频生成请用 POST /admin/api/drives 上传
 // teaserEnabled 字段。保留 settings 用作主题、spider91 上传目标这类全局配置。
 type settingsDTO struct {
 	Theme                 string `json:"theme"`

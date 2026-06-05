@@ -263,7 +263,7 @@ func (d *Driver) findChildDir(ctx context.Context, parent, name string) (string,
 	return "", nil
 }
 
-// ---------- 上传（第一版不实现，走本地 teaser 兜底） ----------
+// ---------- 上传（第一版不实现，走本地预览视频兜底） ----------
 
 func (d *Driver) Upload(ctx context.Context, parentID, name string, r io.Reader, size int64) (string, error) {
 	return "", drives.ErrNotSupported

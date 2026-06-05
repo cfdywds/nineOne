@@ -66,10 +66,10 @@ func (c *Catalog) migrate(ctx context.Context) error {
 	if err := c.addColumnIfMissing(ctx, "videos", "thumbnail_failures", "INTEGER DEFAULT 0"); err != nil {
 		return err
 	}
-	// drives.teaser_enabled：每盘 teaser 开关，替代旧的全局 preview.enabled。
+	// drives.teaser_enabled：每盘预览视频开关，替代旧的全局 preview.enabled。
 	// 升级路径：直接让 ALTER TABLE 的 DEFAULT 1 兜底 —— 每个现存 drive 都默认开启，
 	// 不读旧的 settings.preview.enabled 字段。这样老用户即便之前关过全局开关，
-	// 升级后所有盘也都恢复"默认生成 teaser"，跟新建保持一致。
+	// 升级后所有盘也都恢复"默认生成预览视频"，跟新建保持一致。
 	if _, err := c.addColumnIfMissingReportNew(ctx, "drives", "teaser_enabled", "INTEGER NOT NULL DEFAULT 1"); err != nil {
 		return err
 	}
@@ -77,6 +77,18 @@ func (c *Catalog) migrate(ctx context.Context) error {
 	// 其中任意一个的目录及其全部子目录都不会被递归扫描。替代旧版硬编码"影视"
 	// 目录例外分支；旧 drive 升级后默认空数组 → 行为等同于以前未启用跳过。
 	if err := c.addColumnIfMissing(ctx, "drives", "skip_dir_ids", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS deleted_videos (
+	id           TEXT PRIMARY KEY,
+	drive_id     TEXT NOT NULL DEFAULT '',
+	file_id      TEXT NOT NULL DEFAULT '',
+	content_hash TEXT NOT NULL DEFAULT '',
+	file_name    TEXT NOT NULL DEFAULT '',
+	size_bytes   INTEGER NOT NULL DEFAULT 0,
+	deleted_at   INTEGER NOT NULL
+)`); err != nil {
 		return err
 	}
 	if err := c.syncDriveScanRootIDToRootID(ctx); err != nil {
@@ -119,6 +131,15 @@ func (c *Catalog) migrate(ctx context.Context) error {
 		return err
 	}
 	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_file_name_size_created ON videos(file_name, size_bytes, created_at, id)`); err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_deleted_videos_drive_file ON deleted_videos(drive_id, file_id)`); err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_deleted_videos_drive_hash ON deleted_videos(drive_id, content_hash)`); err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_deleted_videos_drive_signature ON deleted_videos(drive_id, file_name, size_bytes)`); err != nil {
 		return err
 	}
 	if err := c.seedSystemTags(ctx); err != nil {
@@ -193,7 +214,7 @@ func (c *Catalog) addColumnIfMissingReportNew(ctx context.Context, table, column
 // 设为 1（开启），但仅在历史上没跑过这条迁移时执行（用 marker setting 记号）。
 //
 // 为什么需要：早期短暂存在过的版本会从旧的全局 preview.enabled = "0" 同步到
-// 所有 drive 的 teaser_enabled = 0；用户报告升级后页面全显示"Teaser 关"。新版
+// 所有 drive 的 teaser_enabled = 0；用户报告升级后页面全显示"预览视频关"。新版
 // 约定 per-drive 默认开启，所以这里跑一次性修正。
 //
 // 幂等保证：marker setting 设过了就不再跑，确保用户在 UI 里把某盘关了不会被

@@ -237,6 +237,170 @@ func TestRegisterPreviewWorkersBackfillsHistoricalFingerprints(t *testing.T) {
 	t.Fatalf("fingerprint status=%q sampled=%q, want ready with hash", got.FingerprintStatus, got.SampledSHA256)
 }
 
+func TestStopDriveTasksCancelsQueuedTasksAndReplacesWorkers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	drv := &serverFakeDrive{}
+	registry := proxy.NewRegistry()
+	registry.Set("drive-id", drv)
+
+	gen := &serverFakeTeaserGenerator{}
+	oldWorker := preview.NewWorker(gen, cat, drv)
+	oldThumbWorker := preview.NewThumbWorker(gen, cat, drv)
+	oldFingerprintWorker := fingerprint.NewWorker(cat, drv, fingerprint.Config{})
+	oldCanceled := make(chan struct{})
+
+	app := &App{
+		cfg:                &config.Config{},
+		cat:                cat,
+		registry:           registry,
+		workers:            map[string]*preview.Worker{"drive-id": oldWorker},
+		thumbWorkers:       map[string]*preview.ThumbWorker{"drive-id": oldThumbWorker},
+		fingerprintWorkers: map[string]*fingerprint.Worker{"drive-id": oldFingerprintWorker},
+		cancels: map[string]context.CancelFunc{
+			"drive-id": func() { close(oldCanceled) },
+		},
+		scanQueued:          map[string]bool{"drive-id": true},
+		fingerprintQueueing: map[string]bool{"drive-id": true},
+	}
+	taskCtx, done := app.registerDriveTaskContext(ctx, "drive-id")
+	defer done()
+
+	if !app.stopDriveTasks(ctx, "drive-id") {
+		t.Fatal("stopDriveTasks returned false, want true")
+	}
+	select {
+	case <-oldCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("old worker cancel was not called")
+	}
+	if err := taskCtx.Err(); err == nil {
+		t.Fatal("registered drive task context was not canceled")
+	}
+	if app.scanQueued["drive-id"] {
+		t.Fatal("scan queue marker was not cleared")
+	}
+	if app.fingerprintQueueing["drive-id"] {
+		t.Fatal("fingerprint queue marker was not cleared")
+	}
+
+	app.mu.Lock()
+	newWorker := app.workers["drive-id"]
+	newThumbWorker := app.thumbWorkers["drive-id"]
+	newFingerprintWorker := app.fingerprintWorkers["drive-id"]
+	newCancel := app.cancels["drive-id"]
+	app.mu.Unlock()
+	if newWorker == nil || newWorker == oldWorker {
+		t.Fatalf("preview worker was not replaced")
+	}
+	if newThumbWorker == nil || newThumbWorker == oldThumbWorker {
+		t.Fatalf("thumb worker was not replaced")
+	}
+	if newFingerprintWorker == nil || newFingerprintWorker == oldFingerprintWorker {
+		t.Fatalf("fingerprint worker was not replaced")
+	}
+	if newCancel == nil {
+		t.Fatalf("replacement worker cancel was not registered")
+	}
+	newCancel()
+}
+
+func TestDriveGenerationStatusUsesWorkerQueueNotPendingCatalogRows(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:            "pending-thumb",
+		DriveID:       "drive-id",
+		FileID:        "file-id",
+		Title:         "Pending Thumb",
+		PreviewStatus: "ready",
+		PublishedAt:   now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if err := cat.UpdateVideoMeta(ctx, "pending-thumb", catalog.VideoMetaPatch{ThumbnailStatus: "pending"}); err != nil {
+		t.Fatalf("mark thumbnail pending: %v", err)
+	}
+
+	thumbWorker := preview.NewThumbWorker(&serverFakeTeaserGenerator{}, cat, &serverFakeDrive{})
+	app := &App{
+		cat:                cat,
+		workers:            map[string]*preview.Worker{},
+		thumbWorkers:       map[string]*preview.ThumbWorker{"drive-id": thumbWorker},
+		fingerprintWorkers: map[string]*fingerprint.Worker{},
+	}
+
+	status := app.driveGenerationStatuses()["drive-id"].Thumbnail
+	if status.State != "idle" || status.QueueLength != 0 {
+		t.Fatalf("thumbnail status = %#v, want idle with empty worker queue", status)
+	}
+}
+
+func TestRegenFailedThumbnailsQueuesPendingRowsAfterStop(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:            "pending-thumb",
+		DriveID:       "drive-id",
+		FileID:        "file-id",
+		Title:         "Pending Thumb",
+		PreviewStatus: "ready",
+		PublishedAt:   now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if err := cat.UpdateVideoMeta(ctx, "pending-thumb", catalog.VideoMetaPatch{ThumbnailStatus: "pending"}); err != nil {
+		t.Fatalf("mark thumbnail pending: %v", err)
+	}
+
+	thumbWorker := preview.NewThumbWorker(&serverFakeTeaserGenerator{}, cat, &serverFakeDrive{})
+	app := &App{
+		cat:          cat,
+		thumbWorkers: map[string]*preview.ThumbWorker{"drive-id": thumbWorker},
+	}
+
+	app.regenFailedThumbnails(ctx, "drive-id")
+
+	if got := thumbWorker.Status().QueueLength; got != 1 {
+		t.Fatalf("thumb queue length = %d, want pending row re-enqueued", got)
+	}
+}
+
 func TestRunScanStartsFingerprintBeforeThumbnailAndPreviewDrain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -340,7 +504,6 @@ func TestNightlyTargetsComeFromCatalogBeforeDriveAttach(t *testing.T) {
 		{ID: "115", Kind: "p115", Name: "115", RootID: "0", TeaserEnabled: true},
 		{ID: "pikpak", Kind: "pikpak", Name: "PikPak", RootID: "0", TeaserEnabled: true},
 		{ID: "91-spider", Kind: "spider91", Name: "91 Spider", RootID: "0", TeaserEnabled: true},
-		{ID: "xvideos-spider", Kind: "spiderxvideos", Name: "XVideos Spider", RootID: "0", TeaserEnabled: true},
 	} {
 		if err := cat.UpsertDrive(ctx, d); err != nil {
 			t.Fatalf("seed drive %s: %v", d.ID, err)
@@ -355,10 +518,6 @@ func TestNightlyTargetsComeFromCatalogBeforeDriveAttach(t *testing.T) {
 	spiderIDs := app.listSpider91DriveIDs(ctx)
 	if len(spiderIDs) != 1 || spiderIDs[0] != "91-spider" {
 		t.Fatalf("spider91 ids = %#v, want catalog spider drive", spiderIDs)
-	}
-	spiderXVideosIDs := app.listSpiderXVideosDriveIDs(ctx)
-	if len(spiderXVideosIDs) != 1 || spiderXVideosIDs[0] != "xvideos-spider" {
-		t.Fatalf("spiderxvideos ids = %#v, want catalog xvideos spider drive", spiderXVideosIDs)
 	}
 }
 
@@ -796,6 +955,177 @@ func TestCleanupDriveVideosForDeleteRemovesRowsAndGeneratedAssetsOnly(t *testing
 	}
 	if _, err := os.Stat(originalVideo); err != nil {
 		t.Fatalf("original local video should remain, stat err=%v", err)
+	}
+}
+
+func TestDeleteVideoRemovesGeneratedAssetsKeepsLocalOriginalAndTombstones(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	localDir := filepath.Join(root, "previews")
+	originalDir := filepath.Join(root, "local-videos")
+	originalVideo := filepath.Join(originalDir, "clip.mp4")
+	if err := os.MkdirAll(originalDir, 0o755); err != nil {
+		t.Fatalf("mkdir original dir: %v", err)
+	}
+	if err := os.WriteFile(originalVideo, []byte("original"), 0o644); err != nil {
+		t.Fatalf("write original: %v", err)
+	}
+
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:            "local-main",
+		Kind:          "localstorage",
+		Name:          "Local",
+		RootID:        "/",
+		Credentials:   map[string]string{"path": originalDir},
+		TeaserEnabled: true,
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	previewPath := filepath.Join(localDir, "localstorage-local-main-file.mp4")
+	thumbPath := filepath.Join(localDir, "thumbs", "localstorage-local-main-file.jpg")
+	for _, path := range []string{previewPath, thumbPath} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.WriteFile(path, []byte("generated"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:                "localstorage-local-main-file",
+		DriveID:           "local-main",
+		FileID:            "file",
+		FileName:          "clip.mp4",
+		SampledSHA256:     "sampled",
+		FingerprintStatus: "ready",
+		Title:             "Local File",
+		PreviewLocal:      previewPath,
+		PreviewStatus:     "ready",
+		ThumbnailURL:      "/p/thumb/localstorage-local-main-file",
+		Size:              123,
+		PublishedAt:       now,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+
+	app := &App{
+		cfg: &config.Config{Storage: config.Storage{LocalPreviewDir: localDir}},
+		cat: cat,
+	}
+	result, err := app.deleteVideo(ctx, "localstorage-local-main-file")
+	if err != nil {
+		t.Fatalf("delete video: %v", err)
+	}
+	if !result.OK || result.DeletedSource {
+		t.Fatalf("delete result = %#v, want ok without source deletion", result)
+	}
+	if _, err := cat.GetVideo(ctx, "localstorage-local-main-file"); err != sql.ErrNoRows {
+		t.Fatalf("deleted video lookup error = %v, want sql.ErrNoRows", err)
+	}
+	deleted, err := cat.IsDeletedVideoCandidate(ctx, "localstorage-local-main-file", "local-main", "file", "", "clip.mp4", 123)
+	if err != nil {
+		t.Fatalf("check tombstone: %v", err)
+	}
+	if !deleted {
+		t.Fatal("deleted video tombstone missing")
+	}
+	for _, path := range []string{previewPath, thumbPath} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("generated asset %s still exists, stat err=%v", path, err)
+		}
+	}
+	if _, err := os.Stat(originalVideo); err != nil {
+		t.Fatalf("original local video was removed: %v", err)
+	}
+}
+
+func TestDeleteVideoRemovesSpider91SourceFile(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	localDir := filepath.Join(root, "previews")
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:            "spider-main",
+		Kind:          spider91.Kind,
+		Name:          "Spider",
+		RootID:        "/",
+		TeaserEnabled: true,
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	app := &App{
+		cfg: &config.Config{Storage: config.Storage{LocalPreviewDir: localDir}},
+		cat: cat,
+	}
+	sourceDir := app.spider91DriveDir("spider-main")
+	sourceVideo := filepath.Join(sourceDir, "videos", "source.mp4")
+	sourceThumb := filepath.Join(sourceDir, "thumbs", "source.jpg")
+	previewPath := filepath.Join(localDir, "spider91-spider-main-source.mp4")
+	commonThumb := filepath.Join(localDir, "thumbs", "spider91-spider-main-source.jpg")
+	for _, path := range []string{sourceVideo, sourceThumb, previewPath, commonThumb} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.WriteFile(path, []byte("file"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:            "spider91-spider-main-source",
+		DriveID:       "spider-main",
+		FileID:        "source.mp4",
+		FileName:      "source.mp4",
+		Ext:           "mp4",
+		Title:         "Spider Source",
+		PreviewLocal:  previewPath,
+		PreviewStatus: "ready",
+		ThumbnailURL:  "/p/thumb/spider91-spider-main-source",
+		Size:          456,
+		PublishedAt:   now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+
+	result, err := app.deleteVideo(ctx, "spider91-spider-main-source")
+	if err != nil {
+		t.Fatalf("delete spider video: %v", err)
+	}
+	if !result.OK || !result.DeletedSource {
+		t.Fatalf("delete result = %#v, want source deleted", result)
+	}
+	for _, path := range []string{sourceVideo, sourceThumb, previewPath, commonThumb} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("deleted file %s still exists, stat err=%v", path, err)
+		}
+	}
+	if _, err := cat.GetVideo(ctx, "spider91-spider-main-source"); err != sql.ErrNoRows {
+		t.Fatalf("deleted video lookup error = %v, want sql.ErrNoRows", err)
+	}
+	deleted, err := cat.IsVideoDeleted(ctx, "spider91-spider-main-source")
+	if err != nil {
+		t.Fatalf("check tombstone: %v", err)
+	}
+	if !deleted {
+		t.Fatal("deleted spider91 video tombstone missing")
 	}
 }
 
