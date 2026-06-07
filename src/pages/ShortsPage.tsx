@@ -809,12 +809,25 @@ function ShortsSlide({
     }
   }, [isMarkedHidden]);
 
-  // 监听 video 的时长 / 进度 / 缓冲状态 / 音量物理键变化
+  // 监听 video 的时长 / 进度 / 缓冲状态 / 音量物理键变化。
+  // MOUNT_RADIUS 会让第三屏以后的 slide 先以海报占位，之后才挂载 video；
+  // 因此这里必须跟随 shouldMount 重新绑定，否则后续视频没有 timeupdate 事件。
   useEffect(() => {
+    if (!shouldMount) {
+      setDuration(0);
+      setCurrentTime(0);
+      setIsBuffering(false);
+      return;
+    }
     const video = localRef.current;
     if (!video) return;
     const handleLoaded = () => {
-      if (Number.isFinite(video.duration)) setDuration(video.duration);
+      if (Number.isFinite(video.duration) && video.duration > 0) {
+        setDuration(video.duration);
+      } else {
+        setDuration(0);
+      }
+      if (!scrubbingRef.current) setCurrentTime(video.currentTime || 0);
     };
     const handleTime = () => {
       // 拖动期间不要被 timeupdate 覆盖 UI
@@ -838,6 +851,7 @@ function ShortsSlide({
     };
 
     handleLoaded();
+    handleTime();
     video.addEventListener("loadedmetadata", handleLoaded);
     video.addEventListener("durationchange", handleLoaded);
     video.addEventListener("timeupdate", handleTime);
@@ -860,7 +874,7 @@ function ShortsSlide({
       video.removeEventListener("canplay", handlePlayingOrCanPlay);
       video.removeEventListener("volumechange", handleVolumeChange);
     };
-  }, [muted, volume, setMuted, setVolume]);
+  }, [shouldMount, item.id, muted, volume, setMuted, setVolume]);
 
   // 长按 2 倍速：直接绑原生事件
   useEffect(() => {

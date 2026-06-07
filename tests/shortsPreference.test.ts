@@ -31,6 +31,18 @@ test("shorts progress dragging uses immediate pointer state", () => {
   assert.match(shortsPageSource, /onLostPointerCapture=\{handleProgressPointerEnd\}/);
 });
 
+test("shorts progress listeners rebind when deferred videos mount", () => {
+  assert.match(
+    shortsPageSource,
+    /MOUNT_RADIUS 会让第三屏以后的 slide 先以海报占位/
+  );
+  assert.match(shortsPageSource, /if \(!shouldMount\) \{\s*setDuration\(0\);\s*setCurrentTime\(0\);/);
+  assert.match(
+    shortsPageSource,
+    /\}, \[shouldMount, item\.id, muted, volume, setMuted, setVolume\]\);/
+  );
+});
+
 test("shorts fullscreen changes preserve the active slide", () => {
   assert.match(shortsPageSource, /const activeIndexRef = useRef\(0\)/);
   assert.match(shortsPageSource, /const ignoreIntersectionUntilRef = useRef\(0\)/);

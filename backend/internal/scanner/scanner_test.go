@@ -3,6 +3,7 @@ package scanner
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -87,6 +88,50 @@ func TestRunIgnoresZeroSizeVideoFiles(t *testing.T) {
 	}
 	if _, err := cat.GetVideo(ctx, "fake-drive-empty-file"); err != sql.ErrNoRows {
 		t.Fatalf("get zero-size video error = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestRunStopsWhenContextCanceledDuringFileLoop(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	drv := &scannerFakeDrive{
+		entries: []drives.Entry{
+			{ID: "file-1", Name: "one.mp4", Size: 123},
+			{ID: "file-2", Name: "two.mp4", Size: 123},
+			{ID: "file-3", Name: "three.mp4", Size: 123},
+		},
+	}
+	callbacks := 0
+	sc := New(cat, drv, []string{".mp4"}, nil, func(*catalog.Video) {
+		callbacks++
+		cancel()
+	})
+
+	stats, err := sc.Run(ctx, "")
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("scan error = %v, want context.Canceled", err)
+	}
+	if stats.Added != 1 || callbacks != 1 {
+		t.Fatalf("added=%d callbacks=%d, want exactly one video before cancellation", stats.Added, callbacks)
+	}
+	if _, err := cat.GetVideo(context.Background(), "fake-drive-file-1"); err != nil {
+		t.Fatalf("first video should be persisted before cancellation: %v", err)
+	}
+	if _, err := cat.GetVideo(context.Background(), "fake-drive-file-2"); err != sql.ErrNoRows {
+		t.Fatalf("second video lookup error = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := cat.GetVideo(context.Background(), "fake-drive-file-3"); err != sql.ErrNoRows {
+		t.Fatalf("third video lookup error = %v, want sql.ErrNoRows", err)
 	}
 }
 

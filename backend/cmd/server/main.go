@@ -1574,7 +1574,15 @@ func (a *App) runScanWithTaskContext(ctx context.Context, driveID string) {
 	log.Printf("[scan] drive=%s start=%s skip_dirs=%d", driveID, startID, len(d.SkipDirIDs))
 	stats, err := sc.Run(ctx, startID)
 	if err != nil {
-		log.Printf("[scan] drive=%s error: %v", driveID, err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			log.Printf("[scan] drive=%s canceled: %v", driveID, err)
+		} else {
+			log.Printf("[scan] drive=%s error: %v", driveID, err)
+		}
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		log.Printf("[scan] drive=%s canceled after scan: %v", driveID, err)
 		return
 	}
 	log.Printf("[scan] drive=%s done scanned=%d added=%d errors=%d", driveID, stats.Scanned, stats.Added, stats.Errors)
@@ -1591,11 +1599,19 @@ func (a *App) runScanWithTaskContext(ctx context.Context, driveID string) {
 		} else {
 			removed, err := a.cleanupMissingDriveVideos(ctx, driveID, stats.SeenFileIDs, stats.VisitedDirIDs, startID == drv.RootID())
 			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					log.Printf("[cleanup] canceled stale cleanup drive=%s kind=%s: %v", driveID, drv.Kind(), ctxErr)
+					return
+				}
 				log.Printf("[cleanup] stale cleanup drive=%s kind=%s error: %v", driveID, drv.Kind(), err)
 			} else if removed > 0 {
 				log.Printf("[cleanup] removed %d stale videos for drive=%s kind=%s", removed, driveID, drv.Kind())
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		log.Printf("[scan] drive=%s canceled before enqueue generation: %v", driveID, err)
+		return
 	}
 	a.scheduleFingerprintBackfill(ctx, driveID, fingerprintWorker)
 	a.enqueueDriveGeneration(ctx, driveID, worker, thumbWorker)

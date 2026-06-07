@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,8 @@ import (
 )
 
 const Kind = "localstorage"
+
+const maxSTRMBytes = 64 * 1024
 
 type Config struct {
 	ID       string
@@ -122,11 +125,126 @@ func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLi
 	if err != nil {
 		return nil, err
 	}
-	if info.IsDir() || !info.Mode().IsRegular() || info.Size() <= 0 {
+	if info.IsDir() || !info.Mode().IsRegular() {
+		return nil, os.ErrNotExist
+	}
+	if strings.EqualFold(filepath.Ext(p), ".strm") {
+		return d.streamURLFromSTRM(ctx, p)
+	}
+	if info.Size() <= 0 {
 		return nil, os.ErrNotExist
 	}
 	return &drives.StreamLink{
 		URL:     p,
+		Expires: time.Now().Add(24 * time.Hour),
+	}, nil
+}
+
+func (d *Driver) streamURLFromSTRM(ctx context.Context, strmPath string) (*drives.StreamLink, error) {
+	target, err := readSTRMTarget(strmPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	if filepath.IsAbs(target) {
+		return d.localSTRMLink(strmPath, target)
+	}
+	u, err := url.Parse(target)
+	if err == nil {
+		switch strings.ToLower(u.Scheme) {
+		case "http", "https":
+			if u.Host == "" {
+				return nil, fmt.Errorf("localstorage: invalid strm url %q", target)
+			}
+			return &drives.StreamLink{
+				URL:     target,
+				Expires: time.Now().Add(24 * time.Hour),
+			}, nil
+		case "file":
+			if u.Host != "" && !strings.EqualFold(u.Host, "localhost") {
+				return nil, fmt.Errorf("localstorage: unsupported strm file url host %q", u.Host)
+			}
+			return d.localSTRMLink(strmPath, u.Path)
+		case "":
+			// Local path below.
+		default:
+			return nil, fmt.Errorf("localstorage: unsupported strm target scheme %q", u.Scheme)
+		}
+	} else if strings.Contains(target, "://") {
+		return nil, fmt.Errorf("localstorage: invalid strm url %q: %w", target, err)
+	}
+	return d.localSTRMLink(strmPath, target)
+}
+
+func readSTRMTarget(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	data, err := io.ReadAll(io.LimitReader(f, maxSTRMBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > maxSTRMBytes {
+		return "", errors.New("localstorage: strm file is too large")
+	}
+	lines := strings.Split(string(data), "\n")
+	for i, line := range lines {
+		if i == 0 {
+			line = strings.TrimPrefix(line, "\ufeff")
+		}
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line, nil
+		}
+	}
+	return "", errors.New("localstorage: empty strm target")
+}
+
+func (d *Driver) localSTRMLink(strmPath, target string) (*drives.StreamLink, error) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return nil, errors.New("localstorage: empty strm target")
+	}
+
+	var p string
+	if filepath.IsAbs(target) {
+		p = filepath.Clean(target)
+	} else {
+		p = filepath.Join(filepath.Dir(strmPath), filepath.FromSlash(target))
+	}
+	p, err := filepath.Abs(p)
+	if err != nil {
+		return nil, err
+	}
+	root, err := d.root()
+	if err != nil {
+		return nil, err
+	}
+	realPath, within, err := realPathWithinRoot(root, p)
+	if err != nil {
+		return nil, err
+	}
+	if !within {
+		return nil, errors.New("localstorage: strm target escapes root")
+	}
+	if strings.EqualFold(filepath.Ext(p), ".strm") || strings.EqualFold(filepath.Ext(realPath), ".strm") {
+		return nil, errors.New("localstorage: nested strm target is not supported")
+	}
+	info, err := os.Stat(realPath)
+	if err != nil {
+		return nil, err
+	}
+	if info.IsDir() || !info.Mode().IsRegular() || info.Size() <= 0 {
+		return nil, os.ErrNotExist
+	}
+	return &drives.StreamLink{
+		URL:     realPath,
 		Expires: time.Now().Add(24 * time.Hour),
 	}, nil
 }
@@ -177,6 +295,11 @@ func (d *Driver) pathForID(id string) (string, string, error) {
 	if !pathWithinRoot(root, p) {
 		return "", "", errors.New("localstorage: path escapes root")
 	}
+	if _, within, err := realPathWithinRoot(root, p); err != nil {
+		return "", "", err
+	} else if !within {
+		return "", "", errors.New("localstorage: path escapes root")
+	}
 	return p, rel, nil
 }
 
@@ -186,6 +309,26 @@ func pathWithinRoot(root, path string) bool {
 		return false
 	}
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
+}
+
+func realPathWithinRoot(root, path string) (string, bool, error) {
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", false, err
+	}
+	realRoot, err = filepath.Abs(realRoot)
+	if err != nil {
+		return "", false, err
+	}
+	realPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", false, err
+	}
+	realPath, err = filepath.Abs(realPath)
+	if err != nil {
+		return "", false, err
+	}
+	return realPath, pathWithinRoot(realRoot, realPath), nil
 }
 
 func localStoragePathHint(configured string) string {

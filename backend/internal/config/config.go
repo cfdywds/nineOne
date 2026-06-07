@@ -16,6 +16,11 @@ const (
 	DefaultAdminPassword = "admin123"
 )
 
+var (
+	legacyDefaultVideoExtensions = []string{".mp4", ".mkv", ".mov", ".webm", ".avi"}
+	defaultVideoExtensions       = []string{".mp4", ".mkv", ".mov", ".webm", ".avi", ".strm"}
+)
+
 type Config struct {
 	Server  Server  `yaml:"server"`
 	Storage Storage `yaml:"storage"`
@@ -247,7 +252,9 @@ func (c *Config) applyDefaults() {
 		c.Scanner.MaxDepth = 5
 	}
 	if len(c.Scanner.VideoExtensions) == 0 {
-		c.Scanner.VideoExtensions = []string{".mp4", ".mkv", ".mov", ".webm", ".avi"}
+		c.Scanner.VideoExtensions = append([]string{}, defaultVideoExtensions...)
+	} else if isLegacyDefaultVideoExtensions(c.Scanner.VideoExtensions) {
+		c.Scanner.VideoExtensions = append(c.Scanner.VideoExtensions, ".strm")
 	}
 	if c.Preview.FFmpegPath == "" {
 		c.Preview.FFmpegPath = "ffmpeg"
@@ -275,4 +282,20 @@ func (c *Config) applyDefaults() {
 	} else if c.Nightly.CronHour < 0 || c.Nightly.CronHour > 23 {
 		c.Nightly.CronHour = 1
 	}
+}
+
+func isLegacyDefaultVideoExtensions(exts []string) bool {
+	if len(exts) != len(legacyDefaultVideoExtensions) {
+		return false
+	}
+	seen := make(map[string]struct{}, len(exts))
+	for _, ext := range exts {
+		seen[strings.ToLower(strings.TrimSpace(ext))] = struct{}{}
+	}
+	for _, ext := range legacyDefaultVideoExtensions {
+		if _, ok := seen[ext]; !ok {
+			return false
+		}
+	}
+	return true
 }

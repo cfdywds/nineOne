@@ -127,6 +127,9 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, stats *Stats,
 	}
 
 	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if e.IsDir {
 			// 跳过 previews 目录，避免扫到自己生成的预览视频
 			if strings.EqualFold(e.Name, "previews") {
@@ -137,6 +140,9 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, stats *Stats,
 				continue
 			}
 			if err := s.walk(ctx, e.ID, e.Name, stats, progress); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
 				stats.Errors++
 				log.Printf("[scanner] walk %s error: %v", e.Name, err)
 			}
@@ -155,6 +161,9 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, stats *Stats,
 
 		id := s.Drive.Kind() + "-" + s.Drive.ID() + "-" + e.ID
 		if deleted, err := s.Catalog.IsDeletedVideoCandidate(ctx, id, s.Drive.ID(), e.ID, e.Hash, e.Name, e.Size); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			stats.Errors++
 			log.Printf("[scanner] check deleted video %s error: %v", id, err)
 			continue
@@ -170,11 +179,20 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, stats *Stats,
 		if matched, err := s.Catalog.MatchTags(ctx, e.Name+" "+dirName+" "+parsed.Author); err == nil {
 			tags = mergeTags(tags, matched)
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if label, ok, err := s.Catalog.EnsureCollectionTag(ctx, dirName); err == nil && ok {
 			tags = mergeTags(tags, []string{label})
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 
 		existing, _ := s.Catalog.GetVideo(ctx, id)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if existing != nil {
 			patch := catalog.VideoMetaPatch{}
 			if e.Hash != "" && existing.ContentHash == "" {
@@ -191,18 +209,30 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, stats *Stats,
 			}
 			if patch.Category != "" || patch.ContentHash != "" || patch.FileName != "" {
 				_ = s.Catalog.UpdateVideoMeta(ctx, id, patch)
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 			}
 			if dup := s.findDuplicate(ctx, e.Hash, e.Name, e.Size, id); dup != nil {
 				continue
 			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if !sameTags(existing.Tags, tags) {
 				_ = s.Catalog.SetAutoVideoTags(ctx, id, tags)
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 			}
 			continue
 		}
 
 		if dup := s.findDuplicate(ctx, e.Hash, e.Name, e.Size, id); dup != nil {
 			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 
 		now := time.Now()
@@ -226,8 +256,14 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, stats *Stats,
 			UpdatedAt:     now,
 		}
 		if err := s.Catalog.UpsertVideo(ctx, v); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			log.Printf("[scanner] upsert %s error: %v", v.Title, err)
 			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		stats.Added++
 		if s.OnNewVideo != nil {
