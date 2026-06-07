@@ -1068,6 +1068,52 @@ test("video importer userscript resolves pornhub embed metadata before submittin
   assert.notEqual(postedPayload.videos?.[0]?.videoUrl, embedURL);
 });
 
+test("video importer userscript parses alternate pornhub media definition formats", async () => {
+  const detailURL = "https://cn.pornhub.com/view_video.php?viewkey=69d3e8a8797c";
+  let postedPayload: { videos?: Array<Record<string, unknown>> } = {};
+  const api = loadUserscriptTestAPI({
+    hostname: "cn.pornhub.com",
+    href: "https://cn.pornhub.com/",
+    html: "",
+    pastedVideoURLs: detailURL,
+    windowFetch: async () => ({
+      ok: true,
+      status: 200,
+      text: async () => `
+        <script>
+          var flashvars_123 = {
+            mediaDefinitions: [
+              {quality: '480', videoUrl: 'https:\\/\\/ph.example.com\\/alt-480.mp4'},
+              {quality: '720', videoUrl: 'https:\\/\\/ph.example.com\\/alt-720.mp4'}
+            ]
+          };
+        </script>
+      `,
+    }),
+    gmXmlHttpRequest: (options) => {
+      if (isProgressRequest(options)) {
+        return emitProgressEvents(options, [{ index: 0, status: "completed", progress: 100 }]);
+      }
+      assert.equal(options.method, "POST");
+      postedPayload = JSON.parse(String(options.data || "{}")) as { videos?: Array<Record<string, unknown>> };
+      options.onload({
+        status: 202,
+        responseText: JSON.stringify({
+          status: "accepted",
+          sessionId: "import-alt-pornhub",
+          progressToken: "alt-pornhub-progress-token",
+          results: [{ index: 0, id: "local-upload-import-1", href: "/video/local-upload-import-1", status: "accepted" }],
+        }),
+      });
+      return undefined;
+    },
+  });
+
+  await api.importPastedVideos?.();
+
+  assert.equal(postedPayload.videos?.[0]?.videoUrl, "https://ph.example.com/alt-720.mp4");
+});
+
 type UserscriptTestAPI = {
   detectSourceSite: () => string;
   detectPageType: () => string;

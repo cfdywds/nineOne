@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Video Site 快速导入下载器
 // @namespace    https://github.com/nianzhibai/91
-// @version      0.1.2
+// @version      0.1.3
 // @description  在 XVideos / Pornhub 页面解析高清视频直链，并导入当前 Video Site 项目。
 // @match        https://www.xvideos.com/*
 // @match        https://www.pornhub.com/*
@@ -203,24 +203,69 @@
   }
 
   function collectPornhubCandidates(candidates, html) {
-    const objectPattern = /\{[^{}]*"quality"\s*:\s*"?([^",}]+)"?[^{}]*"videoUrl"\s*:\s*"([^"]+)"[^{}]*\}/gi;
+    const variants = uniqueTextVariants([html, decodeHTMLText(html), decodeScriptURL(decodeHTMLText(html))]);
+    for (const variant of variants) {
+      collectPornhubMediaDefinitionObjects(candidates, variant);
+      collectDirectVideoURLCandidates(candidates, variant, "pornhub:direct-url");
+    }
+  }
+
+  function collectPornhubMediaDefinitionObjects(candidates, html) {
+    const objectPattern = /\{[^{}]*(?:videoUrl|quality)[^{}]*\}/gi;
     let objectMatch;
-    while ((objectMatch = objectPattern.exec(html))) {
+    while ((objectMatch = objectPattern.exec(String(html || "")))) {
+      const objectText = objectMatch[0];
+      const videoURL = jsObjectPropertyValue(objectText, "videoUrl") || jsObjectPropertyValue(objectText, "video_url");
+      if (!videoURL) continue;
       candidates.push({
-        url: decodeScriptURL(objectMatch[2]),
-        quality: objectMatch[1],
+        url: decodeScriptURL(videoURL),
+        quality: jsObjectPropertyValue(objectText, "quality") || qualityFromURL(videoURL),
         source: "pornhub:mediaDefinitions",
       });
     }
-    const reversedPattern = /\{[^{}]*"videoUrl"\s*:\s*"([^"]+)"[^{}]*"quality"\s*:\s*"?([^",}]+)"?[^{}]*\}/gi;
-    let reversedMatch;
-    while ((reversedMatch = reversedPattern.exec(html))) {
+  }
+
+  function collectDirectVideoURLCandidates(candidates, html, source) {
+    const text = decodeScriptURL(decodeHTMLText(String(html || "")));
+    const pattern = /https?:\/\/[^\s"'<>]+?(?:\.mp4|\.webm|\.mov|\.mkv|\.avi|\.m3u8)(?:[^\s"'<>]*)?/gi;
+    let match;
+    while ((match = pattern.exec(text))) {
+      const url = match[0].replace(/[),.;]+$/, "");
       candidates.push({
-        url: decodeScriptURL(reversedMatch[1]),
-        quality: reversedMatch[2],
-        source: "pornhub:mediaDefinitions",
+        url,
+        quality: qualityFromURL(url),
+        source,
       });
     }
+  }
+
+  function uniqueTextVariants(values) {
+    const seen = new Set();
+    const out = [];
+    for (const value of values) {
+      const text = String(value || "");
+      if (!text || seen.has(text)) continue;
+      seen.add(text);
+      out.push(text);
+    }
+    return out;
+  }
+
+  function jsObjectPropertyValue(objectText, name) {
+    const key = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const quotedPattern = new RegExp(`(?:^|[,\\{\\s])["']?${key}["']?\\s*:\\s*(["'])([\\s\\S]*?)\\1`, "i");
+    const quoted = quotedPattern.exec(String(objectText || ""));
+    if (quoted) return decodeScriptURL(quoted[2]).trim();
+    const barePattern = new RegExp(`(?:^|[,\\{\\s])["']?${key}["']?\\s*:\\s*([^,}\\]]+)`, "i");
+    const bare = barePattern.exec(String(objectText || ""));
+    return bare ? decodeScriptURL(bare[1]).trim().replace(/^["']|["']$/g, "") : "";
+  }
+
+  function qualityFromURL(value) {
+    const text = String(value || "");
+    if (/4k|2160/i.test(text)) return "2160";
+    const match = text.match(/(?:^|[^\d])(\d{3,4})p?(?:[^\d]|$)/i);
+    return match ? match[1] : "";
   }
 
   function collectVideoCandidatesFromHTML(html, pageURL, sourceSite = detectSourceSiteFromURL(pageURL)) {
@@ -274,6 +319,10 @@
     if (!out) return "";
     out = out.replace(/\\\//g, "/");
     out = out.replace(/\\u002F/gi, "/");
+    out = out.replace(/\\u003A/gi, ":");
+    out = out.replace(/\\u003F/gi, "?");
+    out = out.replace(/\\u003D/gi, "=");
+    out = out.replace(/\\u0026/gi, "&");
     out = out.replace(/&amp;/g, "&");
     try {
       out = decodeURIComponent(out);
