@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Video Site 快速导入下载器
 // @namespace    https://github.com/nianzhibai/91
-// @version      0.1.1
+// @version      0.1.2
 // @description  在 XVideos / Pornhub 页面解析高清视频直链，并导入当前 Video Site 项目。
 // @match        https://www.xvideos.com/*
 // @match        https://www.pornhub.com/*
@@ -96,11 +96,39 @@
       const url = normalizeURL(candidate.url);
       if (!url) return false;
       candidate.url = url;
-      return VIDEO_FILE_PATTERN.test(url);
+      return isDownloadableVideoURL(url);
     });
-    const pool = playable.length ? playable : candidates;
-    pool.sort((a, b) => scoreCandidate(b) - scoreCandidate(a));
-    return pool[0] || null;
+    playable.sort((a, b) => scoreCandidate(b) - scoreCandidate(a));
+    return playable[0] || null;
+  }
+
+  function isDownloadableVideoURL(value) {
+    const url = normalizeURL(value);
+    return VIDEO_FILE_PATTERN.test(url) || HLS_FILE_PATTERN.test(url);
+  }
+
+  function isPornhubEmbedURL(value) {
+    try {
+      const parsed = new URL(value, window.location.href);
+      return parsed.hostname.includes("pornhub.com") && parsed.pathname.startsWith("/embed/");
+    } catch {
+      return false;
+    }
+  }
+
+  async function resolveBestVideoCandidate(candidates, sourceSite) {
+    const best = pickBestCandidate(candidates);
+    if (best) return best;
+    if (sourceSite !== "pornhub") return null;
+    for (const candidate of candidates) {
+      const embedURL = normalizeURL(candidate.url);
+      if (!isPornhubEmbedURL(embedURL)) continue;
+      const embedHTML = await fetchText(embedURL);
+      const embedCandidates = collectVideoCandidatesFromHTML(embedHTML, embedURL, sourceSite);
+      const embedBest = pickBestCandidate(embedCandidates);
+      if (embedBest) return embedBest;
+    }
+    return null;
   }
 
   function scoreCandidate(candidate) {
@@ -370,41 +398,39 @@
     setStatus("项目地址已保存: " + projectBase());
   }
 
-  function importBestVideo() {
+  async function importBestVideo() {
     if (state.busy) return;
     const sourceSite = detectSourceSite();
     if (!sourceSite) {
       setStatus("当前站点不支持导入");
       return;
     }
-    const candidates = collectVideoCandidates();
-    const best = pickBestCandidate(candidates);
-    if (!best) {
-      setStatus("未找到可导入的视频直链");
-      return;
-    }
-    if (HLS_FILE_PATTERN.test(best.url)) {
-      setStatus("只找到 HLS/m3u8，当前快速导入优先支持 mp4/webm/mov/mkv/avi 直链");
-      return;
-    }
     state.busy = true;
-    setStatus(`开始导入 ${sourceSite} ${best.quality || ""}...`);
-    const payload = collectPageMetadata(best);
-    postJSON(projectBase() + "/api/import/remote", payload)
-      .then((response) => {
-        const href = response?.href || (response?.id ? "/video/" + response.id : "");
-        if (response?.accepted) {
-          setStatus(href ? `已提交后台下载：${projectBase()}${href}` : "已提交后台下载，请稍后到项目后台查看");
-          return;
-        }
-        setStatus(href ? `导入成功：${projectBase()}${href}` : "导入成功");
-      })
-      .catch((error) => {
-        setStatus("导入失败：" + error.message);
-      })
-      .finally(() => {
-        state.busy = false;
-      });
+    try {
+      const candidates = collectVideoCandidates();
+      const best = await resolveBestVideoCandidate(candidates, sourceSite);
+      if (!best) {
+        setStatus("未找到可导入的视频直链");
+        return;
+      }
+      if (HLS_FILE_PATTERN.test(best.url)) {
+        setStatus("只找到 HLS/m3u8，当前快速导入优先支持 mp4/webm/mov/mkv/avi 直链");
+        return;
+      }
+      setStatus(`开始导入 ${sourceSite} ${best.quality || ""}...`);
+      const payload = collectPageMetadata(best);
+      const response = await postJSON(projectBase() + "/api/import/remote", payload);
+      const href = response?.href || (response?.id ? "/video/" + response.id : "");
+      if (response?.accepted) {
+        setStatus(href ? `已提交后台下载：${projectBase()}${href}` : "已提交后台下载，请稍后到项目后台查看");
+        return;
+      }
+      setStatus(href ? `导入成功：${projectBase()}${href}` : "导入成功");
+    } catch (error) {
+      setStatus("导入失败：" + error.message);
+    } finally {
+      state.busy = false;
+    }
   }
 
   function parsePastedVideoURLs(value) {
@@ -728,7 +754,7 @@
 
     if (isCurrentPageURL(inputURL) && detectPageType() === "detail") {
       const candidates = collectVideoCandidates();
-      const best = pickBestCandidate(candidates);
+      const best = await resolveBestVideoCandidate(candidates, sourceSite);
       if (!best) {
         throw new Error("未找到可下载的视频直链：" + inputURL);
       }
@@ -758,7 +784,7 @@
 
     const html = await fetchText(inputURL);
     const candidates = collectVideoCandidatesFromHTML(html, inputURL, pastedSourceSite);
-    const best = pickBestCandidate(candidates);
+    const best = await resolveBestVideoCandidate(candidates, pastedSourceSite);
     if (!best) {
       throw new Error("未找到可下载的视频直链：" + inputURL);
     }

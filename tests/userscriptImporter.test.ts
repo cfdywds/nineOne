@@ -1004,6 +1004,70 @@ test("video importer userscript uses page fetch for same-origin pasted pornhub d
   assert.equal(postedPayload.videos?.[0]?.videoUrl, "https://ph.example.com/clip-1080.mp4");
 });
 
+test("video importer userscript resolves pornhub embed metadata before submitting", async () => {
+  const detailURL = "https://cn.pornhub.com/view_video.php?viewkey=ph61e594f4e042d";
+  const embedURL = "https://cn.pornhub.com/embed/694a56ede157f";
+  const fetchedURLs: string[] = [];
+  let postedPayload: { videos?: Array<Record<string, unknown>> } = {};
+  const api = loadUserscriptTestAPI({
+    hostname: "cn.pornhub.com",
+    href: "https://cn.pornhub.com/",
+    html: "",
+    pastedVideoURLs: detailURL,
+    windowFetch: async (url) => {
+      fetchedURLs.push(String(url));
+      if (String(url) === detailURL) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () => `
+            <meta property="og:title" content="Embed backed pornhub page">
+            <meta property="og:video" content="${embedURL}">
+          `,
+        };
+      }
+      if (String(url) === embedURL) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () => `
+            <script>
+              var mediaDefinitions = [
+                {"quality":"480","videoUrl":"https:\\/\\/ph.example.com\\/embed-480.mp4"},
+                {"quality":"720","videoUrl":"https:\\/\\/ph.example.com\\/embed-720.mp4"}
+              ];
+            </script>
+          `,
+        };
+      }
+      return { ok: false, status: 404, text: async () => "" };
+    },
+    gmXmlHttpRequest: (options) => {
+      if (isProgressRequest(options)) {
+        return emitProgressEvents(options, [{ index: 0, status: "completed", progress: 100 }]);
+      }
+      assert.equal(options.method, "POST");
+      postedPayload = JSON.parse(String(options.data || "{}")) as { videos?: Array<Record<string, unknown>> };
+      options.onload({
+        status: 202,
+        responseText: JSON.stringify({
+          status: "accepted",
+          sessionId: "import-embed-backed",
+          progressToken: "embed-backed-progress-token",
+          results: [{ index: 0, id: "local-upload-import-1", href: "/video/local-upload-import-1", status: "accepted" }],
+        }),
+      });
+      return undefined;
+    },
+  });
+
+  await api.importPastedVideos?.();
+
+  assert.deepEqual(fetchedURLs, [detailURL, embedURL]);
+  assert.equal(postedPayload.videos?.[0]?.videoUrl, "https://ph.example.com/embed-720.mp4");
+  assert.notEqual(postedPayload.videos?.[0]?.videoUrl, embedURL);
+});
+
 type UserscriptTestAPI = {
   detectSourceSite: () => string;
   detectPageType: () => string;

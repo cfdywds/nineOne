@@ -706,6 +706,53 @@ func TestHandleImportRemoteVideoAcceptsSlowDownloadBeforeCompletion(t *testing.T
 	}
 }
 
+func TestHandleImportRemoteVideoBatchRejectsPornhubEmbedURL(t *testing.T) {
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	server := &Server{Catalog: cat, LocalDir: t.TempDir()}
+	payload, err := json.Marshal(map[string]any{
+		"videos": []map[string]any{
+			{
+				"sourceSite": "pornhub",
+				"pageUrl":    "https://cn.pornhub.com/view_video.php?viewkey=ph61e594f4e042d",
+				"videoUrl":   "https://cn.pornhub.com/embed/694a56ede157f",
+				"title":      "Embed page",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/import/remote/batch", bytes.NewReader(payload))
+	rr := httptest.NewRecorder()
+
+	server.handleImportRemoteVideoBatch(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body = %s", rr.Code, rr.Body.String())
+	}
+	var response batchRemoteImportResp
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Results) != 1 {
+		t.Fatalf("results length = %d, want 1", len(response.Results))
+	}
+	if response.Results[0].Status != "error" {
+		t.Fatalf("result status = %q, want error; body = %s", response.Results[0].Status, rr.Body.String())
+	}
+	if !strings.Contains(response.Results[0].Error, "direct video") {
+		t.Fatalf("result error = %q, want direct video message", response.Results[0].Error)
+	}
+}
+
 func TestImportRemoteVideoWithProgressPublishesDownloadPercent(t *testing.T) {
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
 	if err != nil {

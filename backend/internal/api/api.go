@@ -879,6 +879,10 @@ func (s *Server) handleImportRemoteVideo(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	if err := validateRemoteImportVideoURL(site, videoURL); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
 	pageURL, err := parseRemoteImportURL("pageUrl", body.PageURL, true)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -980,6 +984,11 @@ func (s *Server) handleImportRemoteVideoBatch(w http.ResponseWriter, r *http.Req
 
 		videoURL, err := parseRemoteImportURL("videoUrl", videoReq.VideoURL, true)
 		if err != nil {
+			result.Status = "error"
+			result.Error = err.Error()
+			continue
+		}
+		if err := validateRemoteImportVideoURL(site, videoURL); err != nil {
 			result.Status = "error"
 			result.Error = err.Error()
 			continue
@@ -1401,6 +1410,24 @@ func parseRemoteImportURL(field, raw string, required bool) (*url.URL, error) {
 		return nil, fmt.Errorf("%s must use http or https", field)
 	}
 	return parsed, nil
+}
+
+func validateRemoteImportVideoURL(site remoteImportSite, videoURL *url.URL) error {
+	if videoURL == nil {
+		return nil
+	}
+	if site.ID != "pornhub" {
+		return nil
+	}
+	host := strings.ToLower(videoURL.Hostname())
+	if !strings.Contains(host, "pornhub.com") {
+		return nil
+	}
+	cleanPath := strings.ToLower(videoURL.EscapedPath())
+	if strings.HasPrefix(cleanPath, "/embed/") || strings.HasPrefix(cleanPath, "/view_video.php") {
+		return errors.New("videoUrl must be a direct video file URL, not a Pornhub page")
+	}
+	return nil
 }
 
 func remoteImportExtension(videoURL *url.URL, contentType string) string {
