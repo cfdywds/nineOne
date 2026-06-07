@@ -16,6 +16,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/video-site/backend/internal/auth"
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/mediaasset"
 	"github.com/video-site/backend/internal/proxy"
@@ -809,6 +810,8 @@ func TestProgressHubReplaysLatestEventsToLateSubscribers(t *testing.T) {
 func TestHandleImportProgressAllowsCredentialedEventSourceCORS(t *testing.T) {
 	server := &Server{}
 	sessionID := "cors-session"
+	progressToken := "cors-token"
+	server.ensureProgressHub().SetProgressToken(sessionID, progressToken)
 	server.ensureProgressHub().Publish(ImportProgressEvent{
 		SessionID: sessionID,
 		Index:     0,
@@ -817,7 +820,7 @@ func TestHandleImportProgressAllowsCredentialedEventSourceCORS(t *testing.T) {
 		Progress:  0,
 	})
 
-	req := requestWithRouteParam(http.MethodGet, "/api/import/progress/"+sessionID, "sessionID", sessionID, strings.NewReader(""))
+	req := requestWithRouteParam(http.MethodGet, "/api/import/progress/"+sessionID+"?token="+progressToken, "sessionID", sessionID, strings.NewReader(""))
 	ctx, cancel := context.WithCancel(req.Context())
 	defer cancel()
 	req = req.WithContext(ctx)
@@ -854,6 +857,94 @@ func TestHandleImportProgressAllowsCredentialedEventSourceCORS(t *testing.T) {
 	}
 	if got := rr.Header().Get("Vary"); !strings.Contains(got, "Origin") {
 		t.Fatalf("Vary = %q, want Origin", got)
+	}
+}
+
+func TestImportProgressRouteAllowsTokenWithoutAdminCookie(t *testing.T) {
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	media := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/clip.mp4" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("video-bytes"))
+	}))
+	defer media.Close()
+	server := &Server{Catalog: cat, LocalDir: t.TempDir()}
+	payload, err := json.Marshal(map[string]any{
+		"videos": []map[string]any{
+			{
+				"sourceSite": "xvideos",
+				"pageUrl":    "https://www.xvideos.com/video123456/token",
+				"videoUrl":   media.URL + "/clip.mp4",
+				"title":      "Token Clip",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	batchReq := httptest.NewRequest(http.MethodPost, "/api/import/remote/batch", bytes.NewReader(payload))
+	batchRR := httptest.NewRecorder()
+
+	server.handleImportRemoteVideoBatch(batchRR, batchReq)
+
+	if batchRR.Code != http.StatusAccepted {
+		t.Fatalf("batch status = %d, body = %s", batchRR.Code, batchRR.Body.String())
+	}
+	var batchResp struct {
+		SessionID     string `json:"sessionId"`
+		ProgressToken string `json:"progressToken"`
+	}
+	if err := json.Unmarshal(batchRR.Body.Bytes(), &batchResp); err != nil {
+		t.Fatalf("decode batch response: %v", err)
+	}
+	if batchResp.SessionID == "" {
+		t.Fatal("batch response missing sessionId")
+	}
+	if batchResp.ProgressToken == "" {
+		t.Fatal("batch response missing progressToken")
+	}
+
+	router := chi.NewRouter()
+	server.RegisterRoutes(router, &auth.Authenticator{Catalog: cat})
+	progressReq := httptest.NewRequest(http.MethodGet, "/api/import/progress/"+batchResp.SessionID+"?token="+batchResp.ProgressToken, strings.NewReader(""))
+	progressReq.Header.Set("Origin", "https://cn.pornhub.com")
+	ctx, cancel := context.WithCancel(progressReq.Context())
+	defer cancel()
+	progressReq = progressReq.WithContext(ctx)
+	progressRR := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(progressRR, progressReq)
+		close(done)
+	}()
+
+	deadline := time.After(time.Second)
+	for !strings.Contains(progressRR.Body.String(), `"sessionId":"`+batchResp.SessionID+`"`) {
+		select {
+		case <-done:
+			t.Fatalf("progress route exited before event; status=%d body=%q", progressRR.Code, progressRR.Body.String())
+		case <-deadline:
+			t.Fatalf("timed out waiting for progress event; status=%d body=%q", progressRR.Code, progressRR.Body.String())
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("progress route did not exit after cancellation")
 	}
 }
 

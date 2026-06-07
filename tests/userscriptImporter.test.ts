@@ -178,6 +178,7 @@ test("video importer userscript downloads pasted detail page URLs through batch 
         responseText: JSON.stringify({
           status: "accepted",
           sessionId: "import-test-session",
+          progressToken: "test-progress-token",
           results: [{ index: 0, id: "local-upload-import-1", href: "/video/local-upload-import-1", status: "accepted" }],
         }),
       });
@@ -214,6 +215,7 @@ test("video importer userscript stores progress session metadata for queued down
         responseText: JSON.stringify({
           status: "accepted",
           sessionId: "import-persisted-session",
+          progressToken: "persisted-progress-token",
           results: [
             {
               index: 0,
@@ -233,6 +235,7 @@ test("video importer userscript stores progress session metadata for queued down
   const queue = api.loadDownloadQueue?.() || [];
   assert.equal(queue[0]?.status, "queued");
   assert.equal(queue[0]?.sessionId, "import-persisted-session");
+  assert.equal(queue[0]?.progressToken, "persisted-progress-token");
   assert.equal(queue[0]?.progressIndex, 0);
 });
 
@@ -255,6 +258,7 @@ test("video importer userscript does not show accepted download locations before
         responseText: JSON.stringify({
           status: "accepted",
           sessionId: "import-accepted-no-location",
+          progressToken: "accepted-progress-token",
           results: [
             {
               index: 0,
@@ -312,6 +316,7 @@ test("video importer userscript shows per-download percentage and download locat
         responseText: JSON.stringify({
           status: "accepted",
           sessionId: "import-progress-location",
+          progressToken: "location-progress-token",
           results: [
             {
               index: 0,
@@ -380,6 +385,7 @@ test("video importer userscript falls back to GM_xmlhttpRequest progress with cr
         responseText: JSON.stringify({
           status: "accepted",
           sessionId: "import-gm-progress",
+          progressToken: "gm-progress-token",
           results: [
             {
               index: 0,
@@ -398,7 +404,7 @@ test("video importer userscript falls back to GM_xmlhttpRequest progress with cr
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(progressRequests.length, 1);
-  assert.equal(progressRequests[0]?.url, "http://127.0.0.1:9191/api/import/progress/import-gm-progress");
+  assert.equal(progressRequests[0]?.url, "http://127.0.0.1:9191/api/import/progress/import-gm-progress?token=gm-progress-token");
   assert.equal(progressRequests[0]?.withCredentials, true);
   assert.equal(progressRequests[0]?.anonymous, false);
   assert.equal(progressRequestAborted, true, "progress stream should be aborted after all items finish");
@@ -408,12 +414,14 @@ test("video importer userscript falls back to GM_xmlhttpRequest progress with cr
 
 test("video importer userscript prefers EventSource for live progress streaming", async () => {
   const statusMessages: string[] = [];
+  const eventSourceURLs: string[] = [];
   const api = loadUserscriptTestAPI({
     hostname: "www.xvideos.com",
     href: "https://www.xvideos.com/?k=sample",
     html: "",
     pastedVideoURLs: "https://cdn.example.com/clip-720p.mp4",
     onStatus: (message) => statusMessages.push(message),
+    onEventSourceOpen: (url) => eventSourceURLs.push(url),
     eventSourceEvents: [
       {
         index: 0,
@@ -433,6 +441,7 @@ test("video importer userscript prefers EventSource for live progress streaming"
         responseText: JSON.stringify({
           status: "accepted",
           sessionId: "import-eventsource-progress",
+          progressToken: "progress-token-123",
           results: [
             {
               index: 0,
@@ -450,6 +459,10 @@ test("video importer userscript prefers EventSource for live progress streaming"
   await api.importPastedVideos?.();
   await new Promise((resolve) => setImmediate(resolve));
 
+  assert.equal(
+    eventSourceURLs[0],
+    "http://127.0.0.1:9191/api/import/progress/import-eventsource-progress?token=progress-token-123"
+  );
   assert.match(statusMessages.at(-1) || "", /导入完成：100%/);
 });
 
@@ -466,6 +479,7 @@ test("video importer userscript resumes active queued downloads after page navig
         status: "downloading",
         progress: 0,
         sessionId: "import-resume-session",
+        progressToken: "resume-progress-token",
         progressIndex: 0,
         href: "/video/local-upload-import-1",
         videoId: "local-upload-import-1",
@@ -505,7 +519,7 @@ test("video importer userscript resumes active queued downloads after page navig
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.deepEqual(progressRequests, [
-    "http://127.0.0.1:9191/api/import/progress/import-resume-session",
+    "http://127.0.0.1:9191/api/import/progress/import-resume-session?token=resume-progress-token",
   ]);
   const queue = api.loadDownloadQueue?.() || [];
   assert.equal(queue[0]?.status, "completed");
@@ -551,6 +565,49 @@ test("video importer userscript returns legacy active downloads without progress
   const queue = api.loadDownloadQueue?.() || [];
   assert.equal(queue[0]?.status, "pending");
   assert.equal(queue[0]?.progress, 0);
+  assert.equal(queue[0]?.href, "");
+  assert.match(statusMessages.at(-1) || "", /旧下载任务缺少进度会话/);
+});
+
+test("video importer userscript returns active downloads without progress tokens to pending", () => {
+  const queueKey = "video-site-importer-download-queue-v1";
+  const storedValues = new Map<string, unknown>();
+  storedValues.set(
+    queueKey,
+    JSON.stringify([
+      {
+        id: "missing-token",
+        url: "https://cn.pornhub.com/view_video.php?viewkey=ph61e594f4e042d",
+        title: "Missing token video",
+        status: "queued",
+        progress: 0,
+        sessionId: "import-old-session",
+        progressIndex: 0,
+        href: "/video/local-upload-old-session",
+        videoId: "local-upload-old-session",
+      },
+    ])
+  );
+  const statusMessages: string[] = [];
+  const api = loadUserscriptTestAPI({
+    hostname: "cn.pornhub.com",
+    href: "https://cn.pornhub.com/video/search?search=sample",
+    html: "",
+    onStatus: (message) => statusMessages.push(message),
+    gmGetValue: (key, fallback) => storedValues.get(key) ?? fallback,
+    gmSetValue: (key, value) => {
+      storedValues.set(key, value);
+    },
+  });
+
+  api.recoverActiveDownloadQueue?.();
+
+  const queue = api.loadDownloadQueue?.() || [];
+  assert.equal(queue[0]?.status, "pending");
+  assert.equal(queue[0]?.progress, 0);
+  assert.equal(queue[0]?.sessionId, "");
+  assert.equal(queue[0]?.progressToken, "");
+  assert.equal(queue[0]?.progressIndex, -1);
   assert.equal(queue[0]?.href, "");
   assert.match(statusMessages.at(-1) || "", /旧下载任务缺少进度会话/);
 });
@@ -607,6 +664,7 @@ test("video importer userscript returns stale recovered progress sessions to pen
         status: "queued",
         progress: 0,
         sessionId: "import-stale-session",
+        progressToken: "stale-progress-token",
         progressIndex: 0,
         href: "/video/local-upload-stale",
         videoId: "local-upload-stale",
@@ -650,6 +708,7 @@ test("video importer userscript returns stale recovered progress sessions to pen
   assert.equal(queue[0]?.status, "pending");
   assert.equal(queue[0]?.progress, 0);
   assert.equal(queue[0]?.sessionId, "");
+  assert.equal(queue[0]?.progressToken, "");
   assert.equal(queue[0]?.progressIndex, -1);
   assert.equal(queue[0]?.href, "");
   assert.equal(queue[0]?.videoId, "");
@@ -781,6 +840,7 @@ test("video importer userscript allows submitting new queued links while downloa
         responseText: JSON.stringify({
           status: "accepted",
           sessionId: `import-multi-submit-${postCount}`,
+          progressToken: `multi-progress-token-${postCount}`,
           results: [{ index: 0, id: `local-upload-${postCount}`, href: `/video/local-upload-${postCount}`, status: "accepted" }],
         }),
       });
@@ -825,6 +885,7 @@ test("video importer userscript treats immediate batch errors as completed progr
         responseText: JSON.stringify({
           status: "accepted",
           sessionId: "import-progress-with-error",
+          progressToken: "error-progress-token",
           results: [
             { index: 0, id: "local-upload-import-ok", href: "/video/local-upload-import-ok", status: "accepted" },
             { index: 1, status: "error", error: "unsupported video extension" },
@@ -870,6 +931,7 @@ test("video importer userscript treats xvideos dotted video URLs as current deta
         responseText: JSON.stringify({
           status: "accepted",
           sessionId: "import-current-page",
+          progressToken: "current-page-progress-token",
           results: [{ index: 0, id: "local-upload-import-1", href: "/video/local-upload-import-1", status: "accepted" }],
         }),
       });
@@ -927,6 +989,7 @@ test("video importer userscript uses page fetch for same-origin pasted pornhub d
         responseText: JSON.stringify({
           status: "accepted",
           sessionId: "import-same-origin",
+          progressToken: "same-origin-progress-token",
           results: [{ index: 0, id: "local-upload-import-1", href: "/video/local-upload-import-1", status: "accepted" }],
         }),
       });
@@ -962,6 +1025,7 @@ type UserscriptTestAPI = {
     progress?: number;
     href?: string;
     sessionId?: string;
+    progressToken?: string;
     progressIndex?: number;
   }>;
   renderDownloadListHTML?: (items: Array<Record<string, unknown>>) => string;
@@ -993,6 +1057,7 @@ function loadUserscriptTestAPI(input: {
   pastedVideoURLs?: string;
   eventSourceEvents?: Array<Record<string, unknown>>;
   eventSourceAvailable?: boolean;
+  onEventSourceOpen?: (url: string) => void;
   onStatus?: (message: string) => void;
   gmGetValue?: (key: string, fallback: unknown) => unknown;
   gmSetValue?: (key: string, value: unknown) => void;
@@ -1054,6 +1119,7 @@ function loadUserscriptTestAPI(input: {
 
     constructor(url: string) {
       this.url = url;
+      input.onEventSourceOpen?.(url);
       setImmediate(() => {
         const events = input.eventSourceEvents || [{ index: 0, status: "completed" }];
         for (const event of events) {

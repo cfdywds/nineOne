@@ -4,6 +4,7 @@ import (
 	"context"
 	crand "crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -138,6 +139,7 @@ func (s *Server) RegisterRoutes(r chi.Router, a *auth.Authenticator) {
 	// 公开端点：拿当前生效的主题。登录页本身要在挂前就能读，所以单独挂在
 	// 鉴权组之外。只暴露 theme 一个字段，避免泄露其他设置。
 	r.Get("/api/settings/theme", s.handleGetTheme)
+	r.Get("/api/import/progress/{sessionID}", s.handleImportProgress)
 
 	r.Group(func(r chi.Router) {
 		r.Use(a.Required)
@@ -152,7 +154,6 @@ func (s *Server) RegisterRoutes(r chi.Router, a *auth.Authenticator) {
 		r.Post("/api/upload", s.handleUploadVideo)
 		r.Post("/api/import/remote", s.handleImportRemoteVideo)
 		r.Post("/api/import/remote/batch", s.handleImportRemoteVideoBatch)
-		r.Get("/api/import/progress/{sessionID}", s.handleImportProgress)
 		r.Get("/api/tags", s.handleTags)
 		r.Post("/api/shorts/next", s.handleShortsNext)
 
@@ -844,9 +845,10 @@ type batchRemoteImportReq struct {
 }
 
 type batchRemoteImportResp struct {
-	Status    string                    `json:"status"`
-	SessionID string                    `json:"sessionId"`
-	Results   []batchRemoteImportResult `json:"results"`
+	Status        string                    `json:"status"`
+	SessionID     string                    `json:"sessionId"`
+	ProgressToken string                    `json:"progressToken"`
+	Results       []batchRemoteImportResult `json:"results"`
 }
 
 type batchRemoteImportResult struct {
@@ -956,6 +958,13 @@ func (s *Server) handleImportRemoteVideoBatch(w http.ResponseWriter, r *http.Req
 
 	now := time.Now()
 	sessionID := fmt.Sprintf("import-%d-%d", now.Unix(), rand.IntN(10000))
+	progressToken, err := newImportProgressToken()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	hub := s.ensureProgressHub()
+	hub.SetProgressToken(sessionID, progressToken)
 	results := make([]batchRemoteImportResult, len(body.Videos))
 
 	for i, videoReq := range body.Videos {
@@ -1017,7 +1026,7 @@ func (s *Server) handleImportRemoteVideoBatch(w http.ResponseWriter, r *http.Req
 		result.Href = "/video/" + videoID
 		result.Status = "accepted"
 
-		s.ensureProgressHub().Publish(ImportProgressEvent{
+		hub.Publish(ImportProgressEvent{
 			SessionID: sessionID,
 			Index:     i,
 			VideoID:   videoID,
@@ -1044,37 +1053,35 @@ func (s *Server) handleImportRemoteVideoBatch(w http.ResponseWriter, r *http.Req
 	}
 
 	writeJSON(w, http.StatusAccepted, batchRemoteImportResp{
-		Status:    "accepted",
-		SessionID: sessionID,
-		Results:   results,
+		Status:        "accepted",
+		SessionID:     sessionID,
+		ProgressToken: progressToken,
+		Results:       results,
 	})
 }
 
 func (s *Server) handleImportProgress(w http.ResponseWriter, r *http.Request) {
+	setImportProgressCORSHeaders(w, r)
 	sessionID := chi.URLParam(r, "sessionID")
 	if sessionID == "" {
 		writeErr(w, http.StatusBadRequest, errors.New("missing sessionID"))
+		return
+	}
+	hub := s.ensureProgressHub()
+	if !hub.ValidProgressToken(sessionID, r.URL.Query().Get("token")) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	if origin := r.Header.Get("Origin"); origin != "" {
-		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
-		w.Header().Add("Vary", "Origin")
-	} else {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-	}
-
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeErr(w, http.StatusInternalServerError, errors.New("streaming not supported"))
 		return
 	}
 
-	hub := s.ensureProgressHub()
 	ch := hub.Subscribe(sessionID)
 	defer hub.Unsubscribe(sessionID, ch)
 
@@ -1091,6 +1098,16 @@ func (s *Server) handleImportProgress(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 		}
+	}
+}
+
+func setImportProgressCORSHeaders(w http.ResponseWriter, r *http.Request) {
+	if origin := r.Header.Get("Origin"); origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		w.Header().Add("Vary", "Origin")
+	} else {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
 	}
 }
 
@@ -1855,6 +1872,14 @@ func writeErr(w http.ResponseWriter, code int, err error) {
 	writeJSON(w, code, map[string]string{"error": err.Error()})
 }
 
+func newImportProgressToken() (string, error) {
+	var b [32]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
 type ImportProgressEvent struct {
 	SessionID string `json:"sessionId"`
 	Index     int    `json:"index"`
@@ -1869,6 +1894,7 @@ type ProgressHub struct {
 	mu          sync.RWMutex
 	subscribers map[string][]chan ImportProgressEvent
 	latest      map[string]map[int]ImportProgressEvent
+	tokens      map[string]string
 }
 
 func (s *Server) ensureProgressHub() *ProgressHub {
@@ -1882,7 +1908,30 @@ func NewProgressHub() *ProgressHub {
 	return &ProgressHub{
 		subscribers: make(map[string][]chan ImportProgressEvent),
 		latest:      make(map[string]map[int]ImportProgressEvent),
+		tokens:      make(map[string]string),
 	}
+}
+
+func (h *ProgressHub) SetProgressToken(sessionID, token string) {
+	if sessionID == "" || token == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.tokens[sessionID] = token
+}
+
+func (h *ProgressHub) ValidProgressToken(sessionID, token string) bool {
+	if sessionID == "" || token == "" {
+		return false
+	}
+	h.mu.RLock()
+	expected := h.tokens[sessionID]
+	h.mu.RUnlock()
+	if expected == "" || len(expected) != len(token) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(token)) == 1
 }
 
 func (h *ProgressHub) Subscribe(sessionID string) <-chan ImportProgressEvent {

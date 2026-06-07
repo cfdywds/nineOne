@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Video Site 快速导入下载器
 // @namespace    https://github.com/nianzhibai/91
-// @version      0.1.0
+// @version      0.1.1
 // @description  在 XVideos / Pornhub 页面解析高清视频直链，并导入当前 Video Site 项目。
 // @match        https://www.xvideos.com/*
 // @match        https://www.pornhub.com/*
@@ -468,6 +468,7 @@
       message: String(item?.message || ""),
       error: String(item?.error || ""),
       sessionId: String(item?.sessionId || ""),
+      progressToken: String(item?.progressToken || ""),
       progressIndex: Number.isInteger(progressIndex) && progressIndex >= 0 ? progressIndex : -1,
       addedAt: Number(item?.addedAt || Date.now()),
       updatedAt: Number(item?.updatedAt || Date.now()),
@@ -667,12 +668,15 @@
       }
       setStatus(errors.length ? `跳过 ${errors.length} 个地址，提交 ${videoRequests.length} 个下载...` : `提交 ${videoRequests.length} 个下载...`);
       const response = await postJSON(projectBase() + "/api/import/remote/batch", { videos: videoRequests });
-      if (!response || !response.results || !response.sessionId) {
+      if (!response || !response.results || !response.sessionId || !response.progressToken) {
         throw new Error("Invalid response from server");
       }
-      applyBatchResultsToQueue(response.results, requestItemIDs, response.sessionId);
+      applyBatchResultsToQueue(response.results, requestItemIDs, response.sessionId, response.progressToken);
       setStatus(`已提交后台下载：${videoRequests.length} 个；下载进度：0%`);
-      subscribeToProgress(response.sessionId, videoRequests.length, response.results, { itemIDs: requestItemIDs });
+      subscribeToProgress(response.sessionId, videoRequests.length, response.results, {
+        itemIDs: requestItemIDs,
+        progressToken: response.progressToken,
+      });
     } catch (error) {
       for (const itemID of requestItemIDs) {
         updateDownloadQueueItem(itemID, {
@@ -686,7 +690,7 @@
     }
   }
 
-  function applyBatchResultsToQueue(results, itemIDs, sessionId = "") {
+  function applyBatchResultsToQueue(results, itemIDs, sessionId = "", progressToken = "") {
     (Array.isArray(results) ? results : []).forEach((result) => {
       const index = Number(result?.index);
       const itemID = Number.isInteger(index) ? itemIDs[index] : "";
@@ -706,6 +710,7 @@
         href: result?.href || "",
         videoId: result?.id || "",
         sessionId: String(sessionId || ""),
+        progressToken: String(progressToken || ""),
         progressIndex: index,
         message: "已加入下载队列",
         error: "",
@@ -826,7 +831,13 @@
     }
     let resumed = 0;
     for (const group of groups) {
-      if (subscribeToProgress(group.sessionId, group.totalCount, group.results, { itemIDs: group.itemIDs, recovering: true })) {
+      if (
+        subscribeToProgress(group.sessionId, group.totalCount, group.results, {
+          itemIDs: group.itemIDs,
+          progressToken: group.progressToken,
+          recovering: true,
+        })
+      ) {
         resumed++;
       }
     }
@@ -843,10 +854,10 @@
   function activeDownloadSessionGroups() {
     const groupsBySession = new Map();
     for (const item of loadDownloadQueue()) {
-      if (!item.sessionId || item.progressIndex < 0) continue;
+      if (!item.sessionId || !item.progressToken || item.progressIndex < 0) continue;
       let group = groupsBySession.get(item.sessionId);
       if (!group) {
-        group = { sessionId: item.sessionId, totalCount: 0, itemIDs: [], results: [], hasActive: false };
+        group = { sessionId: item.sessionId, progressToken: item.progressToken, totalCount: 0, itemIDs: [], results: [], hasActive: false };
         groupsBySession.set(item.sessionId, group);
       }
       if (isActiveDownloadStatus(item.status)) group.hasActive = true;
@@ -868,7 +879,7 @@
   function markUnresumableActiveDownloads() {
     let marked = 0;
     const queue = loadDownloadQueue().map((item) => {
-      if (!isActiveDownloadStatus(item.status) || item.sessionId) return item;
+      if (!isActiveDownloadStatus(item.status) || (item.sessionId && item.progressToken)) return item;
       marked++;
       return {
         ...item,
@@ -877,6 +888,7 @@
         href: "",
         videoId: "",
         sessionId: "",
+        progressToken: "",
         progressIndex: -1,
         message: "旧下载任务缺少进度会话，已转回待提交",
         error: "",
@@ -904,6 +916,7 @@
         href: "",
         videoId: "",
         sessionId: "",
+        progressToken: "",
         progressIndex: -1,
         message: "进度会话已失效，已转回待提交",
         error: "",
@@ -919,7 +932,8 @@
 
   function subscribeToProgress(sessionId, totalCount, results = [], options = {}) {
     const sessionKey = String(sessionId || "");
-    if (!sessionKey) return false;
+    const progressToken = String(options.progressToken || "");
+    if (!sessionKey || !progressToken) return false;
     if (state.activeProgressSessions.has(sessionKey)) return false;
     state.activeProgressSessions.add(sessionKey);
     const progressMap = initialProgressMap(results);
@@ -937,7 +951,7 @@
     }
 
     progressStream = openProgressStream(
-      projectBase() + "/api/import/progress/" + sessionKey,
+      progressStreamURL(sessionKey, progressToken),
       (data) => {
         sawProgressEvent = true;
         if (recoveryTimer) {
@@ -988,6 +1002,10 @@
       }, RECOVERY_PROGRESS_TIMEOUT_MS);
     }
     return true;
+  }
+
+  function progressStreamURL(sessionId, progressToken) {
+    return `${projectBase()}/api/import/progress/${encodeURIComponent(sessionId)}?token=${encodeURIComponent(progressToken)}`;
   }
 
   function openProgressStream(url, onProgressEvent, onDisconnect) {
