@@ -196,6 +196,87 @@ test("video importer userscript downloads pasted detail page URLs through batch 
   assert.match(statusMessages.at(-1) || "", /导入进度|已提交后台下载|导入完成/);
 });
 
+test("video importer userscript stores progress session metadata for queued downloads", async () => {
+  const storedValues = new Map<string, unknown>();
+  const api = loadUserscriptTestAPI({
+    hostname: "www.xvideos.com",
+    href: "https://www.xvideos.com/?k=sample",
+    html: "",
+    pastedVideoURLs: "https://cdn.example.com/clip-720p.mp4",
+    gmGetValue: (key, fallback) => storedValues.get(key) ?? fallback,
+    gmSetValue: (key, value) => {
+      storedValues.set(key, value);
+    },
+    gmXmlHttpRequest: (options) => {
+      if (isProgressRequest(options)) return undefined;
+      options.onload({
+        status: 202,
+        responseText: JSON.stringify({
+          status: "accepted",
+          sessionId: "import-persisted-session",
+          results: [
+            {
+              index: 0,
+              id: "local-upload-import-1",
+              href: "/video/local-upload-import-1",
+              status: "accepted",
+            },
+          ],
+        }),
+      });
+      return undefined;
+    },
+  });
+
+  await api.importPastedVideos?.();
+
+  const queue = api.loadDownloadQueue?.() || [];
+  assert.equal(queue[0]?.status, "queued");
+  assert.equal(queue[0]?.sessionId, "import-persisted-session");
+  assert.equal(queue[0]?.progressIndex, 0);
+});
+
+test("video importer userscript does not show accepted download locations before progress arrives", async () => {
+  const statusMessages: string[] = [];
+  const api = loadUserscriptTestAPI({
+    hostname: "www.xvideos.com",
+    href: "https://www.xvideos.com/?k=sample",
+    html: "",
+    pastedVideoURLs: "https://cdn.example.com/clip-720p.mp4",
+    eventSourceEvents: [],
+    onStatus: (message) => statusMessages.push(message),
+    gmXmlHttpRequest: (options) => {
+      if (isProgressRequest(options)) {
+        throw new Error("progress should use EventSource when available");
+      }
+      assert.equal(options.method, "POST");
+      options.onload({
+        status: 202,
+        responseText: JSON.stringify({
+          status: "accepted",
+          sessionId: "import-accepted-no-location",
+          results: [
+            {
+              index: 0,
+              id: "local-upload-import-1",
+              href: "/video/local-upload-import-1",
+              status: "accepted",
+            },
+          ],
+        }),
+      });
+      return undefined;
+    },
+  });
+
+  await api.importPastedVideos?.();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const acceptedStatus = statusMessages.at(-1) || "";
+  assert.match(acceptedStatus, /0%/);
+  assert.doesNotMatch(acceptedStatus, /local-upload-import-1/);
+});
+
 test("video importer userscript shows per-download percentage and download locations", async () => {
   const statusMessages: string[] = [];
   const progressEvents = [
@@ -260,7 +341,7 @@ test("video importer userscript shows per-download percentage and download locat
   assert.match(statusMessages.at(-1) || "", /下载位置/);
 });
 
-test("video importer userscript subscribes to progress through GM_xmlhttpRequest with credentials", async () => {
+test("video importer userscript falls back to GM_xmlhttpRequest progress with credentials", async () => {
   const statusMessages: string[] = [];
   const progressRequests: Array<{
     url: string;
@@ -274,6 +355,7 @@ test("video importer userscript subscribes to progress through GM_xmlhttpRequest
     html: "",
     pastedVideoURLs: "https://cdn.example.com/clip-720p.mp4",
     onStatus: (message) => statusMessages.push(message),
+    eventSourceAvailable: false,
     gmXmlHttpRequest: (options) => {
       if (options.method === "GET" && options.url.includes("/api/import/progress/")) {
         progressRequests.push({
@@ -322,6 +404,256 @@ test("video importer userscript subscribes to progress through GM_xmlhttpRequest
   assert.equal(progressRequestAborted, true, "progress stream should be aborted after all items finish");
   assert.ok(statusMessages.some((message) => message.includes("45%")));
   assert.doesNotMatch(statusMessages.at(-1) || "", /进度订阅断开/);
+});
+
+test("video importer userscript prefers EventSource for live progress streaming", async () => {
+  const statusMessages: string[] = [];
+  const api = loadUserscriptTestAPI({
+    hostname: "www.xvideos.com",
+    href: "https://www.xvideos.com/?k=sample",
+    html: "",
+    pastedVideoURLs: "https://cdn.example.com/clip-720p.mp4",
+    onStatus: (message) => statusMessages.push(message),
+    eventSourceEvents: [
+      {
+        index: 0,
+        status: "completed",
+        progress: 100,
+        message: "导入成功",
+        videoId: "local-upload-import-1",
+      },
+    ],
+    gmXmlHttpRequest: (options) => {
+      if (isProgressRequest(options)) {
+        throw new Error("progress should use EventSource when available");
+      }
+      assert.equal(options.method, "POST");
+      options.onload({
+        status: 202,
+        responseText: JSON.stringify({
+          status: "accepted",
+          sessionId: "import-eventsource-progress",
+          results: [
+            {
+              index: 0,
+              id: "local-upload-import-1",
+              href: "/video/local-upload-import-1",
+              status: "accepted",
+            },
+          ],
+        }),
+      });
+      return undefined;
+    },
+  });
+
+  await api.importPastedVideos?.();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.match(statusMessages.at(-1) || "", /导入完成：100%/);
+});
+
+test("video importer userscript resumes active queued downloads after page navigation", async () => {
+  const queueKey = "video-site-importer-download-queue-v1";
+  const storedValues = new Map<string, unknown>();
+  storedValues.set(
+    queueKey,
+    JSON.stringify([
+      {
+        id: "queued-one",
+        url: "https://www.xvideos.com/video123456/sample",
+        title: "Previously submitted video",
+        status: "downloading",
+        progress: 0,
+        sessionId: "import-resume-session",
+        progressIndex: 0,
+        href: "/video/local-upload-import-1",
+        videoId: "local-upload-import-1",
+      },
+    ])
+  );
+  const progressRequests: string[] = [];
+  const statusMessages: string[] = [];
+  const api = loadUserscriptTestAPI({
+    hostname: "www.xvideos.com",
+    href: "https://www.xvideos.com/?k=sample",
+    html: "",
+    onStatus: (message) => statusMessages.push(message),
+    eventSourceAvailable: false,
+    gmGetValue: (key, fallback) => storedValues.get(key) ?? fallback,
+    gmSetValue: (key, value) => {
+      storedValues.set(key, value);
+    },
+    gmXmlHttpRequest: (options) => {
+      if (isProgressRequest(options)) {
+        progressRequests.push(options.url);
+        return emitProgressEvents(options, [
+          {
+            index: 0,
+            status: "completed",
+            progress: 100,
+            message: "导入成功",
+            videoId: "local-upload-import-1",
+          },
+        ]);
+      }
+      throw new Error("resume should not submit a new batch");
+    },
+  });
+
+  await api.importPastedVideos?.();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(progressRequests, [
+    "http://127.0.0.1:9191/api/import/progress/import-resume-session",
+  ]);
+  const queue = api.loadDownloadQueue?.() || [];
+  assert.equal(queue[0]?.status, "completed");
+  assert.equal(queue[0]?.progress, 100);
+  assert.match(statusMessages.at(-1) || "", /导入完成：100%/);
+});
+
+test("video importer userscript returns legacy active downloads without progress sessions to pending", async () => {
+  const queueKey = "video-site-importer-download-queue-v1";
+  const storedValues = new Map<string, unknown>();
+  storedValues.set(
+    queueKey,
+    JSON.stringify([
+      {
+        id: "legacy-active",
+        url: "https://cn.pornhub.com/view_video.php?viewkey=ph61e594f4e042d",
+        title: "Legacy active video",
+        status: "downloading",
+        progress: 0,
+        href: "/video/local-upload-legacy",
+        videoId: "local-upload-legacy",
+      },
+    ])
+  );
+  const statusMessages: string[] = [];
+  const api = loadUserscriptTestAPI({
+    hostname: "cn.pornhub.com",
+    href: "https://cn.pornhub.com/video/search?search=sample",
+    html: "",
+    onStatus: (message) => statusMessages.push(message),
+    eventSourceAvailable: false,
+    gmGetValue: (key, fallback) => storedValues.get(key) ?? fallback,
+    gmSetValue: (key, value) => {
+      storedValues.set(key, value);
+    },
+    gmXmlHttpRequest: () => {
+      throw new Error("legacy active cleanup should not submit or subscribe");
+    },
+  });
+
+  await api.importPastedVideos?.();
+
+  const queue = api.loadDownloadQueue?.() || [];
+  assert.equal(queue[0]?.status, "pending");
+  assert.equal(queue[0]?.progress, 0);
+  assert.equal(queue[0]?.href, "");
+  assert.match(statusMessages.at(-1) || "", /旧下载任务缺少进度会话/);
+});
+
+test("video importer userscript returns legacy queued downloads to pending during panel recovery", () => {
+  const queueKey = "video-site-importer-download-queue-v1";
+  const storedValues = new Map<string, unknown>();
+  storedValues.set(
+    queueKey,
+    JSON.stringify([
+      {
+        id: "legacy-queued",
+        url: "https://cn.pornhub.com/view_video.php?viewkey=ph61e594f4e042d",
+        title: "Legacy queued video",
+        status: "queued",
+        progress: 0,
+        href: "/video/local-upload-legacy-queued",
+        videoId: "local-upload-legacy-queued",
+      },
+    ])
+  );
+  const statusMessages: string[] = [];
+  const api = loadUserscriptTestAPI({
+    hostname: "cn.pornhub.com",
+    href: "https://cn.pornhub.com/video/search?search=sample",
+    html: "",
+    onStatus: (message) => statusMessages.push(message),
+    eventSourceAvailable: false,
+    gmGetValue: (key, fallback) => storedValues.get(key) ?? fallback,
+    gmSetValue: (key, value) => {
+      storedValues.set(key, value);
+    },
+  });
+
+  api.recoverActiveDownloadQueue?.();
+
+  const queue = api.loadDownloadQueue?.() || [];
+  assert.equal(queue[0]?.status, "pending");
+  assert.equal(queue[0]?.progress, 0);
+  assert.equal(queue[0]?.href, "");
+  assert.match(statusMessages.at(-1) || "", /旧下载任务缺少进度会话/);
+});
+
+test("video importer userscript returns stale recovered progress sessions to pending", async () => {
+  const queueKey = "video-site-importer-download-queue-v1";
+  const storedValues = new Map<string, unknown>();
+  storedValues.set(
+    queueKey,
+    JSON.stringify([
+      {
+        id: "stale-session",
+        url: "https://cn.pornhub.com/view_video.php?viewkey=ph61e594f4e042d",
+        title: "Stale recovered video",
+        status: "queued",
+        progress: 0,
+        sessionId: "import-stale-session",
+        progressIndex: 0,
+        href: "/video/local-upload-stale",
+        videoId: "local-upload-stale",
+      },
+    ])
+  );
+  let didAbortProgress = false;
+  const statusMessages: string[] = [];
+  const api = loadUserscriptTestAPI({
+    hostname: "cn.pornhub.com",
+    href: "https://cn.pornhub.com/video/search?search=sample",
+    html: "",
+    onStatus: (message) => statusMessages.push(message),
+    eventSourceAvailable: false,
+    gmGetValue: (key, fallback) => storedValues.get(key) ?? fallback,
+    gmSetValue: (key, value) => {
+      storedValues.set(key, value);
+    },
+    setTimeout: (callback) => {
+      callback();
+      return 1;
+    },
+    clearTimeout: () => undefined,
+    gmXmlHttpRequest: (options) => {
+      if (isProgressRequest(options)) {
+        return {
+          abort() {
+            didAbortProgress = true;
+          },
+        };
+      }
+      throw new Error("stale recovery should not submit a new batch");
+    },
+  });
+
+  const result = api.recoverActiveDownloadQueue?.();
+
+  assert.equal(result?.resumed, 1);
+  assert.equal(didAbortProgress, true);
+  const queue = api.loadDownloadQueue?.() || [];
+  assert.equal(queue[0]?.status, "pending");
+  assert.equal(queue[0]?.progress, 0);
+  assert.equal(queue[0]?.sessionId, "");
+  assert.equal(queue[0]?.progressIndex, -1);
+  assert.equal(queue[0]?.href, "");
+  assert.equal(queue[0]?.videoId, "");
+  assert.match(statusMessages.at(-1) || "", /进度会话已失效/);
 });
 
 test("video importer userscript stages current page links across pagination", () => {
@@ -373,8 +705,8 @@ test("video importer userscript renders a friendly download task list", () => {
       id: "one",
       url: "https://www.xvideos.com/video123456/first",
       title: "First staged video",
-      status: "downloading",
-      progress: 45,
+      status: "completed",
+      progress: 100,
       href: "/video/local-upload-one",
     },
     {
@@ -386,11 +718,45 @@ test("video importer userscript renders a friendly download task list", () => {
     },
   ]) || "";
 
-  assert.match(html, /下载中/);
-  assert.match(html, /45%/);
+  assert.match(html, /已完成/);
+  assert.match(html, /100%/);
   assert.match(html, /待提交/);
   assert.match(html, /First staged video/);
   assert.match(html, /http:\/\/127\.0\.0\.1:9191\/video\/local-upload-one/);
+});
+
+test("video importer userscript hides predicted download links until imports complete", () => {
+  const api = loadUserscriptTestAPI({
+    hostname: "www.xvideos.com",
+    href: "https://www.xvideos.com/?k=sample",
+    html: "",
+  });
+
+  const html = api.renderDownloadListHTML?.([
+    {
+      id: "active",
+      url: "https://www.xvideos.com/video123456/active",
+      title: "Active video",
+      status: "downloading",
+      progress: 45,
+      href: "/video/local-upload-active",
+      videoId: "local-upload-active",
+    },
+    {
+      id: "failed",
+      url: "https://www.xvideos.com/video789/failed",
+      title: "Failed video",
+      status: "error",
+      progress: 100,
+      href: "/video/local-upload-failed",
+      videoId: "local-upload-failed",
+      error: "download failed",
+    },
+  ]) || "";
+
+  assert.match(html, /完成后可用/);
+  assert.doesNotMatch(html, /href="http:\/\/127\.0\.0\.1:9191\/video\/local-upload-active"/);
+  assert.doesNotMatch(html, /href="http:\/\/127\.0\.0\.1:9191\/video\/local-upload-failed"/);
 });
 
 test("video importer userscript allows submitting new queued links while downloads are active", async () => {
@@ -587,7 +953,17 @@ type UserscriptTestAPI = {
   importPastedVideos?: () => Promise<void>;
   collectListPageVideoLinksFromHTML?: (html: string, pageURL: string) => string[];
   addDownloadQueueURLs?: (urls: string[]) => { added: number; skipped: number; total: number };
-  loadDownloadQueue?: () => Array<{ id: string; url: string; title?: string; status?: string; progress?: number; href?: string }>;
+  recoverActiveDownloadQueue?: () => { resumed: number; marked: number };
+  loadDownloadQueue?: () => Array<{
+    id: string;
+    url: string;
+    title?: string;
+    status?: string;
+    progress?: number;
+    href?: string;
+    sessionId?: string;
+    progressIndex?: number;
+  }>;
   renderDownloadListHTML?: (items: Array<Record<string, unknown>>) => string;
   setPastedVideoURLs?: (value: string) => void;
 };
@@ -616,6 +992,7 @@ function loadUserscriptTestAPI(input: {
   html: string;
   pastedVideoURLs?: string;
   eventSourceEvents?: Array<Record<string, unknown>>;
+  eventSourceAvailable?: boolean;
   onStatus?: (message: string) => void;
   gmGetValue?: (key: string, fallback: unknown) => unknown;
   gmSetValue?: (key: string, value: unknown) => void;
@@ -630,6 +1007,8 @@ function loadUserscriptTestAPI(input: {
     onerror?: () => void;
     ontimeout?: () => void;
   }) => void | { abort?: () => void };
+  setTimeout?: (callback: () => void, delay?: number) => unknown;
+  clearTimeout?: (timer: unknown) => void;
   windowFetch?: (
     url: string,
     init?: { credentials?: string }
@@ -648,6 +1027,7 @@ function loadUserscriptTestAPI(input: {
       importPastedVideos: typeof importPastedVideos === "function" ? importPastedVideos : undefined,
       collectListPageVideoLinksFromHTML: typeof collectListPageVideoLinksFromHTML === "function" ? collectListPageVideoLinksFromHTML : undefined,
       addDownloadQueueURLs: typeof addDownloadQueueURLs === "function" ? addDownloadQueueURLs : undefined,
+      recoverActiveDownloadQueue: typeof recoverActiveDownloadQueue === "function" ? recoverActiveDownloadQueue : undefined,
       loadDownloadQueue: typeof loadDownloadQueue === "function" ? loadDownloadQueue : undefined,
       renderDownloadListHTML: typeof renderDownloadListHTML === "function" ? renderDownloadListHTML : undefined,
     };
@@ -698,9 +1078,11 @@ function loadUserscriptTestAPI(input: {
     Promise,
     JSON,
     decodeURIComponent,
+    setTimeout: input.setTimeout || setTimeout,
+    clearTimeout: input.clearTimeout || clearTimeout,
     setImmediate,
     console,
-    EventSource: TestEventSource,
+    EventSource: input.eventSourceAvailable === false ? undefined : TestEventSource,
     GM_getValue: input.gmGetValue || ((_key: string, fallback: string) => fallback),
     GM_setValue: input.gmSetValue || (() => undefined),
     GM_xmlhttpRequest: input.gmXmlHttpRequest || (() => undefined),

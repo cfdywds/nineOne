@@ -23,6 +23,7 @@
   const VIDEO_FILE_PATTERN = /\.(mp4|webm|mov|mkv|avi)(?:[?#].*)?$/i;
   const HLS_FILE_PATTERN = /\.m3u8(?:[?#].*)?$/i;
   const MAX_PASTED_VIDEO_URLS = 50;
+  const RECOVERY_PROGRESS_TIMEOUT_MS = 8000;
   const DOWNLOAD_STATUS_LABELS = {
     pending: "待提交",
     parsing: "解析中",
@@ -33,12 +34,14 @@
     completed: "已完成",
     error: "失败",
   };
+  const ACTIVE_DOWNLOAD_STATUSES = new Set(["parsing", "submitting", "queued", "downloading", "saving"]);
   const state = {
     busy: false,
     lastCandidates: [],
     queueLoaded: false,
     downloadQueue: [],
     activeSessionCount: 0,
+    activeProgressSessions: new Set(),
   };
 
   function detectSourceSite(locationLike = window.location) {
@@ -453,6 +456,7 @@
     const url = normalizeURL(item?.url || "");
     if (!url) return null;
     const status = DOWNLOAD_STATUS_LABELS[item?.status] ? item.status : "pending";
+    const progressIndex = Number(item?.progressIndex);
     return {
       id: String(item?.id || downloadQueueItemID(url)),
       url,
@@ -463,6 +467,8 @@
       videoId: String(item?.videoId || ""),
       message: String(item?.message || ""),
       error: String(item?.error || ""),
+      sessionId: String(item?.sessionId || ""),
+      progressIndex: Number.isInteger(progressIndex) && progressIndex >= 0 ? progressIndex : -1,
       addedAt: Number(item?.addedAt || Date.now()),
       updatedAt: Number(item?.updatedAt || Date.now()),
     };
@@ -590,6 +596,10 @@
     setStatus("暂存列表已清空");
   }
 
+  function isActiveDownloadStatus(status) {
+    return ACTIVE_DOWNLOAD_STATUSES.has(status);
+  }
+
   function isDirectVideoURL(value) {
     return VIDEO_FILE_PATTERN.test(normalizeURL(value));
   }
@@ -604,8 +614,15 @@
     stagePastedVideoURLs();
     const pendingItems = loadDownloadQueue().filter((item) => item.status === "pending");
     if (pendingItems.length === 0) {
-      const activeCount = loadDownloadQueue().filter((item) => ["parsing", "submitting", "queued", "downloading", "saving"].includes(item.status)).length;
-      setStatus(activeCount > 0 ? `没有新的待提交地址，当前 ${activeCount} 个任务仍在下载中` : "请先粘贴或暂存视频地址");
+      const activeItems = loadDownloadQueue().filter((item) => isActiveDownloadStatus(item.status));
+      if (activeItems.length > 0) {
+        const result = recoverActiveDownloadQueue();
+        if (result.resumed === 0 && result.marked === 0) {
+          setStatus(`没有新的待提交地址，当前 ${activeItems.length} 个任务仍在下载中`);
+        }
+        return;
+      }
+      setStatus("请先粘贴或暂存视频地址");
       return;
     }
     if (pendingItems.length > MAX_PASTED_VIDEO_URLS) {
@@ -653,9 +670,8 @@
       if (!response || !response.results || !response.sessionId) {
         throw new Error("Invalid response from server");
       }
-      applyBatchResultsToQueue(response.results, requestItemIDs);
-      const initialLocations = formatBatchDownloadLocations(response.results);
-      setStatus(`已提交后台下载：${videoRequests.length} 个；下载进度：0%${initialLocations ? `；下载位置：${initialLocations}` : ""}`);
+      applyBatchResultsToQueue(response.results, requestItemIDs, response.sessionId);
+      setStatus(`已提交后台下载：${videoRequests.length} 个；下载进度：0%`);
       subscribeToProgress(response.sessionId, videoRequests.length, response.results, { itemIDs: requestItemIDs });
     } catch (error) {
       for (const itemID of requestItemIDs) {
@@ -670,7 +686,7 @@
     }
   }
 
-  function applyBatchResultsToQueue(results, itemIDs) {
+  function applyBatchResultsToQueue(results, itemIDs, sessionId = "") {
     (Array.isArray(results) ? results : []).forEach((result) => {
       const index = Number(result?.index);
       const itemID = Number.isInteger(index) ? itemIDs[index] : "";
@@ -689,6 +705,8 @@
         progress: 0,
         href: result?.href || "",
         videoId: result?.id || "",
+        sessionId: String(sessionId || ""),
+        progressIndex: index,
         message: "已加入下载队列",
         error: "",
       });
@@ -801,20 +819,131 @@
     if (button) button.disabled = disabled;
   }
 
+  function resumeActiveDownloadProgress() {
+    const groups = activeDownloadSessionGroups();
+    if (groups.length > 0) {
+      setStatus(`正在恢复 ${groups.length} 个下载会话的进度订阅...`);
+    }
+    let resumed = 0;
+    for (const group of groups) {
+      if (subscribeToProgress(group.sessionId, group.totalCount, group.results, { itemIDs: group.itemIDs, recovering: true })) {
+        resumed++;
+      }
+    }
+    return resumed;
+  }
+
+  function recoverActiveDownloadQueue() {
+    return {
+      resumed: resumeActiveDownloadProgress(),
+      marked: markUnresumableActiveDownloads(),
+    };
+  }
+
+  function activeDownloadSessionGroups() {
+    const groupsBySession = new Map();
+    for (const item of loadDownloadQueue()) {
+      if (!item.sessionId || item.progressIndex < 0) continue;
+      let group = groupsBySession.get(item.sessionId);
+      if (!group) {
+        group = { sessionId: item.sessionId, totalCount: 0, itemIDs: [], results: [], hasActive: false };
+        groupsBySession.set(item.sessionId, group);
+      }
+      if (isActiveDownloadStatus(item.status)) group.hasActive = true;
+      group.totalCount = Math.max(group.totalCount, item.progressIndex + 1);
+      group.itemIDs[item.progressIndex] = item.id;
+      group.results.push({
+        index: item.progressIndex,
+        id: item.videoId,
+        href: item.href,
+        status: item.status,
+        progress: item.progress,
+        message: item.message,
+        error: item.error,
+      });
+    }
+    return [...groupsBySession.values()].filter((group) => group.hasActive);
+  }
+
+  function markUnresumableActiveDownloads() {
+    let marked = 0;
+    const queue = loadDownloadQueue().map((item) => {
+      if (!isActiveDownloadStatus(item.status) || item.sessionId) return item;
+      marked++;
+      return {
+        ...item,
+        status: "pending",
+        progress: 0,
+        href: "",
+        videoId: "",
+        sessionId: "",
+        progressIndex: -1,
+        message: "旧下载任务缺少进度会话，已转回待提交",
+        error: "",
+        updatedAt: Date.now(),
+      };
+    });
+    if (marked > 0) {
+      saveDownloadQueue(queue);
+      setStatus(`旧下载任务缺少进度会话，已将 ${marked} 个转回待提交，可重新提交下载`);
+    }
+    return marked;
+  }
+
+  function returnProgressSessionToPending(sessionId, itemIDs = []) {
+    const ids = new Set((Array.isArray(itemIDs) ? itemIDs : []).filter(Boolean));
+    if (ids.size === 0) return 0;
+    let marked = 0;
+    const queue = loadDownloadQueue().map((item) => {
+      if (!ids.has(item.id) || !isActiveDownloadStatus(item.status)) return item;
+      marked++;
+      return {
+        ...item,
+        status: "pending",
+        progress: 0,
+        href: "",
+        videoId: "",
+        sessionId: "",
+        progressIndex: -1,
+        message: "进度会话已失效，已转回待提交",
+        error: "",
+        updatedAt: Date.now(),
+      };
+    });
+    if (marked > 0) {
+      saveDownloadQueue(queue);
+      setStatus(`进度会话已失效，已将 ${marked} 个任务转回待提交，可重新提交下载`);
+    }
+    return marked;
+  }
+
   function subscribeToProgress(sessionId, totalCount, results = [], options = {}) {
+    const sessionKey = String(sessionId || "");
+    if (!sessionKey) return false;
+    if (state.activeProgressSessions.has(sessionKey)) return false;
+    state.activeProgressSessions.add(sessionKey);
     const progressMap = initialProgressMap(results);
     const resultMap = progressResultMap(results);
     const itemIDs = Array.isArray(options.itemIDs) ? options.itemIDs : [];
+    const recovering = Boolean(options.recovering);
+    let recoveryTimer = null;
+    let sawProgressEvent = false;
+    let progressStream = null;
     state.activeSessionCount++;
     const initialCounts = progressCounts(progressMap);
     if (initialCounts.finished >= totalCount) {
-      setFinalProgressStatus(progressMap, resultMap, initialCounts, itemIDs);
-      return;
+      setFinalProgressStatus(progressMap, resultMap, initialCounts, itemIDs, sessionKey);
+      return true;
     }
 
-    openProgressStream(
-      projectBase() + "/api/import/progress/" + sessionId,
+    progressStream = openProgressStream(
+      projectBase() + "/api/import/progress/" + sessionKey,
       (data) => {
+        sawProgressEvent = true;
+        if (recoveryTimer) {
+          clearTimeout(recoveryTimer);
+          recoveryTimer = null;
+        }
         const index = Number(data.index);
         if (Number.isInteger(index)) {
           progressMap.set(index, data);
@@ -838,23 +967,34 @@
         }
         setStatus(`下载进度：${overallPercent}%（${counts.finished}/${totalCount}）${itemPrefix}：${itemPercent}% ${itemMessage}${locationText}；成功:${counts.completed} 失败:${counts.error}`);
         if (counts.finished >= totalCount) {
-          setFinalProgressStatus(progressMap, resultMap, counts, itemIDs);
+          setFinalProgressStatus(progressMap, resultMap, counts, itemIDs, sessionKey);
           return true;
         }
         return false;
       },
       () => {
         setStatus("进度订阅断开，请刷新查看结果");
-        state.activeSessionCount = Math.max(0, state.activeSessionCount - 1);
+        finishProgressSession(sessionKey);
       }
     );
+    if (recovering && !sawProgressEvent) {
+      recoveryTimer = setTimeout(() => {
+        if (sawProgressEvent) return;
+        if (progressStream && typeof progressStream.close === "function") {
+          progressStream.close();
+        }
+        returnProgressSessionToPending(sessionKey, itemIDs);
+        finishProgressSession(sessionKey);
+      }, RECOVERY_PROGRESS_TIMEOUT_MS);
+    }
+    return true;
   }
 
   function openProgressStream(url, onProgressEvent, onDisconnect) {
-    if (typeof GM_xmlhttpRequest === "function") {
-      return openGMProgressStream(url, onProgressEvent, onDisconnect);
+    if (typeof EventSource === "function") {
+      return openEventSourceProgressStream(url, onProgressEvent, onDisconnect);
     }
-    return openEventSourceProgressStream(url, onProgressEvent, onDisconnect);
+    return openGMProgressStream(url, onProgressEvent, onDisconnect);
   }
 
   function openGMProgressStream(url, onProgressEvent, onDisconnect) {
@@ -959,7 +1099,12 @@
     return eventSource;
   }
 
-  function setFinalProgressStatus(progressMap, resultMap, counts, itemIDs = []) {
+  function finishProgressSession(sessionId) {
+    if (sessionId) state.activeProgressSessions.delete(sessionId);
+    state.activeSessionCount = Math.max(0, state.activeSessionCount - 1);
+  }
+
+  function setFinalProgressStatus(progressMap, resultMap, counts, itemIDs = [], sessionId = "") {
     for (let index = 0; index < itemIDs.length; index++) {
       const data = progressMap.get(index);
       if (!data) continue;
@@ -974,7 +1119,7 @@
     }
     const finalLocations = formatDownloadLocations(progressMap, resultMap);
     setStatus(`导入完成：100% - ${counts.completed} 成功，${counts.error} 失败${finalLocations ? `；下载位置：${finalLocations}` : ""}`);
-    state.activeSessionCount = Math.max(0, state.activeSessionCount - 1);
+    finishProgressSession(sessionId);
   }
 
   function progressResultMap(results) {
@@ -1002,13 +1147,18 @@
           progress: 100,
           error: result.error || "提交失败",
         });
+      } else if (result?.status === "completed") {
+        progressMap.set(index, {
+          index,
+          videoId: result.id || "",
+          href: result.href || "",
+          status: "completed",
+          progress: 100,
+          message: result.message || "导入成功",
+        });
       }
     });
     return progressMap;
-  }
-
-  function formatBatchDownloadLocations(results) {
-    return formatDownloadLocations(new Map(), progressResultMap(results));
   }
 
   function progressCounts(progressMap) {
@@ -1121,7 +1271,7 @@
     const counts = { pending: 0, active: 0, completed: 0, error: 0 };
     for (const item of queue) {
       if (item.status === "pending") counts.pending++;
-      if (["parsing", "submitting", "queued", "downloading", "saving"].includes(item.status)) counts.active++;
+      if (isActiveDownloadStatus(item.status)) counts.active++;
       if (item.status === "completed") counts.completed++;
       if (item.status === "error") counts.error++;
     }
@@ -1141,7 +1291,7 @@
         const title = escapeHTML(item.title || filenameTitleFromURL(item.url) || item.url || "Untitled");
         const url = escapeHTML(shortDisplayURL(item.url || ""));
         const detailURL = item.href ? absoluteProjectURL(item.href) : item.videoId ? absoluteProjectURL("/video/" + encodeURIComponent(item.videoId)) : "";
-        const location = detailURL ? `<a href="${escapeAttribute(detailURL)}" target="_blank" rel="noopener">下载位置</a>` : "";
+        const location = downloadLocationHTML(status, detailURL);
         const error = item.error ? `<div class="vsi-item-error">${escapeHTML(item.error)}</div>` : "";
         return `
           <div class="vsi-download-item" data-status="${escapeAttribute(status)}">
@@ -1157,6 +1307,17 @@
         `;
       })
       .join("");
+  }
+
+  function downloadLocationHTML(status, detailURL) {
+    if (!detailURL) return "";
+    if (status === "completed") {
+      return `<a href="${escapeAttribute(detailURL)}" target="_blank" rel="noopener">下载位置</a>`;
+    }
+    if (isActiveDownloadStatus(status)) {
+      return `<span class="vsi-location-pending">完成后可用</span>`;
+    }
+    return "";
   }
 
   function shortDisplayURL(value) {
@@ -1404,6 +1565,7 @@
       panel.querySelector('[data-role="download-pasted"]')?.addEventListener("click", importPastedVideos);
       panel.querySelector('[data-role="clear-queue"]')?.addEventListener("click", clearDownloadQueue);
       renderDownloadQueuePanel();
+      recoverActiveDownloadQueue();
     } else {
       panel.querySelector('[data-role="import"]')?.addEventListener("click", importBestVideo);
     }

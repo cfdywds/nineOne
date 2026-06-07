@@ -806,6 +806,57 @@ func TestProgressHubReplaysLatestEventsToLateSubscribers(t *testing.T) {
 	}
 }
 
+func TestHandleImportProgressAllowsCredentialedEventSourceCORS(t *testing.T) {
+	server := &Server{}
+	sessionID := "cors-session"
+	server.ensureProgressHub().Publish(ImportProgressEvent{
+		SessionID: sessionID,
+		Index:     0,
+		VideoID:   "video-1",
+		Status:    "queued",
+		Progress:  0,
+	})
+
+	req := requestWithRouteParam(http.MethodGet, "/api/import/progress/"+sessionID, "sessionID", sessionID, strings.NewReader(""))
+	ctx, cancel := context.WithCancel(req.Context())
+	defer cancel()
+	req = req.WithContext(ctx)
+	req.Header.Set("Origin", "https://cn.pornhub.com")
+	rr := httptest.NewRecorder()
+	done := make(chan struct{})
+
+	go func() {
+		server.handleImportProgress(rr, req)
+		close(done)
+	}()
+
+	deadline := time.After(time.Second)
+	for !strings.Contains(rr.Body.String(), `"status":"queued"`) {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for progress event; body = %q", rr.Body.String())
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("progress handler did not exit after cancellation")
+	}
+
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://cn.pornhub.com" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want request origin", got)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Fatalf("Access-Control-Allow-Credentials = %q, want true", got)
+	}
+	if got := rr.Header().Get("Vary"); !strings.Contains(got, "Origin") {
+		t.Fatalf("Vary = %q, want Origin", got)
+	}
+}
+
 func TestHandleImportRemoteVideoRejectsUnsupportedSite(t *testing.T) {
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
 	if err != nil {
