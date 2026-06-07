@@ -512,6 +512,325 @@ func TestHandleUploadVideoRejectsUnsupportedTag(t *testing.T) {
 	}
 }
 
+func TestHandleImportRemoteVideoDownloadsVideoAndPreservesSourceMetadata(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	var gotReferer string
+	media := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/video-hd.mp4" {
+			http.NotFound(w, r)
+			return
+		}
+		gotReferer = r.Header.Get("Referer")
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("remote-video-bytes"))
+	}))
+	defer media.Close()
+
+	queuedCh := make(chan *catalog.Video, 1)
+	server := &Server{
+		Catalog:  cat,
+		LocalDir: t.TempDir(),
+		OnVideoUploaded: func(v *catalog.Video) {
+			queuedCh <- v
+		},
+	}
+	payload, err := json.Marshal(map[string]any{
+		"sourceSite":      "xvideos",
+		"pageUrl":         "https://www.xvideos.com/video123456/sample",
+		"videoUrl":        media.URL + "/video-hd.mp4",
+		"title":           "Remote HD Clip",
+		"thumbnailUrl":    "https://img.example/thumb.jpg",
+		"quality":         "1080p",
+		"durationSeconds": 123,
+		"referer":         "https://www.xvideos.com/video123456/sample",
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/import/remote", bytes.NewReader(payload))
+	rr := httptest.NewRecorder()
+
+	server.handleImportRemoteVideo(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var accepted struct {
+		Status string `json:"status"`
+		ID     string `json:"id"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&accepted); err != nil {
+		t.Fatalf("decode accepted response: %v", err)
+	}
+	if accepted.Status != "accepted" || accepted.ID == "" {
+		t.Fatalf("accepted response = %#v, want accepted status and predicted video id", accepted)
+	}
+	var queued *catalog.Video
+	select {
+	case queued = <-queuedCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for background remote import")
+	}
+	if gotReferer != "https://www.xvideos.com/video123456/sample" {
+		t.Fatalf("download Referer = %q, want source page URL", gotReferer)
+	}
+	got, err := cat.GetVideo(ctx, queued.ID)
+	if err != nil {
+		t.Fatalf("get imported video: %v", err)
+	}
+	if got.DriveID != localUploadDriveID {
+		t.Fatalf("drive id = %q, want %q", got.DriveID, localUploadDriveID)
+	}
+	if got.Title != "Remote HD Clip" || got.Author != "XVideos 导入" {
+		t.Fatalf("title/author = %q/%q, want source-specific metadata", got.Title, got.Author)
+	}
+	if got.FileName != "[XVideos] Remote HD Clip.mp4" {
+		t.Fatalf("file name = %q, want source-prefixed original name", got.FileName)
+	}
+	if got.Quality != "1080p" || got.DurationSeconds != 123 {
+		t.Fatalf("quality/duration = %q/%d, want submitted metadata", got.Quality, got.DurationSeconds)
+	}
+	if got.ThumbnailURL != "https://img.example/thumb.jpg" {
+		t.Fatalf("thumbnail = %q, want submitted source thumbnail", got.ThumbnailURL)
+	}
+	if got.ContentHash == "" {
+		t.Fatal("content hash should be set from downloaded bytes")
+	}
+	if !sameStringSet(got.Tags, []string{"xvideos"}) {
+		t.Fatalf("tags = %#v, want xvideos source tag", got.Tags)
+	}
+	if !strings.Contains(got.Description, "https://www.xvideos.com/video123456/sample") {
+		t.Fatalf("description = %q, want source page URL", got.Description)
+	}
+	path := filepath.Join(server.localUploadDir(), got.FileID)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read imported file: %v", err)
+	}
+	if string(data) != "remote-video-bytes" {
+		t.Fatalf("imported file content = %q, want downloaded bytes", string(data))
+	}
+	if queued.ID != got.ID {
+		t.Fatalf("queued video = %#v, want imported video", queued)
+	}
+}
+
+func TestHandleImportRemoteVideoAcceptsSlowDownloadBeforeCompletion(t *testing.T) {
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	downloadStarted := make(chan struct{})
+	releaseDownload := make(chan struct{})
+	media := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/slow.mp4" {
+			http.NotFound(w, r)
+			return
+		}
+		close(downloadStarted)
+		<-releaseDownload
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("slow-remote-video"))
+	}))
+	defer media.Close()
+
+	queuedCh := make(chan *catalog.Video, 1)
+	server := &Server{
+		Catalog:  cat,
+		LocalDir: t.TempDir(),
+		OnVideoUploaded: func(v *catalog.Video) {
+			queuedCh <- v
+		},
+	}
+	payload, err := json.Marshal(map[string]any{
+		"sourceSite": "pornhub",
+		"pageUrl":    "https://www.pornhub.com/view_video.php?viewkey=slow",
+		"videoUrl":   media.URL + "/slow.mp4",
+		"title":      "Slow Import",
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/import/remote", bytes.NewReader(payload))
+	rr := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		server.handleImportRemoteVideo(rr, req)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(150 * time.Millisecond):
+		close(releaseDownload)
+		<-done
+		t.Fatalf("remote import response waited for video download; status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr.Code != http.StatusAccepted {
+		close(releaseDownload)
+		t.Fatalf("status = %d, want 202; body = %s", rr.Code, rr.Body.String())
+	}
+
+	select {
+	case <-downloadStarted:
+	case <-time.After(2 * time.Second):
+		close(releaseDownload)
+		t.Fatal("background download did not start")
+	}
+	close(releaseDownload)
+	select {
+	case uploaded := <-queuedCh:
+		if uploaded.Title != "Slow Import" {
+			t.Fatalf("uploaded title = %q, want Slow Import", uploaded.Title)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for slow background import to finish")
+	}
+}
+
+func TestImportRemoteVideoWithProgressPublishesDownloadPercent(t *testing.T) {
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	videoBytes := bytes.Repeat([]byte("x"), 128*1024)
+	media := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/progress.mp4" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Content-Length", strconv.Itoa(len(videoBytes)))
+		_, _ = w.Write(videoBytes)
+	}))
+	defer media.Close()
+
+	videoURL, err := parseRemoteImportURL("videoUrl", media.URL+"/progress.mp4", true)
+	if err != nil {
+		t.Fatalf("parse video URL: %v", err)
+	}
+	pageURL, err := parseRemoteImportURL("pageUrl", "https://www.xvideos.com/video123456/progress", true)
+	if err != nil {
+		t.Fatalf("parse page URL: %v", err)
+	}
+	server := &Server{
+		Catalog:  cat,
+		LocalDir: t.TempDir(),
+	}
+	sessionID := "import-progress-percent"
+	ch := server.ensureProgressHub().Subscribe(sessionID)
+	defer server.ensureProgressHub().Unsubscribe(sessionID, ch)
+
+	done := make(chan struct{})
+	go func() {
+		server.importRemoteVideoWithProgress(context.Background(), remoteImportJob{
+			Site:     remoteImportSites["xvideos"],
+			VideoURL: videoURL,
+			PageURL:  pageURL,
+			Referer:  pageURL.String(),
+			UploadID: "upload-progress-percent",
+			VideoID:  localUploadDriveID + "-upload-progress-percent",
+			Title:    "Progress Percent",
+			Now:      time.Now(),
+		}, sessionID, 0)
+		close(done)
+	}()
+
+	sawIntermediateDownloadPercent := false
+	for {
+		select {
+		case event := <-ch:
+			if event.Status == "downloading" && event.Progress > 10 && event.Progress < 80 {
+				sawIntermediateDownloadPercent = true
+			}
+			if event.Status == "error" {
+				t.Fatalf("unexpected import error: %#v", event)
+			}
+			if event.Status == "completed" {
+				if !sawIntermediateDownloadPercent {
+					t.Fatal("expected at least one downloading progress event between 10% and 80%")
+				}
+				<-done
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for import progress events")
+		}
+	}
+}
+
+func TestProgressHubReplaysLatestEventsToLateSubscribers(t *testing.T) {
+	hub := NewProgressHub()
+	hub.Publish(ImportProgressEvent{
+		SessionID: "late-session",
+		Index:     0,
+		VideoID:   "video-1",
+		Status:    "completed",
+		Progress:  100,
+		Message:   "导入成功",
+	})
+
+	ch := hub.Subscribe("late-session")
+	defer hub.Unsubscribe("late-session", ch)
+
+	select {
+	case event := <-ch:
+		if event.Status != "completed" || event.Progress != 100 || event.VideoID != "video-1" {
+			t.Fatalf("replayed event = %#v, want latest completed progress", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late subscriber did not receive latest progress event")
+	}
+}
+
+func TestHandleImportRemoteVideoRejectsUnsupportedSite(t *testing.T) {
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	server := &Server{Catalog: cat, LocalDir: t.TempDir()}
+	payload := []byte(`{"sourceSite":"unknown","pageUrl":"https://example.com/v","videoUrl":"https://cdn.example/v.mp4","title":"Clip"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/import/remote", bytes.NewReader(payload))
+	rr := httptest.NewRecorder()
+
+	server.handleImportRemoteVideo(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "unsupported source site") {
+		t.Fatalf("body = %s, want unsupported source site error", rr.Body.String())
+	}
+}
+
 func TestHandleUploadedVideoServesLocalUploadFile(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")

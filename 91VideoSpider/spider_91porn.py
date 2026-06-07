@@ -27,12 +27,15 @@ CLI 参数:
     --seen-viewkeys-file FILE 每行一个已知 viewkey 或 mp4 源 ID，命中即跳过；与 --target-new 配合使用
     --output FILE             输出 JSON 路径，覆盖默认的 OUTPUT_FILE
     --no-resume               禁用断点续爬（单页/target-new 模式下自动禁用）
+    --proxy URL               显式 HTTP/HTTPS 代理；也可用 SPIDER_91_PROXY/SPIDER_PROXY
+    --cookie COOKIE           附加 Cookie 请求头
+    --detail-workers N        并发抓详情页的 worker 数，默认 1，最大 8
     --quiet                   压缩日志，每条视频只输出一行
     -h / --help               帮助
 
 配置说明 (编辑脚本内 "配置区域"):
     - MIN_PAGE_DELAY / MAX_PAGE_DELAY : 列表页请求间隔 (默认 3-6 秒)
-    - MIN_DETAIL_DELAY / MAX_DETAIL_DELAY : 详情页请求间隔 (默认 2-5 秒)
+    - MIN_DETAIL_DELAY / MAX_DETAIL_DELAY : 详情页请求间隔 (默认 0.2-0.8 秒)
     - MAX_PAGES : 限制最大爬取页数 (None=不限, 如 5=只爬前5页)
     - OUTPUT_FILE : 输出文件名
 
@@ -71,6 +74,7 @@ import os
 import socket
 import sys
 import html
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, unquote, urlparse
 from datetime import datetime
 
@@ -136,12 +140,14 @@ HEADERS = {
 # 延时配置 (秒) - 控制爬取频率，避免被封
 MIN_PAGE_DELAY = 3.0      # 列表页之间最小延时
 MAX_PAGE_DELAY = 6.0      # 列表页之间最大延时
-MIN_DETAIL_DELAY = 2.0    # 详情页之间最小延时
-MAX_DETAIL_DELAY = 5.0    # 详情页之间最大延时
+MIN_DETAIL_DELAY = 0.2    # 详情页之间最小延时
+MAX_DETAIL_DELAY = 0.8    # 详情页之间最大延时
 
 # 重试配置
 MAX_RETRIES = 3
 RETRY_DELAY = 5.0
+DEFAULT_DETAIL_WORKERS = 1
+MAX_DETAIL_WORKERS = 8
 
 # 输出配置
 OUTPUT_FILE = "91porn_videos.json"
@@ -149,6 +155,39 @@ MAX_PAGES = None          # 设置为 None 爬取所有页，或设置整数如 
 RESUME = True             # 是否跳过输出文件中已存在的 viewkey (断点续爬)
 MAX_EMPTY_PAGES = 2       # 连续空页数达到此值时停止爬取
 # ===================================================
+
+
+def clamp_positive_int(value, default: int, max_value: int = None) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = int(default)
+    if parsed <= 0:
+        parsed = 1
+    if max_value is not None:
+        parsed = min(parsed, int(max_value))
+    return parsed
+
+
+def default_proxy_from_env() -> str:
+    for name in ("SPIDER_91_PROXY", "SPIDER_PROXY"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def safe_print(message: str, file=None, flush: bool = False):
+    target = file or sys.stdout
+    try:
+        print(message, file=target, flush=flush)
+    except UnicodeEncodeError:
+        encoding = getattr(target, "encoding", None) or "utf-8"
+        try:
+            safe_message = str(message).encode(encoding, errors="replace").decode(encoding, errors="replace")
+        except LookupError:
+            safe_message = str(message).encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+        print(safe_message, file=target, flush=flush)
 
 
 class Porn91Spider:
@@ -163,6 +202,9 @@ class Porn91Spider:
         target_new: int = None,
         seen_viewkeys: list = None,
         stream_output: bool = False,
+        cookie: str = "",
+        proxy: str = "",
+        detail_workers: int = None,
     ):
         """
         构造函数。所有参数都有默认值，等同于使用脚本顶部的全局配置。
@@ -175,14 +217,16 @@ class Porn91Spider:
             - 所有日志改走 stderr，避免与 stdout JSONL 流混合。
             - --output 仍生效，作为离线归档用（脚本退出时一次性写完整 JSON）。
         """
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS)
-        # 91porn 没有固定 mode cookie 时，详情页首次请求可能返回与列表卡片
-        # 不一致的视频源；固定桌面模式让列表页和详情页解析保持一致。
-        self.session.cookies.set("mode", "d")
-
         # 解析后的实际配置；优先使用构造参数，回退到模块级配置
         self.output_file = output_file if output_file is not None else OUTPUT_FILE
+        self.cookie_header = (cookie or os.environ.get("SPIDER_91_COOKIE", "") or os.environ.get("SPIDER_COOKIE", "")).strip()
+        self.proxy = (proxy or default_proxy_from_env()).strip()
+        self.detail_workers = clamp_positive_int(
+            detail_workers if detail_workers is not None else os.environ.get("SPIDER_91_DETAIL_WORKERS", os.environ.get("SPIDER_DETAIL_WORKERS", DEFAULT_DETAIL_WORKERS)),
+            DEFAULT_DETAIL_WORKERS,
+            MAX_DETAIL_WORKERS,
+        )
+        self.session = self._make_session()
         self.start_page = max(1, int(start_page or 1))
         # max_pages=None 表示不限制；max_pages=N 表示从 start_page 起爬 N 页
         self.max_pages = max_pages if max_pages is None or max_pages > 0 else None
@@ -198,21 +242,6 @@ class Porn91Spider:
         # （配合 backend Go 端 bufio.Scanner 实时消费，下载一个就开始下一个）。
         # 开启后所有 log 都走 stderr。
         self.stream_output = bool(stream_output)
-
-        # 添加重试适配器
-        try:
-            from requests.adapters import HTTPAdapter
-            from urllib3.util.retry import Retry
-            retry_strategy = Retry(
-                total=MAX_RETRIES,
-                backoff_factor=1,
-                status_forcelist=[429, 500, 502, 503, 504],
-            )
-            adapter = HTTPAdapter(max_retries=retry_strategy)
-            self.session.mount("https://", adapter)
-            self.session.mount("http://", adapter)
-        except ImportError:
-            pass  # urllib3 版本可能较低
 
         self.results = []
         self.pages_crawled = 0
@@ -248,14 +277,50 @@ class Porn91Spider:
             except Exception:
                 pass
 
+    def _make_session(self, retry_total: int = None):
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        # 91porn 没有固定 mode cookie 时，详情页首次请求可能返回与列表卡片
+        # 不一致的视频源；固定桌面模式让列表页和详情页解析保持一致。
+        session.cookies.set("mode", "d")
+        if self.cookie_header:
+            session.headers.update({"Cookie": self.cookie_header})
+        if self.proxy:
+            session.proxies.update({"http": self.proxy, "https": self.proxy})
+
+        # 添加重试适配器
+        try:
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+            retries = MAX_RETRIES if retry_total is None else max(0, int(retry_total))
+            retry_strategy = Retry(
+                total=retries,
+                connect=retries,
+                read=retries,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=frozenset(["GET", "HEAD"]),
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(
+                max_retries=retry_strategy,
+                pool_connections=max(10, self.detail_workers * 2),
+                pool_maxsize=max(10, self.detail_workers * 2),
+            )
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+        except Exception:
+            pass  # urllib3 版本可能较低
+        return session
+
     def log(self, message: str):
         """带时间戳的日志输出。stream_output 模式下走 stderr，避免污染 stdout JSONL。"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{timestamp}] {message}"
         if self.stream_output:
-            print(line, file=sys.stderr, flush=True)
+            safe_print(line, file=sys.stderr, flush=True)
         else:
-            print(line)
+            safe_print(line)
 
     def emit_stream_video(self, video: dict):
         """stream_output 模式下把单条 video entry 作为一行 JSON 写到 stdout 并立即刷盘。
@@ -276,23 +341,25 @@ class Porn91Spider:
             self.log(f"  随机延时 {delay:.2f} 秒...")
         time.sleep(delay)
 
-    def fetch_page(self, url: str, description: str = "", referer: str = "") -> str:
+    def fetch_page(self, url: str, description: str = "", referer: str = "", session=None, max_retries: int = None, timeout=30) -> str:
         """
         获取页面HTML内容，带错误处理和重试
         """
         headers_extra = {}
         if referer:
             headers_extra["Referer"] = referer
+        client = session or self.session
 
-        for attempt in range(1, MAX_RETRIES + 1):
+        attempts = MAX_RETRIES if max_retries is None else max(1, int(max_retries))
+        for attempt in range(1, attempts + 1):
             try:
-                self.log(f"正在请求: {description or url} (尝试 {attempt}/{MAX_RETRIES})")
-                response = self.session.get(url, timeout=30, headers=headers_extra)
+                self.log(f"正在请求: {description or url} (尝试 {attempt}/{attempts})")
+                response = client.get(url, timeout=timeout, headers=headers_extra)
 
                 # 检查是否被Cloudflare拦截 (需在 raise_for_status 之前)
                 if response.status_code == 403:
                     self.log("警告: 收到 403 Forbidden，可能被拦截")
-                    if attempt < MAX_RETRIES:
+                    if attempt < attempts:
                         self.random_sleep(RETRY_DELAY, RETRY_DELAY + 3)
                         continue
                     return ""
@@ -313,7 +380,7 @@ class Porn91Spider:
                 )
                 if is_cf_challenge:
                     self.log("警告: 页面被Cloudflare挑战拦截，需要浏览器环境或正确cookie")
-                    if attempt < MAX_RETRIES:
+                    if attempt < attempts:
                         self.random_sleep(RETRY_DELAY, RETRY_DELAY + 5)
                         continue
                     return ""
@@ -321,13 +388,13 @@ class Porn91Spider:
                 return html_content
             except requests.exceptions.HTTPError as e:
                 self.log(f"HTTP错误: {e}")
-                if attempt < MAX_RETRIES:
+                if attempt < attempts:
                     self.random_sleep(RETRY_DELAY, RETRY_DELAY + 3)
                 else:
                     return ""
             except requests.exceptions.RequestException as e:
                 self.log(f"请求失败: {e}")
-                if attempt < MAX_RETRIES:
+                if attempt < attempts:
                     self.random_sleep(RETRY_DELAY, RETRY_DELAY + 3)
                 else:
                     self.log(f"达到最大重试次数，放弃: {url}")
@@ -596,8 +663,12 @@ class Porn91Spider:
 
     def _process_video_list(self, videos: list, referer: str = ""):
         """
-        处理一批视频列表，逐个获取详情页
+        处理一批视频列表，逐个或并发获取详情页。
         """
+        if self.detail_workers > 1 and len(videos) > 1:
+            self._process_video_list_with_workers(videos, referer=referer)
+            return
+
         for idx, video in enumerate(videos, 1):
             # target_new 模式下，凑够后立即停止，不再请求详情页
             if self.target_new is not None and self.processed_videos >= self.target_new:
@@ -610,63 +681,127 @@ class Porn91Spider:
 
             self.log(f"  处理视频 {idx}/{len(videos)}: {video['title'][:40]}...")
 
-            # 延时控制 (同一批次内第一个视频不延时)
+            # 延时控制 (同一批次内第一个视频不延时)。并发模式不逐条 sleep。
             if idx > 1:
                 self.random_sleep(MIN_DETAIL_DELAY, MAX_DETAIL_DELAY)
 
             # 获取详情页
             detail_html = self.fetch_page(video['detail_url'], f"详情页 viewkey={video['viewkey']}", referer=referer)
-
             if not detail_html:
-                self.log(f"  [FAIL] 详情页获取失败: {video['viewkey']}")
-                video["video_url"] = ""
-                self.results.append(video)
-                self.skip_viewkeys.add(video['viewkey'])
-                self.failed_videos += 1
+                self._handle_detail_info(video, {}, "detail_fetch_failed")
                 continue
 
             # 解析视频直链
             detail_info = self.parse_detail_page(detail_html)
+            self._handle_detail_info(video, detail_info, "")
 
-            if detail_info.get("video_url"):
-                video["video_url"] = detail_info["video_url"]
-                if detail_info.get("title"):
-                    video["title"] = detail_info["title"]
-                list_source_id = video.get("source_id", "")
-                detail_source_id = detail_info.get("source_id", "")
-                if list_source_id and detail_source_id and list_source_id != detail_source_id:
-                    self.log(
-                        f"  [FAIL] 详情页视频源不匹配: list_source_id={list_source_id} "
-                        f"detail_source_id={detail_source_id} viewkey={video['viewkey']}"
-                    )
-                    self.failed_videos += 1
-                    self.skip_viewkeys.add(video['viewkey'])
-                    continue
-                if not list_source_id and detail_source_id:
-                    video["source_id"] = detail_source_id
-                if video.get("source_id"):
-                    video["thumb_url"] = self._thumb_url_for_source(
-                        video.get("thumb_url", ""),
-                        video["source_id"],
-                    )
-                    if video["source_id"] in self.skip_viewkeys:
-                        self.log(f"  [SKIP] 已处理过 source_id: {video['source_id']}")
-                        self.skipped_videos += 1
-                        continue
-                self.results.append(video)
-                self.skip_viewkeys.add(video['viewkey'])
-                if video.get("source_id"):
-                    self.skip_viewkeys.add(video["source_id"])
-                self.processed_videos += 1
-                self.log(f"  [OK] 成功提取视频直链")
-                # 流式：立刻把这条 entry 交给 Go 端开始下载，不等本批余下视频
-                self.emit_stream_video(video)
+    def _process_video_list_with_workers(self, videos: list, referer: str = ""):
+        """
+        并发获取详情页，主线程统一更新结果/计数，避免逐条详情页固定等待拖慢 target-new 模式。
+        """
+        eligible = []
+        for idx, video in enumerate(videos, 1):
+            if self.target_new is not None and self.processed_videos >= self.target_new:
+                return
+            if video['viewkey'] in self.skip_viewkeys:
+                self.log(f"  [SKIP] 已处理过: {video['viewkey']}")
+                self.skipped_videos += 1
+                continue
+            self.log(f"  处理视频 {idx}/{len(videos)}: {video['title'][:40]}...")
+            eligible.append((idx, video))
+
+        cursor = 0
+        while cursor < len(eligible):
+            if self.target_new is not None and self.processed_videos >= self.target_new:
+                return
+            if self.target_new is not None:
+                remaining = self.target_new - self.processed_videos
+                if remaining <= 0:
+                    return
+                batch_size = min(self.detail_workers, remaining, len(eligible) - cursor)
             else:
-                self.log(f"  [FAIL] 未找到视频直链: {video['viewkey']}")
-                video["video_url"] = ""
-                self.results.append(video)
-                self.skip_viewkeys.add(video['viewkey'])
+                batch_size = min(self.detail_workers, len(eligible) - cursor)
+            batch = eligible[cursor:cursor + batch_size]
+            cursor += batch_size
+            if not batch:
+                break
+            with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                futures = {
+                    executor.submit(self._fetch_detail_info, video, referer): (idx, video)
+                    for idx, video in batch
+                }
+                for future in as_completed(futures):
+                    if self.target_new is not None and self.processed_videos >= self.target_new:
+                        return
+                    idx, video = futures[future]
+                    try:
+                        detail_info, failure = future.result()
+                    except Exception as e:
+                        detail_info, failure = {}, f"detail_worker_error:{e}"
+                    self._handle_detail_info(video, detail_info, failure)
+
+    def _fetch_detail_info(self, video: dict, referer: str = ""):
+        session = self._make_session(retry_total=1)
+        detail_html = self.fetch_page(
+            video['detail_url'],
+            f"详情页 viewkey={video['viewkey']}",
+            referer=referer,
+            session=session,
+            max_retries=1,
+            timeout=(8, 20),
+        )
+        if not detail_html:
+            return {}, "detail_fetch_failed"
+        return self.parse_detail_page(detail_html), ""
+
+    def _handle_detail_info(self, video: dict, detail_info: dict, failure: str = ""):
+        if failure:
+            self.log(f"  [FAIL] {failure}: {video['viewkey']}")
+            video["video_url"] = ""
+            video["error"] = failure
+            self.results.append(video)
+            self.skip_viewkeys.add(video['viewkey'])
+            self.failed_videos += 1
+            return
+
+        if detail_info.get("video_url"):
+            video["video_url"] = detail_info["video_url"]
+            if detail_info.get("title"):
+                video["title"] = detail_info["title"]
+            list_source_id = video.get("source_id", "")
+            detail_source_id = detail_info.get("source_id", "")
+            if list_source_id and detail_source_id and list_source_id != detail_source_id:
+                self.log(
+                    f"  [FAIL] 详情页视频源不匹配: list_source_id={list_source_id} "
+                    f"detail_source_id={detail_source_id} viewkey={video['viewkey']}"
+                )
                 self.failed_videos += 1
+                self.skip_viewkeys.add(video['viewkey'])
+                return
+            if not list_source_id and detail_source_id:
+                video["source_id"] = detail_source_id
+            if video.get("source_id"):
+                video["thumb_url"] = self._thumb_url_for_source(
+                    video.get("thumb_url", ""),
+                    video["source_id"],
+                )
+                if video["source_id"] in self.skip_viewkeys:
+                    self.log(f"  [SKIP] 已处理过 source_id: {video['source_id']}")
+                    self.skipped_videos += 1
+                    return
+            self.results.append(video)
+            self.skip_viewkeys.add(video['viewkey'])
+            if video.get("source_id"):
+                self.skip_viewkeys.add(video["source_id"])
+            self.processed_videos += 1
+            self.log("  [OK] 成功提取视频直链")
+            self.emit_stream_video(video)
+        else:
+            self.log(f"  [FAIL] 未找到视频直链: {video['viewkey']}")
+            video["video_url"] = ""
+            self.results.append(video)
+            self.skip_viewkeys.add(video['viewkey'])
+            self.failed_videos += 1
 
     def _save_results(self):
         """
@@ -736,7 +871,8 @@ def print_help():
 
 配置说明 (编辑脚本内 "配置区域"):
     MIN_PAGE_DELAY / MAX_PAGE_DELAY : 列表页请求间隔 (默认 3-6 秒)
-    MIN_DETAIL_DELAY / MAX_DETAIL_DELAY : 详情页请求间隔 (默认 2-5 秒)
+    MIN_DETAIL_DELAY / MAX_DETAIL_DELAY : 详情页请求间隔 (默认 0.2-0.8 秒)
+    --detail-workers / SPIDER_DETAIL_WORKERS : 并发抓详情页，默认 1
     MAX_PAGES : 限制最大爬取页数 (None=不限, 如 5=只爬前5页)
     OUTPUT_FILE : 输出文件名 (默认 91porn_videos.json)
 
@@ -778,6 +914,12 @@ def main():
     parser.add_argument("--stream-output", action="store_true",
                         help="流式模式：每解析一条视频直链就立即把它作为一行 JSON 写到 stdout 并 flush；"
                              "日志改走 stderr。配合 backend 边读边下载使用。")
+    parser.add_argument("--proxy", type=str, default="",
+                        help="显式 HTTP/HTTPS 代理；也可用 SPIDER_91_PROXY/SPIDER_PROXY")
+    parser.add_argument("--cookie", type=str, default="",
+                        help="附加 Cookie 请求头")
+    parser.add_argument("--detail-workers", type=int, default=None,
+                        help="并发抓详情页的 worker 数，默认 1，最大 8")
 
     args, _ = parser.parse_known_args()
     cli_out = sys.stderr if args.stream_output else sys.stdout
@@ -816,6 +958,9 @@ def main():
             target_new=args.target_new,
             seen_viewkeys=seen_viewkeys,
             stream_output=args.stream_output,
+            cookie=args.cookie,
+            proxy=args.proxy,
+            detail_workers=args.detail_workers,
         )
     elif args.page is not None:
         # 单页模式（保留作手动调试用）：start_page=N, max_pages=1
@@ -829,6 +974,9 @@ def main():
             quiet=args.quiet,
             seen_viewkeys=seen_viewkeys,
             stream_output=args.stream_output,
+            cookie=args.cookie,
+            proxy=args.proxy,
+            detail_workers=args.detail_workers,
         )
     else:
         # 全量模式（向后兼容）：从 page 1 起爬到末尾
@@ -838,6 +986,9 @@ def main():
             quiet=args.quiet,
             seen_viewkeys=seen_viewkeys,
             stream_output=args.stream_output,
+            cookie=args.cookie,
+            proxy=args.proxy,
+            detail_workers=args.detail_workers,
         )
 
     try:

@@ -330,6 +330,53 @@ func TestHandleStopDriveTasksInvokesHookWithDriveID(t *testing.T) {
 	}
 }
 
+func TestHandleDriveCrawlStatusReturnsHookResult(t *testing.T) {
+	server := &AdminServer{
+		GetDriveCrawlStatus: func(driveID string) CrawlStatus {
+			if driveID != "xv-main" {
+				t.Fatalf("driveID = %q, want xv-main", driveID)
+			}
+			return CrawlStatus{
+				DriveID:      driveID,
+				Kind:         "spiderxvideos",
+				State:        "running",
+				Message:      "crawling",
+				TargetNew:    12,
+				TotalEntries: 9,
+				NewVideos:    3,
+				Skipped:      4,
+				Failed:       2,
+				SeenSnapshot: 30,
+				OutputJSON:   "D:/data/spiderxvideos/xv-main/.crawl/target-12.json",
+				SeenFile:     "D:/data/spiderxvideos/xv-main/.crawl/seen.txt",
+				StartedAt:    "2026-06-06T01:02:03Z",
+				Logs:         []string{"start", "downloaded 3 new videos"},
+			}
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/drives/xv-main/crawl/status", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "xv-main")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+	server.handleDriveCrawlStatus(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got CrawlStatus
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.State != "running" || got.Kind != "spiderxvideos" || got.TargetNew != 12 || got.NewVideos != 3 {
+		t.Fatalf("status = %#v, want running xvideos crawl result", got)
+	}
+	if len(got.Logs) != 2 || got.Logs[0] != "start" {
+		t.Fatalf("logs = %#v, want recent crawl logs", got.Logs)
+	}
+}
+
 func TestHandleStopAllTasksInvokesHookAndReturnsStatus(t *testing.T) {
 	called := false
 	server := &AdminServer{
@@ -614,6 +661,161 @@ func TestHandleUpsertSpider91RejectsUnsupportedProxyScheme(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "socks5:// 或 socks5h://") {
 		t.Fatalf("body = %q, want supported schemes message", rr.Body.String())
+	}
+}
+
+func TestHandleListDrivesIncludesSpiderXVideosConfig(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:     "xv-main",
+		Kind:   "spiderxvideos",
+		Name:   "XVideos",
+		RootID: "/",
+		Credentials: map[string]string{
+			"start_url":     "https://www.xvideos.com/?k=test",
+			"keyword":       "test",
+			"quality":       "hd",
+			"min_duration":  "5m",
+			"max_duration":  "30m",
+			"min_size":      "50MB",
+			"max_size":      "2GB",
+			"merge_hls":     "true",
+			"proxy":         "http://127.0.0.1:7890",
+			"cookie":        "session=abc",
+			"script_path":   "D:/tools/spider_xvideos.py",
+			"last_crawl_at": "1800000000",
+		},
+		Status: "ok",
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/drives", nil)
+	rr := httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleListDrives(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got []struct {
+		ID                  string            `json:"id"`
+		Kind                string            `json:"kind"`
+		LastCrawlAt         int64             `json:"lastCrawlAt"`
+		SpiderCrawlerConfig map[string]string `json:"spiderCrawlerConfig"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "xv-main" || got[0].Kind != "spiderxvideos" {
+		t.Fatalf("drives = %#v, want one xvideos drive", got)
+	}
+	cfg := got[0].SpiderCrawlerConfig
+	for key, want := range map[string]string{
+		"start_url":    "https://www.xvideos.com/?k=test",
+		"keyword":      "test",
+		"quality":      "hd",
+		"min_duration": "5m",
+		"max_duration": "30m",
+		"min_size":     "50MB",
+		"max_size":     "2GB",
+		"merge_hls":    "true",
+		"proxy":        "http://127.0.0.1:7890",
+		"cookie":       "session=abc",
+		"script_path":  "D:/tools/spider_xvideos.py",
+	} {
+		if cfg[key] != want {
+			t.Fatalf("spiderCrawlerConfig[%s] = %q, want %q; full=%#v", key, cfg[key], want, cfg)
+		}
+	}
+	if _, ok := cfg["last_crawl_at"]; ok {
+		t.Fatalf("spiderCrawlerConfig should not expose runtime last_crawl_at: %#v", cfg)
+	}
+	if got[0].LastCrawlAt != 1800000000 {
+		t.Fatalf("lastCrawlAt = %d, want 1800000000", got[0].LastCrawlAt)
+	}
+}
+
+func TestHandleUpsertSpiderXVideosPreservesRuntimeCredentialsAndClearsEmptyFields(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:     "xv-main",
+		Kind:   "spiderxvideos",
+		Name:   "XVideos",
+		RootID: "/",
+		Credentials: map[string]string{
+			"last_crawl_at": "1800000000",
+			"start_url":     "https://old.example/list",
+			"keyword":       "old",
+			"quality":       "best",
+			"proxy":         "http://old-proxy.local:7890",
+			"script_path":   "D:/old/spider_xvideos.py",
+		},
+		Status: "ok",
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives", strings.NewReader(`{
+		"id": "xv-main",
+		"kind": "spiderxvideos",
+		"name": "XVideos",
+		"rootId": "/",
+		"credentials": {
+			"start_url": " https://www.xvideos.com/?k=new ",
+			"keyword": "",
+			"quality": "hd",
+			"merge_hls": "true",
+			"proxy": " socks5h://127.0.0.1:7891 ",
+			"script_path": "D:/new/spider_xvideos.py"
+		}
+	}`))
+	rr := httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleUpsertDrive(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err := cat.GetDrive(ctx, "xv-main")
+	if err != nil {
+		t.Fatalf("get drive: %v", err)
+	}
+	if got.Credentials["last_crawl_at"] != "1800000000" {
+		t.Fatalf("last_crawl_at = %q, want preserved", got.Credentials["last_crawl_at"])
+	}
+	if got.Credentials["start_url"] != "https://www.xvideos.com/?k=new" {
+		t.Fatalf("start_url = %q, want trimmed new url", got.Credentials["start_url"])
+	}
+	if _, ok := got.Credentials["keyword"]; ok {
+		t.Fatalf("empty keyword should be removed, got %q", got.Credentials["keyword"])
+	}
+	if got.Credentials["quality"] != "hd" || got.Credentials["merge_hls"] != "true" {
+		t.Fatalf("quality/merge_hls = %q/%q, want hd/true", got.Credentials["quality"], got.Credentials["merge_hls"])
+	}
+	if got.Credentials["proxy"] != "socks5h://127.0.0.1:7891" {
+		t.Fatalf("proxy = %q, want trimmed socks5h proxy", got.Credentials["proxy"])
+	}
+	if got.Credentials["script_path"] != "D:/new/spider_xvideos.py" {
+		t.Fatalf("script_path = %q, want new script path", got.Credentials["script_path"])
 	}
 }
 

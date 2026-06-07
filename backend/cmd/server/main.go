@@ -223,6 +223,9 @@ func main() {
 		GetDriveGenerationStatuses: func() map[string]api.DriveGenerationStatuses {
 			return app.driveGenerationStatuses()
 		},
+		GetDriveCrawlStatus: func(driveID string) api.CrawlStatus {
+			return app.driveCrawlStatus(driveID)
+		},
 		OnTeaserEnabledChanged: func(driveID string, enabled bool) {
 			// 从关到开时立刻补扫该盘 pending 预览视频，行为对齐旧的"全局开关从关到开"。
 			// 关闭分支不需要做事 —— 入队前会重新查 catalog，新的 enqueue 自然停。
@@ -371,6 +374,9 @@ type App struct {
 	// reconcile 和扫盘结束同时为同一批 pending 视频启动多个长时间入队 goroutine。
 	fingerprintQueueMu  sync.Mutex
 	fingerprintQueueing map[string]bool
+
+	crawlStatusMu sync.Mutex
+	crawlStatuses map[string]api.CrawlStatus
 }
 
 // teaserEnabledForDrive 查询某个 drive 当前的 per-drive 预览视频开关。
@@ -556,6 +562,92 @@ func (a *App) driveGenerationStatuses() map[string]api.DriveGenerationStatuses {
 		out[id] = status
 	}
 	return out
+}
+
+func (a *App) driveCrawlStatus(driveID string) api.CrawlStatus {
+	a.crawlStatusMu.Lock()
+	defer a.crawlStatusMu.Unlock()
+	status := a.crawlStatuses[driveID]
+	if status.DriveID == "" {
+		status.DriveID = driveID
+		status.State = "idle"
+	}
+	status.Logs = append([]string{}, status.Logs...)
+	return status
+}
+
+func (a *App) updateDriveCrawlStatus(driveID string, mutate func(*api.CrawlStatus)) {
+	if driveID == "" || mutate == nil {
+		return
+	}
+	a.crawlStatusMu.Lock()
+	defer a.crawlStatusMu.Unlock()
+	if a.crawlStatuses == nil {
+		a.crawlStatuses = make(map[string]api.CrawlStatus)
+	}
+	status := a.crawlStatuses[driveID]
+	status.DriveID = driveID
+	mutate(&status)
+	if status.State == "" {
+		status.State = "idle"
+	}
+	if len(status.Logs) > 50 {
+		status.Logs = append([]string{}, status.Logs[len(status.Logs)-50:]...)
+	}
+	a.crawlStatuses[driveID] = status
+}
+
+func (a *App) appendDriveCrawlLog(driveID, message string) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return
+	}
+	a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+		status.Logs = append(status.Logs, time.Now().Format("15:04:05")+" "+message)
+		status.Message = message
+	})
+}
+
+func (a *App) updateSpider91CrawlProgress(driveID string, res spider91.CrawlResult) {
+	a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+		status.Kind = spider91.Kind
+		updateCrawlStatusFromResult(status, res.TargetNew, res.TotalEntries, res.NewVideos, res.Skipped, res.Failed, res.SeenSnapshot, res.OutputJSON, res.SeenFile, res.StartedAt, res.FinishedAt)
+	})
+}
+
+func (a *App) updateSpiderXVideosCrawlProgress(driveID string, res spiderxvideos.CrawlResult) {
+	a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+		status.Kind = spiderxvideos.Kind
+		updateCrawlStatusFromResult(status, res.TargetNew, res.TotalEntries, res.NewVideos, res.Skipped, res.Failed, res.SeenSnapshot, res.OutputJSON, res.SeenFile, res.StartedAt, res.FinishedAt)
+	})
+}
+
+func updateCrawlStatusFromResult(status *api.CrawlStatus, targetNew, totalEntries, newVideos, skipped, failed, seenSnapshot int, outputJSON, seenFile string, startedAt, finishedAt time.Time) {
+	if status.State == "" || status.State == "idle" {
+		status.State = "running"
+	}
+	status.TargetNew = targetNew
+	status.TotalEntries = totalEntries
+	status.NewVideos = newVideos
+	status.Skipped = skipped
+	status.Failed = failed
+	status.SeenSnapshot = seenSnapshot
+	status.OutputJSON = outputJSON
+	status.SeenFile = seenFile
+	if !startedAt.IsZero() {
+		status.StartedAt = formatCrawlTime(startedAt)
+	}
+	if !finishedAt.IsZero() {
+		status.FinishedAt = formatCrawlTime(finishedAt)
+	}
+	status.Message = fmt.Sprintf("crawl progress total=%d new=%d skipped=%d failed=%d", totalEntries, newVideos, skipped, failed)
+}
+
+func formatCrawlTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 func generationStatusFromPreview(status preview.TaskStatus) api.GenerationStatus {
@@ -931,6 +1023,12 @@ func (a *App) attachSpider91Crawler(d *catalog.Drive, drv *spider91.Driver) {
 		WorkDir:        filepath.Dir(scriptPath),
 		CommonThumbDir: a.commonThumbsDir(),
 		ProxyURL:       proxyURL,
+		OnLog: func(line string) {
+			a.appendDriveCrawlLog(driveID, line)
+		},
+		OnProgress: func(res spider91.CrawlResult) {
+			a.updateSpider91CrawlProgress(driveID, res)
+		},
 		// 新流程：预览视频不在每条视频入库时立即入队，而是 RunOnce 全部下完后由
 		// runSpider91Crawl 统一调 enqueueDriveGeneration 一次性入队。这样：
 		//   - 下载阶段不和 ffmpeg 抢 CPU/IO
@@ -1002,6 +1100,12 @@ func (a *App) attachSpiderXVideosCrawler(d *catalog.Drive, drv *spiderxvideos.Dr
 		MergeHLS:       mergeHLS,
 		FFmpegPath:     a.cfg.Preview.FFmpegPath,
 		Cookie:         cookie,
+		OnLog: func(line string) {
+			a.appendDriveCrawlLog(driveID, line)
+		},
+		OnProgress: func(res spiderxvideos.CrawlResult) {
+			a.updateSpiderXVideosCrawlProgress(driveID, res)
+		},
 	})
 
 	a.mu.Lock()
@@ -2499,6 +2603,14 @@ func (a *App) runSpider91Crawl(ctx context.Context, driveID string) {
 func (a *App) runSpider91CrawlWithTaskContext(ctx context.Context, driveID string) {
 	if err := ctx.Err(); err != nil {
 		log.Printf("[spider91] drive=%s crawl canceled before start: %v", driveID, err)
+		a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+			status.Kind = "spider91"
+			status.State = "canceled"
+			status.Message = "crawl canceled before start"
+			status.LastError = err.Error()
+			status.FinishedAt = formatCrawlTime(time.Now())
+			status.Logs = append(status.Logs, "crawl canceled before start: "+err.Error())
+		})
 		return
 	}
 	a.mu.Lock()
@@ -2507,6 +2619,14 @@ func (a *App) runSpider91CrawlWithTaskContext(ctx context.Context, driveID strin
 	if c == nil {
 		if err := a.ensureDriveAttached(ctx, driveID); err != nil {
 			log.Printf("[spider91] drive=%s attach failed: %v", driveID, err)
+			a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+				status.Kind = "spider91"
+				status.State = "error"
+				status.Message = "crawler attach failed"
+				status.LastError = err.Error()
+				status.FinishedAt = formatCrawlTime(time.Now())
+				status.Logs = append(status.Logs, "attach failed: "+err.Error())
+			})
 			return
 		}
 		a.mu.Lock()
@@ -2514,6 +2634,14 @@ func (a *App) runSpider91CrawlWithTaskContext(ctx context.Context, driveID strin
 		a.mu.Unlock()
 		if c == nil {
 			log.Printf("[spider91] drive=%s crawler not attached", driveID)
+			a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+				status.Kind = "spider91"
+				status.State = "error"
+				status.Message = "crawler not attached"
+				status.LastError = "crawler not attached"
+				status.FinishedAt = formatCrawlTime(time.Now())
+				status.Logs = append(status.Logs, "crawler not attached")
+			})
 			return
 		}
 	}
@@ -2521,6 +2649,19 @@ func (a *App) runSpider91CrawlWithTaskContext(ctx context.Context, driveID strin
 	d, err := a.cat.GetDrive(ctx, driveID)
 	if err != nil || d == nil {
 		log.Printf("[spider91] drive=%s lookup failed: %v", driveID, err)
+		a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+			status.Kind = "spider91"
+			status.State = "error"
+			status.Message = "drive lookup failed"
+			if err != nil {
+				status.LastError = err.Error()
+				status.Logs = append(status.Logs, "lookup failed: "+err.Error())
+			} else {
+				status.LastError = "drive not found"
+				status.Logs = append(status.Logs, "lookup failed: drive not found")
+			}
+			status.FinishedAt = formatCrawlTime(time.Now())
+		})
 		return
 	}
 	targetNew := spider91IntCred(d, "target_new", spider91.DefaultTargetNew)
@@ -2529,12 +2670,62 @@ func (a *App) runSpider91CrawlWithTaskContext(ctx context.Context, driveID strin
 	}
 
 	log.Printf("[spider91] drive=%s start crawl target_new=%d", driveID, targetNew)
+	started := time.Now()
+	a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+		status.Kind = "spider91"
+		status.State = "running"
+		status.Message = "crawl running"
+		status.LastError = ""
+		status.TargetNew = targetNew
+		status.TotalEntries = 0
+		status.NewVideos = 0
+		status.Skipped = 0
+		status.Failed = 0
+		status.SeenSnapshot = 0
+		status.OutputJSON = ""
+		status.SeenFile = ""
+		status.StartedAt = formatCrawlTime(started)
+		status.FinishedAt = ""
+		status.Logs = append(status.Logs, fmt.Sprintf("start crawl target_new=%d", targetNew))
+	})
 	res, runErr := c.RunOnce(ctx, targetNew)
 	if runErr != nil {
 		log.Printf("[spider91] drive=%s crawl failed: %v", driveID, runErr)
+		a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+			status.State = "error"
+			status.Message = "crawl failed"
+			status.LastError = runErr.Error()
+			status.FinishedAt = formatCrawlTime(time.Now())
+			if res != nil {
+				status.TargetNew = res.TargetNew
+				status.TotalEntries = res.TotalEntries
+				status.NewVideos = res.NewVideos
+				status.Skipped = res.Skipped
+				status.Failed = res.Failed
+				status.SeenSnapshot = res.SeenSnapshot
+				status.OutputJSON = res.OutputJSON
+				status.SeenFile = res.SeenFile
+			}
+			status.Logs = append(status.Logs, "crawl failed: "+runErr.Error())
+		})
 	} else if res != nil {
 		log.Printf("[spider91] drive=%s crawl done target=%d total=%d new=%d skipped=%d failed=%d seen_snapshot=%d",
 			driveID, res.TargetNew, res.TotalEntries, res.NewVideos, res.Skipped, res.Failed, res.SeenSnapshot)
+		a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+			status.State = "ok"
+			status.Message = "crawl done"
+			status.LastError = ""
+			status.TargetNew = res.TargetNew
+			status.TotalEntries = res.TotalEntries
+			status.NewVideos = res.NewVideos
+			status.Skipped = res.Skipped
+			status.Failed = res.Failed
+			status.SeenSnapshot = res.SeenSnapshot
+			status.OutputJSON = res.OutputJSON
+			status.SeenFile = res.SeenFile
+			status.FinishedAt = formatCrawlTime(res.FinishedAt)
+			status.Logs = append(status.Logs, fmt.Sprintf("crawl done total=%d new=%d skipped=%d failed=%d", res.TotalEntries, res.NewVideos, res.Skipped, res.Failed))
+		})
 	}
 
 	// 标记最后一次爬取时间。这字段已不再用于调度判定（nightly 流水线统一调度），
@@ -2555,6 +2746,13 @@ func (a *App) runSpider91CrawlWithTaskContext(ctx context.Context, driveID strin
 	}
 	if err := ctx.Err(); err != nil {
 		log.Printf("[spider91] drive=%s crawl canceled after run: %v", driveID, err)
+		a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+			status.State = "canceled"
+			status.Message = "crawl canceled"
+			status.LastError = err.Error()
+			status.FinishedAt = formatCrawlTime(time.Now())
+			status.Logs = append(status.Logs, "crawl canceled: "+err.Error())
+		})
 		return
 	}
 
@@ -2577,6 +2775,14 @@ func (a *App) runSpiderXVideosCrawl(ctx context.Context, driveID string) {
 	defer done()
 	if err := taskCtx.Err(); err != nil {
 		log.Printf("[spiderxvideos] drive=%s crawl canceled before start: %v", driveID, err)
+		a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+			status.Kind = "spiderxvideos"
+			status.State = "canceled"
+			status.Message = "crawl canceled before start"
+			status.LastError = err.Error()
+			status.FinishedAt = formatCrawlTime(time.Now())
+			status.Logs = append(status.Logs, "crawl canceled before start: "+err.Error())
+		})
 		return
 	}
 	a.mu.Lock()
@@ -2585,6 +2791,14 @@ func (a *App) runSpiderXVideosCrawl(ctx context.Context, driveID string) {
 	if c == nil {
 		if err := a.ensureDriveAttached(taskCtx, driveID); err != nil {
 			log.Printf("[spiderxvideos] drive=%s attach failed: %v", driveID, err)
+			a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+				status.Kind = "spiderxvideos"
+				status.State = "error"
+				status.Message = "crawler attach failed"
+				status.LastError = err.Error()
+				status.FinishedAt = formatCrawlTime(time.Now())
+				status.Logs = append(status.Logs, "attach failed: "+err.Error())
+			})
 			return
 		}
 		a.mu.Lock()
@@ -2592,6 +2806,14 @@ func (a *App) runSpiderXVideosCrawl(ctx context.Context, driveID string) {
 		a.mu.Unlock()
 		if c == nil {
 			log.Printf("[spiderxvideos] drive=%s crawler not attached", driveID)
+			a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+				status.Kind = "spiderxvideos"
+				status.State = "error"
+				status.Message = "crawler not attached"
+				status.LastError = "crawler not attached"
+				status.FinishedAt = formatCrawlTime(time.Now())
+				status.Logs = append(status.Logs, "crawler not attached")
+			})
 			return
 		}
 	}
@@ -2599,6 +2821,19 @@ func (a *App) runSpiderXVideosCrawl(ctx context.Context, driveID string) {
 	d, err := a.cat.GetDrive(taskCtx, driveID)
 	if err != nil || d == nil {
 		log.Printf("[spiderxvideos] drive=%s lookup failed: %v", driveID, err)
+		a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+			status.Kind = "spiderxvideos"
+			status.State = "error"
+			status.Message = "drive lookup failed"
+			if err != nil {
+				status.LastError = err.Error()
+				status.Logs = append(status.Logs, "lookup failed: "+err.Error())
+			} else {
+				status.LastError = "drive not found"
+				status.Logs = append(status.Logs, "lookup failed: drive not found")
+			}
+			status.FinishedAt = formatCrawlTime(time.Now())
+		})
 		return
 	}
 	targetNew := spider91IntCred(d, "target_new", spiderxvideos.DefaultTargetNew)
@@ -2607,12 +2842,62 @@ func (a *App) runSpiderXVideosCrawl(ctx context.Context, driveID string) {
 	}
 
 	log.Printf("[spiderxvideos] drive=%s start crawl target_new=%d", driveID, targetNew)
+	started := time.Now()
+	a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+		status.Kind = "spiderxvideos"
+		status.State = "running"
+		status.Message = "crawl running"
+		status.LastError = ""
+		status.TargetNew = targetNew
+		status.TotalEntries = 0
+		status.NewVideos = 0
+		status.Skipped = 0
+		status.Failed = 0
+		status.SeenSnapshot = 0
+		status.OutputJSON = ""
+		status.SeenFile = ""
+		status.StartedAt = formatCrawlTime(started)
+		status.FinishedAt = ""
+		status.Logs = append(status.Logs, fmt.Sprintf("start crawl target_new=%d", targetNew))
+	})
 	res, runErr := c.RunOnce(taskCtx, targetNew)
 	if runErr != nil {
 		log.Printf("[spiderxvideos] drive=%s crawl failed: %v", driveID, runErr)
+		a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+			status.State = "error"
+			status.Message = "crawl failed"
+			status.LastError = runErr.Error()
+			status.FinishedAt = formatCrawlTime(time.Now())
+			if res != nil {
+				status.TargetNew = res.TargetNew
+				status.TotalEntries = res.TotalEntries
+				status.NewVideos = res.NewVideos
+				status.Skipped = res.Skipped
+				status.Failed = res.Failed
+				status.SeenSnapshot = res.SeenSnapshot
+				status.OutputJSON = res.OutputJSON
+				status.SeenFile = res.SeenFile
+			}
+			status.Logs = append(status.Logs, "crawl failed: "+runErr.Error())
+		})
 	} else if res != nil {
 		log.Printf("[spiderxvideos] drive=%s crawl done target=%d total=%d new=%d skipped=%d failed=%d seen_snapshot=%d",
 			driveID, res.TargetNew, res.TotalEntries, res.NewVideos, res.Skipped, res.Failed, res.SeenSnapshot)
+		a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+			status.State = "ok"
+			status.Message = "crawl done"
+			status.LastError = ""
+			status.TargetNew = res.TargetNew
+			status.TotalEntries = res.TotalEntries
+			status.NewVideos = res.NewVideos
+			status.Skipped = res.Skipped
+			status.Failed = res.Failed
+			status.SeenSnapshot = res.SeenSnapshot
+			status.OutputJSON = res.OutputJSON
+			status.SeenFile = res.SeenFile
+			status.FinishedAt = formatCrawlTime(res.FinishedAt)
+			status.Logs = append(status.Logs, fmt.Sprintf("crawl done total=%d new=%d skipped=%d failed=%d", res.TotalEntries, res.NewVideos, res.Skipped, res.Failed))
+		})
 	}
 
 	if d.Credentials == nil {
@@ -2631,6 +2916,13 @@ func (a *App) runSpiderXVideosCrawl(ctx context.Context, driveID string) {
 	}
 	if err := taskCtx.Err(); err != nil {
 		log.Printf("[spiderxvideos] drive=%s crawl canceled after run: %v", driveID, err)
+		a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+			status.State = "canceled"
+			status.Message = "crawl canceled"
+			status.LastError = err.Error()
+			status.FinishedAt = formatCrawlTime(time.Now())
+			status.Logs = append(status.Logs, "crawl canceled: "+err.Error())
+		})
 		return
 	}
 

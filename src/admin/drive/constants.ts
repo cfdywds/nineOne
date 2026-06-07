@@ -343,6 +343,12 @@ export function credentialFields(kind: Kind): Array<{
           help: "需要 ffmpeg；默认 false。",
         },
         {
+          key: "target_new",
+          label: "目标新视频数",
+          placeholder: "10",
+          help: "每次抓取的目标新视频数；为空时使用后端默认值。",
+        },
+        {
           key: "proxy",
           label: "代理地址（可选）",
           placeholder: "http://127.0.0.1:7890",

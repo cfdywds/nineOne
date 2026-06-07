@@ -3320,6 +3320,62 @@
   background: var(--bg-sunken);
 }
 
+.admin-crawl-status-card {
+  margin-top: var(--space-5);
+}
+
+.admin-crawl-state {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.14);
+  color: var(--text-muted);
+  font-size: var(--font-xs);
+  font-weight: var(--weight-bold);
+}
+
+.admin-crawl-state.is-running {
+  background: rgba(37, 99, 235, 0.14);
+  color: #2563eb;
+}
+
+.admin-crawl-state.is-ok {
+  background: rgba(22, 163, 74, 0.14);
+  color: #15803d;
+}
+
+.admin-crawl-state.is-error {
+  background: rgba(220, 38, 38, 0.14);
+  color: #b91c1c;
+}
+
+.admin-crawl-state.is-canceled {
+  background: rgba(100, 116, 139, 0.18);
+  color: #475569;
+}
+
+.admin-crawl-logs {
+  margin-top: var(--space-4);
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+  color: var(--text-strong);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: var(--font-xs);
+  line-height: 1.55;
+  max-height: 260px;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  -webkit-overflow-scrolling: touch;
+}
+
+.admin-crawl-log-line + .admin-crawl-log-line {
+  margin-top: 4px;
+}
+
 /* =========================================================
  * Tags Management Layout
  * ========================================================= */

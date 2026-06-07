@@ -80,6 +80,10 @@ type CrawlerConfig struct {
 
 	// OnNewVideo 是新视频成功入库后的回调，用于触发 teaser worker。
 	OnNewVideo func(v *catalog.Video)
+	// OnLog receives stderr lines from the Python spider.
+	OnLog func(line string)
+	// OnProgress receives live crawl counters as RunOnce processes entries.
+	OnProgress func(result CrawlResult)
 }
 
 // Crawler 把 Python 爬虫产出包装成 catalog 入库流程。
@@ -198,6 +202,11 @@ func (c *Crawler) RunOnce(ctx context.Context, targetNew int) (*CrawlResult, err
 
 	result := &CrawlResult{TargetNew: targetNew, StartedAt: time.Now()}
 	defer func() { result.FinishedAt = time.Now() }()
+	emitProgress := func() {
+		if c.cfg.OnProgress != nil {
+			c.cfg.OnProgress(*result)
+		}
+	}
 
 	// 1. 准备 .crawl/ 目录 + 已知源视频 ID 列表
 	//
@@ -217,12 +226,14 @@ func (c *Crawler) RunOnce(ctx context.Context, targetNew int) (*CrawlResult, err
 	seenPath := filepath.Join(crawlDir, fmt.Sprintf("seen-%s.txt", timestamp))
 	result.OutputJSON = outputPath
 	result.SeenFile = seenPath
+	emitProgress()
 
 	seenCount, err := c.writeSeenViewkeys(ctx, seenPath)
 	if err != nil {
 		return result, fmt.Errorf("spider91 crawler: build seen list: %w", err)
 	}
 	result.SeenSnapshot = seenCount
+	emitProgress()
 
 	// 2-3. 启动 Python 爬虫（流式 stdout 协议），并边读边处理。
 	//
@@ -253,9 +264,11 @@ func (c *Crawler) RunOnce(ctx context.Context, targetNew int) (*CrawlResult, err
 			continue
 		}
 		result.TotalEntries++
+		emitProgress()
 		sourceID := sourceIDForItem(item)
 		if sourceID == "" || strings.TrimSpace(item.VideoURL) == "" {
 			result.Failed++
+			emitProgress()
 			continue
 		}
 		if result.NewVideos >= targetNew {
@@ -265,14 +278,17 @@ func (c *Crawler) RunOnce(ctx context.Context, targetNew int) (*CrawlResult, err
 		videoID := buildVideoID(c.cfg.Driver.ID(), sourceID)
 		if existing, _ := c.cfg.Catalog.GetVideo(ctx, videoID); existing != nil {
 			result.Skipped++
+			emitProgress()
 			continue
 		}
 		if perr := c.processOne(ctx, videoID, item); perr != nil {
 			log.Printf("[spider91] drive=%s viewkey=%s source_id=%s failed: %v", c.cfg.Driver.ID(), item.Viewkey, sourceID, perr)
 			result.Failed++
+			emitProgress()
 			continue
 		}
 		result.NewVideos++
+		emitProgress()
 	}
 	if scerr := scanner.Err(); scerr != nil {
 		log.Printf("[spider91] drive=%s stdout scan: %v", c.cfg.Driver.ID(), scerr)
@@ -371,6 +387,7 @@ func (c *Crawler) startSpiderTargetNew(ctx context.Context, targetNew int, seenP
 	if c.cfg.WorkDir != "" {
 		cmd.Dir = c.cfg.WorkDir
 	}
+	cmd.Env = pythonUTF8Env(os.Environ())
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, nil, fmt.Errorf("stdout pipe: %w", err)
@@ -388,12 +405,23 @@ func (c *Crawler) startSpiderTargetNew(ctx context.Context, targetNew int, seenP
 		return nil, nil, fmt.Errorf("start: %w", err)
 	}
 	// stderr 转发到 backend log。子进程退出时 reader 自动 EOF，goroutine 自然结束。
-	go forwardSpiderLog(c.cfg.Driver.ID(), stderr)
+	go forwardSpiderLog(c.cfg.Driver.ID(), stderr, c.cfg.OnLog)
 	return cmd, stdout, nil
 }
 
+func pythonUTF8Env(env []string) []string {
+	out := make([]string, 0, len(env)+2)
+	for _, value := range env {
+		if strings.HasPrefix(value, "PYTHONIOENCODING=") || strings.HasPrefix(value, "PYTHONUTF8=") {
+			continue
+		}
+		out = append(out, value)
+	}
+	return append(out, "PYTHONIOENCODING=utf-8", "PYTHONUTF8=1")
+}
+
 // forwardSpiderLog 把 Python stderr 逐行转发到 backend log，便于调试。
-func forwardSpiderLog(driveID string, r io.Reader) {
+func forwardSpiderLog(driveID string, r io.Reader, onLog func(string)) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -402,6 +430,9 @@ func forwardSpiderLog(driveID string, r io.Reader) {
 			continue
 		}
 		log.Printf("[spider91:py] drive=%s %s", driveID, line)
+		if onLog != nil {
+			onLog(line)
+		}
 	}
 }
 

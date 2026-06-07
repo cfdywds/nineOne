@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/drives"
 	"github.com/video-site/backend/internal/drives/spider91"
+	"github.com/video-site/backend/internal/drives/spiderxvideos"
 	"github.com/video-site/backend/internal/fingerprint"
 	"github.com/video-site/backend/internal/preview"
 	"github.com/video-site/backend/internal/proxy"
@@ -28,6 +30,38 @@ func TestDefaultCrawlerPythonPathMatchesPlatform(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("defaultCrawlerPythonPath() = %q, want %q", got, want)
+	}
+}
+
+func TestDriveCrawlStatusTracksCrawlerProgressAndLogs(t *testing.T) {
+	app := &App{}
+	started := time.Date(2026, 6, 6, 1, 2, 3, 0, time.UTC)
+
+	app.updateSpiderXVideosCrawlProgress("xv-main", spiderxvideos.CrawlResult{
+		TargetNew:    10,
+		TotalEntries: 7,
+		NewVideos:    3,
+		Skipped:      2,
+		Failed:       1,
+		SeenSnapshot: 42,
+		OutputJSON:   "D:/data/spiderxvideos/xv-main/.crawl/target-10.json",
+		SeenFile:     "D:/data/spiderxvideos/xv-main/.crawl/seen.txt",
+		StartedAt:    started,
+	})
+	app.appendDriveCrawlLog("xv-main", "python parsed page 1")
+
+	got := app.driveCrawlStatus("xv-main")
+	if got.DriveID != "xv-main" || got.Kind != spiderxvideos.Kind || got.State != "running" {
+		t.Fatalf("status identity = %#v, want running xvideos status", got)
+	}
+	if got.TargetNew != 10 || got.TotalEntries != 7 || got.NewVideos != 3 || got.Skipped != 2 || got.Failed != 1 || got.SeenSnapshot != 42 {
+		t.Fatalf("status counters = %#v, want live crawler counters", got)
+	}
+	if got.OutputJSON == "" || got.SeenFile == "" || got.StartedAt != started.Format(time.RFC3339) {
+		t.Fatalf("status result paths/time = %#v, want paths and startedAt", got)
+	}
+	if len(got.Logs) != 1 || !strings.Contains(got.Logs[0], "python parsed page 1") {
+		t.Fatalf("logs = %#v, want script log line", got.Logs)
 	}
 }
 

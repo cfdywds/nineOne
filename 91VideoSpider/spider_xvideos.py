@@ -58,6 +58,7 @@ import random
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
@@ -95,6 +96,8 @@ MIN_DETAIL_DELAY = 1.0
 MAX_DETAIL_DELAY = 3.0
 MAX_RETRIES = 3
 RETRY_DELAY = 4.0
+DEFAULT_DETAIL_WORKERS = 4
+MAX_DETAIL_WORKERS = 8
 
 OUTPUT_FILE = "xvideos_videos.json"
 DOWNLOAD_DIR = "xvideos_downloads"
@@ -152,6 +155,39 @@ def detect_ext(raw_url: str, allowed: set, default: str) -> str:
     return ext if ext in allowed else default
 
 
+def clamp_positive_int(value, default: int, max_value: int = None) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = int(default)
+    if parsed <= 0:
+        parsed = 1
+    if max_value is not None:
+        parsed = min(parsed, int(max_value))
+    return parsed
+
+
+def default_proxy_from_env() -> str:
+    for name in ("SPIDER_XVIDEOS_PROXY", "SPIDER_PROXY"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def safe_print(message: str, file=None, flush: bool = False):
+    target = file or sys.stdout
+    try:
+        print(message, file=target, flush=flush)
+    except UnicodeEncodeError:
+        encoding = getattr(target, "encoding", None) or "utf-8"
+        try:
+            safe_message = str(message).encode(encoding, errors="replace").decode(encoding, errors="replace")
+        except LookupError:
+            safe_message = str(message).encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+        print(safe_message, file=target, flush=flush)
+
+
 def extract_video_id(raw_url: str) -> str:
     parsed = urlparse(raw_url or "")
     target = parsed.path or raw_url or ""
@@ -190,16 +226,19 @@ class XVideosSpider:
         overwrite: bool = False,
         cookie: str = "",
         proxy: str = "",
+        detail_workers: int = None,
     ):
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS)
-        if cookie:
-            self.session.headers.update({"Cookie": cookie})
-        if proxy:
-            self.session.proxies.update({"http": proxy, "https": proxy})
-
         self.output_file = output_file if output_file is not None else OUTPUT_FILE
         self.download_dir = download_dir if download_dir is not None else DOWNLOAD_DIR
+        self.cookie_header = (cookie or os.environ.get("SPIDER_XVIDEOS_COOKIE", "") or os.environ.get("SPIDER_COOKIE", "")).strip()
+        self.proxy = (proxy or default_proxy_from_env()).strip()
+        self.detail_workers = clamp_positive_int(
+            detail_workers if detail_workers is not None else os.environ.get("SPIDER_XVIDEOS_DETAIL_WORKERS", os.environ.get("SPIDER_DETAIL_WORKERS", DEFAULT_DETAIL_WORKERS)),
+            DEFAULT_DETAIL_WORKERS,
+            MAX_DETAIL_WORKERS,
+        )
+        self.session = self._make_session()
+
         self.keyword = (keyword or "").strip()
         self.start_url = start_url or ("" if self.keyword else DEFAULT_START_URL)
         self.start_page = max(1, int(start_page or 1))
@@ -232,6 +271,7 @@ class XVideosSpider:
         self.skipped_videos = 0
         self.failed_videos = 0
         self.skip_viewkeys = set()
+        self.filtered_viewkeys = set()
 
         if seen_viewkeys:
             for vk in seen_viewkeys:
@@ -254,19 +294,54 @@ class XVideosSpider:
             except Exception as e:
                 self.log(f"警告: 读取历史输出失败，将重新开始: {e}")
 
+    def _make_session(self):
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        if self.cookie_header:
+            session.headers.update({"Cookie": self.cookie_header})
+        if self.proxy:
+            session.proxies.update({"http": self.proxy, "https": self.proxy})
+        try:
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+            retry_strategy = Retry(
+                total=MAX_RETRIES,
+                connect=MAX_RETRIES,
+                read=MAX_RETRIES,
+                backoff_factor=0.6,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=frozenset(["GET", "HEAD"]),
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(
+                max_retries=retry_strategy,
+                pool_connections=max(10, self.detail_workers * 2),
+                pool_maxsize=max(10, self.detail_workers * 2),
+            )
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+        except Exception:
+            pass
+        return session
+
     def log(self, message: str):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{timestamp}] {message}"
         if self.stream_output:
-            print(line, file=sys.stderr, flush=True)
+            safe_print(line, file=sys.stderr, flush=True)
         else:
-            print(line)
+            safe_print(line)
 
     def emit_stream_video(self, video: dict):
         if not self.stream_output:
             return
         try:
             print(json.dumps(video, ensure_ascii=False), flush=True)
+        except UnicodeEncodeError:
+            try:
+                print(json.dumps(video, ensure_ascii=True), flush=True)
+            except Exception as e:
+                print(f"[stream] emit failed: {e}", file=sys.stderr, flush=True)
         except Exception as e:
             print(f"[stream] emit failed: {e}", file=sys.stderr, flush=True)
 
@@ -301,15 +376,16 @@ class XVideosSpider:
         query.append(("p", str(page_num - 1)))
         return urlunparse(parsed._replace(query=urlencode(query)))
 
-    def fetch_page(self, url: str, description: str = "", referer: str = "") -> str:
+    def fetch_page(self, url: str, description: str = "", referer: str = "", session=None) -> str:
         headers_extra = {}
         if referer:
             headers_extra["Referer"] = referer
+        client = session or self.session
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 self.log(f"正在请求: {description or url} (尝试 {attempt}/{MAX_RETRIES})")
-                response = self.session.get(url, timeout=30, headers=headers_extra)
+                response = client.get(url, timeout=30, headers=headers_extra)
                 if response.status_code == 403:
                     self.log("警告: 收到 403 Forbidden，可能需要 cookie 或代理")
                     if attempt < MAX_RETRIES:
@@ -319,6 +395,19 @@ class XVideosSpider:
                 response.raise_for_status()
                 encoding = response.encoding or "utf-8"
                 return response.content.decode(encoding, errors="replace")
+            except requests.exceptions.ProxyError as e:
+                self.log(f"代理请求失败: {e}")
+                proxies = getattr(client, "proxies", None)
+                if proxies:
+                    proxies.clear()
+                    if client is self.session:
+                        self.proxy = ""
+                    self.log("代理不可用，切换为直连重试")
+                    continue
+                if attempt < MAX_RETRIES:
+                    self.random_sleep(RETRY_DELAY, RETRY_DELAY + 3)
+                else:
+                    return ""
             except requests.exceptions.RequestException as e:
                 self.log(f"请求失败: {e}")
                 if attempt < MAX_RETRIES:
@@ -603,9 +692,19 @@ class XVideosSpider:
             return None
         if isinstance(value, (int, float)):
             return int(value)
-        text = str(value).strip()
+        text = str(value).strip().lower()
         if not text:
             return None
+        match = re.match(r"^(\d+(?:\.\d+)?)([smhd])$", text)
+        if match:
+            num = float(match.group(1))
+            scale = {
+                "s": 1,
+                "m": 60,
+                "h": 3600,
+                "d": 86400,
+            }[match.group(2)]
+            return int(num * scale)
         if ":" not in text:
             return int(float(text))
         parts = [int(p) for p in text.split(":")]
@@ -709,10 +808,24 @@ class XVideosSpider:
                 continue
 
             consecutive_empty = 0
-            new_videos = [v for v in page_videos if v["viewkey"] not in self.skip_viewkeys]
-            skipped_on_page = len(page_videos) - len(new_videos)
-            if skipped_on_page > 0:
-                self.log(f"[页 {page_num}] 发现 {len(page_videos)} 个链接，其中 {skipped_on_page} 个已处理，{len(new_videos)} 个新视频")
+            known_on_page = sum(1 for v in page_videos if v["viewkey"] in self.skip_viewkeys)
+            filtered_on_page = sum(
+                1
+                for v in page_videos
+                if v["viewkey"] not in self.skip_viewkeys and v["viewkey"] in self.filtered_viewkeys
+            )
+            new_videos = [
+                v
+                for v in page_videos
+                if v["viewkey"] not in self.skip_viewkeys and v["viewkey"] not in self.filtered_viewkeys
+            ]
+            if known_on_page > 0 or filtered_on_page > 0:
+                parts = []
+                if known_on_page > 0:
+                    parts.append(f"{known_on_page} 个已处理")
+                if filtered_on_page > 0:
+                    parts.append(f"{filtered_on_page} 个本轮过滤")
+                self.log(f"[页 {page_num}] 发现 {len(page_videos)} 个链接，其中 {', '.join(parts)}，{len(new_videos)} 个新视频")
             else:
                 self.log(f"[页 {page_num}] 发现 {len(new_videos)} 个视频")
 
@@ -726,12 +839,19 @@ class XVideosSpider:
         self._print_summary()
 
     def _process_video_list(self, videos: list, referer: str = ""):
+        if self.detail_workers > 1 and len(videos) > 1:
+            self._process_video_list_with_workers(videos, referer=referer)
+            return
+
         for idx, video in enumerate(videos, 1):
             if self.target_new is not None and self.processed_videos >= self.target_new:
                 return
             if video["viewkey"] in self.skip_viewkeys:
                 self.log(f"  [SKIP] 已处理过: {video['viewkey']}")
                 self.skipped_videos += 1
+                continue
+            if video["viewkey"] in self.filtered_viewkeys:
+                self.log(f"  [SKIP] 本轮已过滤: {video['viewkey']}")
                 continue
 
             self.log(f"  处理视频 {idx}/{len(videos)}: {video['title'][:60]}...")
@@ -768,7 +888,7 @@ class XVideosSpider:
 
             if not self.video_matches_filters(video):
                 self.skipped_videos += 1
-                self.skip_viewkeys.add(video["viewkey"])
+                self.filtered_viewkeys.add(video["viewkey"])
                 self.log(f"  [SKIP] 不满足过滤条件: {video['viewkey']}")
                 continue
 
@@ -796,7 +916,7 @@ class XVideosSpider:
 
             if not self.video_matches_filters(video):
                 self.skipped_videos += 1
-                self.skip_viewkeys.add(video["viewkey"])
+                self.filtered_viewkeys.add(video["viewkey"])
                 self.log(f"  [SKIP] 下载后不满足过滤条件: {video['viewkey']}")
                 self._save_results()
                 continue
@@ -808,6 +928,133 @@ class XVideosSpider:
             self.log("  [OK] 成功下载视频源文件")
             self.emit_stream_video(video)
             self._save_results()
+
+    def _process_video_list_with_workers(self, videos: list, referer: str = ""):
+        eligible = []
+        for idx, video in enumerate(videos, 1):
+            if self.target_new is not None and self.processed_videos >= self.target_new:
+                return
+            if video["viewkey"] in self.skip_viewkeys:
+                self.log(f"  [SKIP] 已处理过: {video['viewkey']}")
+                self.skipped_videos += 1
+                continue
+            if video["viewkey"] in self.filtered_viewkeys:
+                self.log(f"  [SKIP] 本轮已过滤: {video['viewkey']}")
+                continue
+            self.log(f"  处理视频 {idx}/{len(videos)}: {video['title'][:60]}...")
+            eligible.append((idx, video))
+
+        cursor = 0
+        while cursor < len(eligible):
+            if self.target_new is not None and self.processed_videos >= self.target_new:
+                return
+            if self.target_new is not None:
+                remaining = self.target_new - self.processed_videos
+                if remaining <= 0:
+                    return
+                batch_size = min(self.detail_workers, remaining, len(eligible) - cursor)
+            else:
+                batch_size = min(self.detail_workers, len(eligible) - cursor)
+            batch = eligible[cursor:cursor + batch_size]
+            cursor += batch_size
+            if not batch:
+                break
+            with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                futures = {
+                    executor.submit(self._fetch_detail_info, video, referer): (idx, video)
+                    for idx, video in batch
+                }
+                for future in as_completed(futures):
+                    if self.target_new is not None and self.processed_videos >= self.target_new:
+                        return
+                    idx, video = futures[future]
+                    try:
+                        detail_info, failure = future.result()
+                    except Exception as e:
+                        detail_info, failure = {}, f"detail_worker_error:{e}"
+                    self._handle_detail_info(video, detail_info, failure)
+
+    def _fetch_detail_info(self, video: dict, referer: str = ""):
+        session = self._make_session()
+        detail_html = self.fetch_page(
+            video["detail_url"],
+            f"详情页 video_id={video['viewkey']}",
+            referer=referer,
+            session=session,
+        )
+        if not detail_html:
+            return {}, "detail_fetch_failed"
+        return self.parse_detail_page(detail_html), ""
+
+    def _handle_detail_info(self, video: dict, detail_info: dict, failure: str = ""):
+        if failure:
+            self._record_failure(video, failure)
+            return
+
+        if detail_info.get("title"):
+            video["title"] = detail_info["title"]
+        if detail_info.get("thumb_url"):
+            video["thumb_url"] = detail_info["thumb_url"]
+        if detail_info.get("sources"):
+            video["sources"] = detail_info["sources"]
+        if detail_info.get("source_quality"):
+            video["source_quality"] = detail_info["source_quality"]
+        if detail_info.get("duration_seconds") is not None:
+            video["duration_seconds"] = detail_info["duration_seconds"]
+
+        video_url = detail_info.get("video_url", "")
+        if not video_url:
+            self._record_failure(video, "video_url_not_found")
+            return
+        video["video_url"] = video_url
+
+        if self.min_size is not None or self.max_size is not None:
+            size = self.probe_content_length(video_url, referer=video["detail_url"])
+            if size is not None:
+                video["video_size"] = size
+
+        if not self.video_matches_filters(video):
+            self.skipped_videos += 1
+            self.filtered_viewkeys.add(video["viewkey"])
+            self.log(f"  [SKIP] 不满足过滤条件: {video['viewkey']}")
+            return
+
+        if self.no_download:
+            video["download_status"] = "metadata_only"
+            self.results.append(video)
+            self.skip_viewkeys.add(video["viewkey"])
+            self.processed_videos += 1
+            self.log("  [OK] 成功提取视频直链")
+            self.emit_stream_video(video)
+            self._save_results()
+            return
+
+        try:
+            self._download_assets(video)
+        except Exception as e:
+            video["download_status"] = "failed"
+            video["error"] = str(e)
+            self.results.append(video)
+            self.skip_viewkeys.add(video["viewkey"])
+            self.failed_videos += 1
+            self.log(f"  [FAIL] 下载失败: {e}")
+            self._save_results()
+            return
+
+        if not self.video_matches_filters(video):
+            self.skipped_videos += 1
+            self.filtered_viewkeys.add(video["viewkey"])
+            self.log(f"  [SKIP] 下载后不满足过滤条件: {video['viewkey']}")
+            self._save_results()
+            return
+
+        self.results.append(video)
+        self.skip_viewkeys.add(video["viewkey"])
+        self.processed_videos += 1
+        self.downloaded_videos += 1
+        self.log("  [OK] 成功下载视频源文件")
+        self.emit_stream_video(video)
+        self._save_results()
 
     def _record_failure(self, video: dict, reason: str):
         video["video_url"] = video.get("video_url", "")
@@ -1002,6 +1249,7 @@ def print_help():
     --no-resume               不读取已有 output JSON 做断点续爬
     --cookie COOKIE           附加 Cookie 请求头
     --proxy URL               显式代理，如 http://127.0.0.1:7890
+    --detail-workers N        并发抓详情页的 worker 数，默认 4，最大 8
     --stream-output           每处理一条就输出一行 JSON 到 stdout，日志走 stderr
     --quiet                   减少日志
     -h / --help               帮助
@@ -1022,7 +1270,7 @@ def main():
     parser.add_argument("--url", type=str, default="")
     parser.add_argument("--keyword", type=str, default="")
     parser.add_argument("--page", type=int, default=1)
-    parser.add_argument("--max-pages", type=int, default=MAX_PAGES)
+    parser.add_argument("--max-pages", type=int, default=None)
     parser.add_argument("--target-new", type=int, default=None)
     parser.add_argument("--seen-file", type=str, default=None)
     parser.add_argument("--seen-viewkeys-file", type=str, default=None)
@@ -1039,6 +1287,7 @@ def main():
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--cookie", type=str, default="")
     parser.add_argument("--proxy", type=str, default="")
+    parser.add_argument("--detail-workers", type=int, default=None)
     parser.add_argument("--stream-output", action="store_true")
     parser.add_argument("--quiet", action="store_true")
 
@@ -1046,12 +1295,11 @@ def main():
     seen_path = args.seen_file or args.seen_viewkeys_file
     seen_viewkeys = read_seen_file(seen_path)
 
-    max_pages = args.max_pages
-    if args.target_new is not None and args.max_pages == MAX_PAGES:
-        # target-new 模式默认不限页，直到凑够或连续空页停止。
-        max_pages = None
-    elif max_pages is not None and max_pages <= 0:
-        max_pages = None
+    if args.max_pages is None:
+        # target-new 模式默认不限页，直到凑够或连续空页停止；普通手动模式默认只抓 1 页。
+        max_pages = None if args.target_new is not None else MAX_PAGES
+    else:
+        max_pages = None if args.max_pages <= 0 else args.max_pages
 
     spider = XVideosSpider(
         output_file=args.output,
@@ -1075,6 +1323,7 @@ def main():
         overwrite=args.overwrite,
         cookie=args.cookie,
         proxy=args.proxy,
+        detail_workers=args.detail_workers,
     )
 
     try:

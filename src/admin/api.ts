@@ -95,6 +95,8 @@ export type AdminDrive = {
   lastCrawlAt?: number;
   // spider91 专用代理地址；仅后台管理接口返回，用于编辑表单回显。
   spider91Proxy?: string;
+  // spider crawler editable config returned for edit form rehydration.
+  spiderCrawlerConfig?: Record<string, string>;
   thumbnailGenerationStatus?: DriveGenerationStatus;
   previewGenerationStatus?: DriveGenerationStatus;
   fingerprintGenerationStatus?: DriveGenerationStatus;
@@ -180,6 +182,31 @@ export function stopDriveTasks(id: string) {
   return request<{ ok: boolean; stopped: boolean }>(
     `/drives/${encodeURIComponent(id)}/tasks/stop`,
     { method: "POST" }
+  );
+}
+
+export type DriveCrawlStatus = {
+  driveId: string;
+  kind?: string;
+  state: "idle" | "running" | "ok" | "error" | "canceled" | string;
+  message?: string;
+  lastError?: string;
+  targetNew?: number;
+  totalEntries?: number;
+  newVideos?: number;
+  skipped?: number;
+  failed?: number;
+  seenSnapshot?: number;
+  outputJson?: string;
+  seenFile?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  logs?: string[];
+};
+
+export function getDriveCrawlStatus(id: string) {
+  return request<DriveCrawlStatus>(
+    `/drives/${encodeURIComponent(id)}/crawl/status`
   );
 }
 

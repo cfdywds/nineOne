@@ -68,6 +68,53 @@ test("spider91 drive form does not expose advanced crawler credentials", () => {
   assert.doesNotMatch(fields, /script_path/);
 });
 
+test("xvideos drive form exposes editable crawler config and rehydrates saved values", () => {
+  const match =
+    /case "spiderxvideos":\s*return \[([\s\S]*?)\];\s*\}/.exec(
+      combinedSource
+    );
+  assert.ok(match, "spiderxvideos credential field block should be present");
+  const fields = match[1];
+
+  for (const key of [
+    "start_url",
+    "keyword",
+    "quality",
+    "min_duration",
+    "max_duration",
+    "min_size",
+    "max_size",
+    "merge_hls",
+    "target_new",
+    "proxy",
+    "cookie",
+    "script_path",
+  ]) {
+    assert.match(fields, new RegExp(`key: "${key}"`));
+  }
+  assert.match(apiSource, /spiderCrawlerConfig\?: Record<string, string>/);
+  assert.match(
+    drivesPageSource,
+    /creds: d\.spiderCrawlerConfig \? \{ \.\.\.d\.spiderCrawlerConfig \} : d\.kind === "spider91"/
+  );
+});
+
+test("spider crawler detail exposes crawl status, result paths, and logs", () => {
+  assert.match(apiSource, /export type DriveCrawlStatus/);
+  assert.match(apiSource, /getDriveCrawlStatus/);
+  assert.match(apiSource, /\/drives\/\$\{encodeURIComponent\(id\)\}\/crawl\/status/);
+  assert.match(drivesPageSource, /const \[crawlStatus, setCrawlStatus\]/);
+  assert.match(drivesPageSource, /refreshCrawlStatus\(selectedDriveId\)/);
+  assert.match(drivesPageSource, />抓取状态</);
+  assert.match(drivesPageSource, />结果 JSON</);
+  assert.match(drivesPageSource, /admin-crawl-logs/);
+  assert.match(drivesPageSource, /crawlStatus\?\.logs\?\.length \? crawlStatus\.logs : \["暂无抓取日志"\]\)\.map/);
+  assert.doesNotMatch(drivesPageSource, /crawlStatus\.logs\.slice\(-8\)/);
+  assert.match(adminCss, /\.admin-crawl-state\.is-running/);
+  assert.match(adminCss, /\.admin-crawl-logs\s*\{[^}]*max-height\s*:/s);
+  assert.match(adminCss, /\.admin-crawl-logs\s*\{[^}]*overflow-y\s*:\s*auto/s);
+});
+
 test("spider91 upload target uses explicit local-save option instead of auto target", () => {
   assert.match(combinedSource, /本地保存，不上传/);
   assert.match(

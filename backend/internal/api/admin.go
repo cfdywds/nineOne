@@ -48,6 +48,7 @@ type AdminServer struct {
 	OnScanRequested            func(driveID string)
 	OnStopDriveTasks           func(driveID string) bool
 	OnStopAllTasks             func() int
+	GetDriveCrawlStatus        func(driveID string) CrawlStatus
 	OnRegenPreview             func(videoID string)
 	OnRegenAllPreviews         func()
 	OnRegenFailedPreviews      func(driveID string)
@@ -108,6 +109,25 @@ type NightlyJobStatus struct {
 	LastFinishedAt string `json:"lastFinishedAt,omitempty"`
 }
 
+type CrawlStatus struct {
+	DriveID      string   `json:"driveId"`
+	Kind         string   `json:"kind,omitempty"`
+	State        string   `json:"state"`
+	Message      string   `json:"message,omitempty"`
+	LastError    string   `json:"lastError,omitempty"`
+	TargetNew    int      `json:"targetNew,omitempty"`
+	TotalEntries int      `json:"totalEntries,omitempty"`
+	NewVideos    int      `json:"newVideos,omitempty"`
+	Skipped      int      `json:"skipped,omitempty"`
+	Failed       int      `json:"failed,omitempty"`
+	SeenSnapshot int      `json:"seenSnapshot,omitempty"`
+	OutputJSON   string   `json:"outputJson,omitempty"`
+	SeenFile     string   `json:"seenFile,omitempty"`
+	StartedAt    string   `json:"startedAt,omitempty"`
+	FinishedAt   string   `json:"finishedAt,omitempty"`
+	Logs         []string `json:"logs,omitempty"`
+}
+
 type DeleteVideoResult struct {
 	OK            bool `json:"ok"`
 	DeletedSource bool `json:"deletedSource"`
@@ -134,6 +154,7 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Get("/drives/p123/qr/{uniID}", a.handleP123QRStatus)
 			r.Delete("/drives/{id}", a.handleDeleteDrive)
 			r.Post("/drives/{id}/rescan", a.handleRescan)
+			r.Get("/drives/{id}/crawl/status", a.handleDriveCrawlStatus)
 			r.Post("/drives/{id}/tasks/stop", a.handleStopDriveTasks)
 			r.Post("/drives/{id}/teaser-enabled", a.handleSetDriveTeaserEnabled)
 			r.Post("/drives/{id}/skip-dirs", a.handleSetDriveSkipDirs)
@@ -415,21 +436,22 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		SkipDirIDs []string `json:"skipDirIds"`
 		// LastCrawlAt 是 spider91 上次成功爬取的 unix 秒（来自 credentials.last_crawl_at）。
 		// 其它 kind 留 0；前端用它显示"上次抓取: N 小时前"。
-		Spider91Proxy                 string           `json:"spider91Proxy,omitempty"`
-		LastCrawlAt                   int64            `json:"lastCrawlAt,omitempty"`
-		ThumbnailGenerationStatus     GenerationStatus `json:"thumbnailGenerationStatus"`
-		PreviewGenerationStatus       GenerationStatus `json:"previewGenerationStatus"`
-		FingerprintGenerationStatus   GenerationStatus `json:"fingerprintGenerationStatus"`
-		ThumbnailReadyCount           int              `json:"thumbnailReadyCount"`
-		ThumbnailPendingCount         int              `json:"thumbnailPendingCount"`
-		ThumbnailFailedCount          int              `json:"thumbnailFailedCount"`
-		ThumbnailDurationPendingCount int              `json:"thumbnailDurationPendingCount"`
-		TeaserReadyCount              int              `json:"teaserReadyCount"`
-		TeaserPendingCount            int              `json:"teaserPendingCount"`
-		TeaserFailedCount             int              `json:"teaserFailedCount"`
-		FingerprintReadyCount         int              `json:"fingerprintReadyCount"`
-		FingerprintPendingCount       int              `json:"fingerprintPendingCount"`
-		FingerprintFailedCount        int              `json:"fingerprintFailedCount"`
+		Spider91Proxy                 string            `json:"spider91Proxy,omitempty"`
+		SpiderCrawlerConfig           map[string]string `json:"spiderCrawlerConfig,omitempty"`
+		LastCrawlAt                   int64             `json:"lastCrawlAt,omitempty"`
+		ThumbnailGenerationStatus     GenerationStatus  `json:"thumbnailGenerationStatus"`
+		PreviewGenerationStatus       GenerationStatus  `json:"previewGenerationStatus"`
+		FingerprintGenerationStatus   GenerationStatus  `json:"fingerprintGenerationStatus"`
+		ThumbnailReadyCount           int               `json:"thumbnailReadyCount"`
+		ThumbnailPendingCount         int               `json:"thumbnailPendingCount"`
+		ThumbnailFailedCount          int               `json:"thumbnailFailedCount"`
+		ThumbnailDurationPendingCount int               `json:"thumbnailDurationPendingCount"`
+		TeaserReadyCount              int               `json:"teaserReadyCount"`
+		TeaserPendingCount            int               `json:"teaserPendingCount"`
+		TeaserFailedCount             int               `json:"teaserFailedCount"`
+		FingerprintReadyCount         int               `json:"fingerprintReadyCount"`
+		FingerprintPendingCount       int               `json:"fingerprintPendingCount"`
+		FingerprintFailedCount        int               `json:"fingerprintFailedCount"`
 	}
 	list := make([]out, 0, len(drives))
 	for _, d := range drives {
@@ -475,6 +497,7 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 			TeaserEnabled:                 d.TeaserEnabled,
 			SkipDirIDs:                    append([]string{}, d.SkipDirIDs...),
 			Spider91Proxy:                 spider91ProxyForDrive(d),
+			SpiderCrawlerConfig:           spiderCrawlerConfigForDrive(d),
 			LastCrawlAt:                   lastCrawlAt,
 			ThumbnailGenerationStatus:     generation.Thumbnail,
 			PreviewGenerationStatus:       generation.Preview,
@@ -527,8 +550,8 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 	if existingDrive, err := a.Catalog.GetDrive(r.Context(), body.ID); err == nil {
 		existing = existingDrive
 	}
-	if body.Kind == "spider91" {
-		credentials, err := mergeSpider91Credentials(existing, body.Credentials)
+	if isSpiderCrawlerKind(body.Kind) {
+		credentials, err := mergeSpiderCrawlerCredentials(body.Kind, existing, body.Credentials)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -590,7 +613,95 @@ func spider91ProxyForDrive(d *catalog.Drive) string {
 	return strings.TrimSpace(d.Credentials["proxy"])
 }
 
+func isSpiderCrawlerKind(kind string) bool {
+	return kind == "spider91" || kind == "spiderxvideos"
+}
+
+func spiderCrawlerEditableKeys(kind string) map[string]struct{} {
+	keys := map[string]struct{}{"proxy": {}}
+	if kind != "spiderxvideos" {
+		return keys
+	}
+	for _, key := range []string{
+		"start_url",
+		"keyword",
+		"quality",
+		"min_duration",
+		"max_duration",
+		"min_size",
+		"max_size",
+		"merge_hls",
+		"proxy",
+		"cookie",
+		"script_path",
+		"target_new",
+	} {
+		keys[key] = struct{}{}
+	}
+	return keys
+}
+
+func spiderCrawlerConfigForDrive(d *catalog.Drive) map[string]string {
+	if d == nil || d.Credentials == nil || !isSpiderCrawlerKind(d.Kind) {
+		return nil
+	}
+	keys := spiderCrawlerEditableKeys(d.Kind)
+	out := map[string]string{}
+	for key := range keys {
+		value := strings.TrimSpace(d.Credentials[key])
+		if value != "" {
+			out[key] = value
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func mergeSpiderCrawlerCredentials(kind string, existing *catalog.Drive, incoming map[string]string) (map[string]string, error) {
+	merged := map[string]string{}
+	if existing != nil {
+		for k, v := range existing.Credentials {
+			merged[k] = v
+		}
+	}
+	editable := spiderCrawlerEditableKeys(kind)
+	for k, v := range incoming {
+		key := strings.TrimSpace(k)
+		if key == "" {
+			continue
+		}
+		if _, ok := editable[key]; !ok {
+			continue
+		}
+		value := strings.TrimSpace(v)
+		if key == "proxy" {
+			proxy, err := normalizeSpider91ProxyURL(value)
+			if err != nil {
+				return nil, err
+			}
+			if proxy == "" {
+				delete(merged, "proxy")
+			} else {
+				merged["proxy"] = proxy
+			}
+			continue
+		}
+		if value == "" {
+			delete(merged, key)
+		} else {
+			merged[key] = value
+		}
+	}
+	return merged, nil
+}
+
 func mergeSpider91Credentials(existing *catalog.Drive, incoming map[string]string) (map[string]string, error) {
+	return mergeSpiderCrawlerCredentials("spider91", existing, incoming)
+}
+
+func mergeSpider91CredentialsLegacy(existing *catalog.Drive, incoming map[string]string) (map[string]string, error) {
 	merged := map[string]string{}
 	if existing != nil {
 		for k, v := range existing.Credentials {
@@ -679,6 +790,21 @@ func (a *AdminServer) handleRescan(w http.ResponseWriter, r *http.Request) {
 		a.OnScanRequested(id)
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
+}
+
+func (a *AdminServer) handleDriveCrawlStatus(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	status := CrawlStatus{DriveID: id, State: "idle"}
+	if a.GetDriveCrawlStatus != nil {
+		status = a.GetDriveCrawlStatus(id)
+		if status.DriveID == "" {
+			status.DriveID = id
+		}
+		if status.State == "" {
+			status.State = "idle"
+		}
+	}
+	writeJSON(w, http.StatusOK, status)
 }
 
 func (a *AdminServer) handleStopDriveTasks(w http.ResponseWriter, r *http.Request) {

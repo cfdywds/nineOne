@@ -40,15 +40,15 @@ func TestCrawlerRunOnceDownloadsAndUpserts(t *testing.T) {
 	driver := New(Config{ID: "xv", RootDir: root})
 	commonThumbs := filepath.Join(t.TempDir(), "thumbs")
 	crawler := NewCrawler(CrawlerConfig{
-		Driver:         driver,
-		Catalog:        cat,
-		PythonPath:     script.runner,
-		ScriptPath:     script.path,
-		WorkDir:        filepath.Dir(script.path),
-		CommonThumbDir: commonThumbs,
+		Driver:          driver,
+		Catalog:         cat,
+		PythonPath:      script.runner,
+		ScriptPath:      script.path,
+		WorkDir:         filepath.Dir(script.path),
+		CommonThumbDir:  commonThumbs,
 		DownloadTimeout: 10 * time.Second,
-		StartURL:       "https://www.xvideos.com/?k=test",
-		Quality:        "best",
+		StartURL:        "https://www.xvideos.com/?k=test",
+		Quality:         "best",
 	})
 
 	res, err := crawler.RunOnce(context.Background(), 1)
@@ -79,6 +79,65 @@ func TestCrawlerRunOnceDownloadsAndUpserts(t *testing.T) {
 	}
 }
 
+func TestCrawlerRunOnceReportsProgressAndScriptLogs(t *testing.T) {
+	cat := openTestCatalog(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/videos/12345.mp4":
+			_, _ = w.Write([]byte("fake-video-body"))
+		case "/thumbs/12345.jpg":
+			_, _ = w.Write([]byte("fake-jpeg-body"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	jsonLine := fmt.Sprintf(`{"title":"XVideos One","thumb_url":%q,"video_url":%q,"viewkey":"12345","video_id":"12345","detail_url":"https://www.xvideos.com/video12345/test"}`,
+		srv.URL+"/thumbs/12345.jpg",
+		srv.URL+"/videos/12345.mp4",
+	)
+	script := buildFakeSpiderScriptWithStderr(t, jsonLine, "python parsed one item")
+
+	root := t.TempDir()
+	driver := New(Config{ID: "xv", RootDir: root})
+	var logs []string
+	var progress []CrawlResult
+	crawler := NewCrawler(CrawlerConfig{
+		Driver:          driver,
+		Catalog:         cat,
+		PythonPath:      script.runner,
+		ScriptPath:      script.path,
+		WorkDir:         filepath.Dir(script.path),
+		DownloadTimeout: 10 * time.Second,
+		Quality:         "best",
+		OnLog: func(line string) {
+			logs = append(logs, line)
+		},
+		OnProgress: func(res CrawlResult) {
+			progress = append(progress, res)
+		},
+	})
+
+	res, err := crawler.RunOnce(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if res.NewVideos != 1 || res.TotalEntries != 1 {
+		t.Fatalf("result = %#v, want one parsed and downloaded video", res)
+	}
+	if len(logs) == 0 || !strings.Contains(logs[0], "python parsed one item") {
+		t.Fatalf("logs = %#v, want script stderr forwarded", logs)
+	}
+	if len(progress) == 0 {
+		t.Fatal("OnProgress was not called")
+	}
+	last := progress[len(progress)-1]
+	if last.TotalEntries != 1 || last.NewVideos != 1 || last.TargetNew != 1 || last.OutputJSON == "" || last.SeenFile == "" {
+		t.Fatalf("last progress = %#v, want live crawl counters and result paths", last)
+	}
+}
+
 func TestCrawlerRunOnceMergesHLSWhenEnabled(t *testing.T) {
 	cat := openTestCatalog(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -99,15 +158,15 @@ func TestCrawlerRunOnceMergesHLSWhenEnabled(t *testing.T) {
 	root := t.TempDir()
 	driver := New(Config{ID: "xv", RootDir: root})
 	crawler := NewCrawler(CrawlerConfig{
-		Driver:         driver,
-		Catalog:        cat,
-		PythonPath:     script.runner,
-		ScriptPath:     script.path,
-		WorkDir:        filepath.Dir(script.path),
+		Driver:          driver,
+		Catalog:         cat,
+		PythonPath:      script.runner,
+		ScriptPath:      script.path,
+		WorkDir:         filepath.Dir(script.path),
 		DownloadTimeout: 10 * time.Second,
-		Quality:        "best",
-		MergeHLS:       true,
-		FFmpegPath:     ffmpeg,
+		Quality:         "best",
+		MergeHLS:        true,
+		FFmpegPath:      ffmpeg,
 	})
 
 	res, err := crawler.RunOnce(context.Background(), 1)
@@ -160,6 +219,8 @@ func TestStartSpiderTargetNewPassesFilterArgs(t *testing.T) {
 			t.Fatalf("args = %q, want contain %q", args, want)
 		}
 	}
+	assertEnvContains(t, cmd.Env, "PYTHONIOENCODING=utf-8")
+	assertEnvContains(t, cmd.Env, "PYTHONUTF8=1")
 	_ = cmd.Process.Kill()
 }
 
@@ -265,6 +326,27 @@ func buildFakeSpiderScript(t *testing.T, jsonLine string) fakeScript {
 	return fakeScript{runner: path, path: path}
 }
 
+func buildFakeSpiderScriptWithStderr(t *testing.T, jsonLine, stderrLine string) fakeScript {
+	t.Helper()
+	dir := t.TempDir()
+	if runtime.GOOS == "windows" {
+		path := filepath.Join(dir, "fake_spider.cmd")
+		body := "@echo off\r\n" +
+			"echo " + stderrLine + " 1>&2\r\n" +
+			"echo " + jsonLine + "\r\n"
+		if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+			t.Fatalf("write fake script: %v", err)
+		}
+		return fakeScript{runner: path, path: path}
+	}
+	path := filepath.Join(dir, "fake_spider.sh")
+	body := "#!/bin/sh\nprintf '%s\\n' '" + strings.ReplaceAll(stderrLine, "'", "'\\''") + "' >&2\nprintf '%s\\n' '" + strings.ReplaceAll(jsonLine, "'", "'\\''") + "'\n"
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatalf("write fake script: %v", err)
+	}
+	return fakeScript{runner: path, path: path}
+}
+
 func buildFakeFFmpeg(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -290,4 +372,14 @@ func buildFakeFFmpeg(t *testing.T) string {
 		t.Fatalf("write fake ffmpeg: %v", err)
 	}
 	return path
+}
+
+func assertEnvContains(t *testing.T, env []string, want string) {
+	t.Helper()
+	for _, value := range env {
+		if value == want {
+			return
+		}
+	}
+	t.Fatalf("env does not contain %q: %#v", want, env)
 }

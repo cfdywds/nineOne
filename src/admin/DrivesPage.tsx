@@ -45,6 +45,7 @@ export function DrivesPage() {
   const [settings, setSettings] = useState<api.Settings | null>(null);
   const [nightlyStatus, setNightlyStatus] =
     useState<api.NightlyJobStatus>(idleNightlyStatus);
+  const [crawlStatus, setCrawlStatus] = useState<api.DriveCrawlStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [modalOpen, setModalOpen] = useState(false);
@@ -139,6 +140,14 @@ export function DrivesPage() {
     }
   }
 
+  async function refreshCrawlStatus(driveId: string) {
+    try {
+      setCrawlStatus(await api.getDriveCrawlStatus(driveId));
+    } catch {
+      // The normal drive polling already reports connection loss.
+    }
+  }
+
   useEffect(() => {
     refresh();
   }, []);
@@ -147,10 +156,20 @@ export function DrivesPage() {
     const timer = window.setInterval(() => {
       if (!document.hidden && !modalOpen) {
         refreshDriveList();
+        if (selectedDriveId) {
+          refreshCrawlStatus(selectedDriveId);
+        }
       }
     }, 5000);
     return () => window.clearInterval(timer);
-  }, [modalOpen]);
+  }, [modalOpen, selectedDriveId]);
+
+  useEffect(() => {
+    setCrawlStatus(null);
+    if (selectedDriveId) {
+      refreshCrawlStatus(selectedDriveId);
+    }
+  }, [selectedDriveId]);
 
   useEffect(() => {
     if (!trackingNightly) return;
@@ -185,7 +204,7 @@ export function DrivesPage() {
       kind: d.kind,
       name: d.name,
       rootId: d.rootId,
-      creds: d.kind === "spider91" ? { proxy: d.spider91Proxy ?? "" } : {},
+      creds: d.spiderCrawlerConfig ? { ...d.spiderCrawlerConfig } : d.kind === "spider91" ? { proxy: d.spider91Proxy ?? "" } : {},
       spider91UploadDriveId: settings?.spider91UploadDriveId ?? "",
     };
     setForm(nextForm);
@@ -302,6 +321,7 @@ export function DrivesPage() {
       await api.rescan(d.id);
       if (isSpiderCrawlerKind(d.kind)) {
         show("已触发抓取任务，需要 2-4 分钟，可稍后刷新视频列表查看", "success");
+        refreshCrawlStatus(d.id);
       } else {
         show("已触发扫描，可稍后刷新视频列表查看", "success");
       }
@@ -563,6 +583,69 @@ export function DrivesPage() {
                 }}
               />
             )}
+            {isSpiderCrawlerKind(d.kind) && (
+              <div className="admin-detail-card admin-crawl-status-card">
+                <header className="admin-detail-card__title">
+                  <div className="admin-detail-card__title-left">
+                    <Download size={16} />
+                    <span>抓取状态</span>
+                  </div>
+                  <div className="admin-detail-card__title-right">
+                    <span className={`admin-crawl-state is-${crawlStatus?.state ?? "idle"}`}>
+                      {crawlStateLabel(crawlStatus?.state)}
+                    </span>
+                  </div>
+                </header>
+                <div className="admin-detail-grid">
+                  <div className="admin-detail-row">
+                    <span className="admin-detail-label">目标 / 新增</span>
+                    <span className="admin-detail-value">
+                      {crawlStatus?.targetNew ?? 0} / {crawlStatus?.newVideos ?? 0}
+                    </span>
+                  </div>
+                  <div className="admin-detail-row">
+                    <span className="admin-detail-label">解析 / 跳过 / 失败</span>
+                    <span className="admin-detail-value">
+                      {crawlStatus?.totalEntries ?? 0} / {crawlStatus?.skipped ?? 0} / {crawlStatus?.failed ?? 0}
+                    </span>
+                  </div>
+                  <div className="admin-detail-row">
+                    <span className="admin-detail-label">已知快照</span>
+                    <span className="admin-detail-value">{crawlStatus?.seenSnapshot ?? 0}</span>
+                  </div>
+                  <div className="admin-detail-row">
+                    <span className="admin-detail-label">开始时间</span>
+                    <span className="admin-detail-value">{formatCrawlDate(crawlStatus?.startedAt)}</span>
+                  </div>
+                  <div className="admin-detail-row">
+                    <span className="admin-detail-label">结束时间</span>
+                    <span className="admin-detail-value">{formatCrawlDate(crawlStatus?.finishedAt)}</span>
+                  </div>
+                  {crawlStatus?.outputJson && (
+                    <div className="admin-detail-row">
+                      <span className="admin-detail-label">结果 JSON</span>
+                      <span className="admin-detail-value admin-mono-cell">{crawlStatus.outputJson}</span>
+                    </div>
+                  )}
+                  {crawlStatus?.seenFile && (
+                    <div className="admin-detail-row">
+                      <span className="admin-detail-label">去重文件</span>
+                      <span className="admin-detail-value admin-mono-cell">{crawlStatus.seenFile}</span>
+                    </div>
+                  )}
+                </div>
+                {crawlStatus?.lastError && (
+                  <div className="admin-detail-error">{crawlStatus.lastError}</div>
+                )}
+                <div className="admin-crawl-logs">
+                  {(crawlStatus?.logs?.length ? crawlStatus.logs : ["暂无抓取日志"]).map((line, index) => (
+                    <div className="admin-crawl-log-line" key={`${index}-${line}`}>
+                      {line}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
 
           <div>
@@ -813,6 +896,28 @@ function sameRecord(a: Record<string, string>, b: Record<string, string>): boole
     if ((a[key] ?? "") !== (b[key] ?? "")) return false;
   }
   return true;
+}
+
+function crawlStateLabel(state?: string): string {
+  switch (state) {
+    case "running":
+      return "运行中";
+    case "ok":
+      return "已完成";
+    case "error":
+      return "失败";
+    case "canceled":
+      return "已取消";
+    default:
+      return "空闲";
+  }
+}
+
+function formatCrawlDate(value?: string): string {
+  if (!value) return "-";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  return d.toLocaleString();
 }
 
 function hasCreateFormChanges(form: FormState, initial: FormState): boolean {

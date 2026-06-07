@@ -249,6 +249,33 @@ func TestCrawlerRunOnceMissingScript(t *testing.T) {
 	}
 }
 
+func TestStartSpiderTargetNewForcesUTF8PythonIO(t *testing.T) {
+	tmp := t.TempDir()
+	cat, drv, scriptPath := seedCrawlerTestDeps(t, tmp, "utf8-env", nil)
+	runner := "sh"
+	if runtime.GOOS == "windows" {
+		scriptPath = filepath.Join(tmp, "utf8-env.cmd")
+		if err := os.WriteFile(scriptPath, []byte("@echo off\r\n"), 0o755); err != nil {
+			t.Fatalf("write script: %v", err)
+		}
+		runner = scriptPath
+	}
+	c := NewCrawler(CrawlerConfig{
+		Driver:     drv,
+		Catalog:    cat,
+		PythonPath: runner,
+		ScriptPath: scriptPath,
+	})
+
+	cmd, _, err := c.startSpiderTargetNew(context.Background(), 1, filepath.Join(tmp, "seen.txt"), filepath.Join(tmp, "out.json"))
+	if err != nil {
+		t.Fatalf("startSpiderTargetNew: %v", err)
+	}
+	assertEnvContains(t, cmd.Env, "PYTHONIOENCODING=utf-8")
+	assertEnvContains(t, cmd.Env, "PYTHONUTF8=1")
+	_ = cmd.Process.Kill()
+}
+
 func TestCrawlerPassesProxyToSpiderProcess(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-based fake script only on unix")
@@ -784,4 +811,14 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func assertEnvContains(t *testing.T, env []string, want string) {
+	t.Helper()
+	for _, value := range env {
+		if value == want {
+			return
+		}
+	}
+	t.Fatalf("env does not contain %q: %#v", want, env)
 }
