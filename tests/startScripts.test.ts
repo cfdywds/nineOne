@@ -32,6 +32,17 @@ test("PowerShell launcher falls back to the bundled Go toolchain", () => {
   assert.match(script, /FilePath\s+\$GoCommand/);
 });
 
+test("PowerShell launcher captures frontend build stderr without native command errors", () => {
+  const scriptPath = path.join(repoRoot, "start.ps1");
+  assert.equal(existsSync(scriptPath), true);
+
+  const script = readFileSync(scriptPath, "utf8");
+  assert.doesNotMatch(script, /npm run build 2>&1\s*\|\s*Tee-Object/);
+  assert.match(script, /\$BuildShell\s*=\s*\$env:ComSpec/);
+  assert.match(script, /\$BuildOutput\s*=\s*&\s*\$BuildShell\s+\/d\s+\/s\s+\/c/);
+  assert.match(script, /\$BuildExitCode\s*=\s*\$LASTEXITCODE/);
+});
+
 test("batch launcher delegates to the PowerShell launcher", () => {
   const scriptPath = path.join(repoRoot, "start.bat");
   assert.equal(existsSync(scriptPath), true);

@@ -136,8 +136,14 @@ function Invoke-FrontendBuild {
   Write-Host "building frontend: $FrontendBuildCommand"
   Push-Location $RootDir
   try {
-    & npm run build 2>&1 | Tee-Object -FilePath $FrontendBuildLog
-    if ($LASTEXITCODE -ne 0) {
+    $BuildShell = $env:ComSpec
+    if (-not $BuildShell) {
+      $BuildShell = "cmd.exe"
+    }
+    $BuildOutput = & $BuildShell /d /s /c "$FrontendBuildCommand 2>&1"
+    $BuildExitCode = $LASTEXITCODE
+    $BuildOutput | Tee-Object -FilePath $FrontendBuildLog
+    if ($BuildExitCode -ne 0) {
       throw "frontend build failed; see $FrontendBuildLog"
     }
   }
