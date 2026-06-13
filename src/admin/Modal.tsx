@@ -75,12 +75,7 @@ export function Modal({ open, title, onClose, children, footer, className = "" }
 
   if (!open) return null;
   return (
-    <div
-      className="admin-modal-backdrop"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
+    <div className="admin-modal-backdrop">
       <div
         ref={dialogRef}
         className={`admin-modal${className ? ` ${className}` : ""}`}

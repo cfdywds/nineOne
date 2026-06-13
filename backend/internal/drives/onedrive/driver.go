@@ -501,6 +501,17 @@ func (d *Driver) Rename(ctx context.Context, fileID, newName string) error {
 	return nil
 }
 
+func (d *Driver) Remove(ctx context.Context, fileID string) error {
+	fileID = strings.TrimSpace(fileID)
+	if fileID == "" {
+		return errors.New("onedrive remove: empty file id")
+	}
+	if err := d.request(ctx, d.itemURL(fileID), http.MethodDelete, nil, nil); err != nil {
+		return fmt.Errorf("onedrive remove: %w", err)
+	}
+	return nil
+}
+
 func (d *Driver) request(ctx context.Context, rawURL, method string, configure func(*resty.Request), out any) error {
 	return d.requestOnce(ctx, rawURL, method, configure, out, true)
 }
@@ -741,3 +752,4 @@ func guessMime(name string) string {
 }
 
 var _ drives.Drive = (*Driver)(nil)
+var _ drives.Remover = (*Driver)(nil)

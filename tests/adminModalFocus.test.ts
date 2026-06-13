@@ -15,3 +15,9 @@ test("admin modal does not reset focus when close handler identity changes", () 
   assert.match(modalSource, /\}, \[open\]\);/);
   assert.doesNotMatch(modalSource, /\}, \[open, onClose\]\);/);
 });
+
+test("admin modal backdrop clicks do not close dialogs", () => {
+  assert.match(modalSource, /className="admin-modal-backdrop"/);
+  assert.doesNotMatch(modalSource, /onMouseDown=\{\(e\) =>/);
+  assert.doesNotMatch(modalSource, /e\.target === e\.currentTarget/);
+});

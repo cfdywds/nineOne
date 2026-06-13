@@ -113,11 +113,11 @@ export function P123QRCodeLogin({ onToken }: { onToken: (token: string) => void 
             <img
               className="admin-p123-qr__image"
               src={session.qrImageDataUrl}
-              alt="123 云盘扫码登录二维码"
+              alt="123网盘扫码登录二维码"
             />
             <div className="admin-p123-qr__meta">
               <div className="admin-form__help">
-                使用微信或 123 云盘 App 扫码并确认登录；确认后系统会自动填入 access_token。
+                使用微信或 123网盘 App 扫码并确认登录；确认后系统会自动填入 access_token。
               </div>
               {session.expiresAt && (
                 <div className="admin-form__help">

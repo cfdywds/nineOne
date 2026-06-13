@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/video-site/backend/internal/auth"
 	"github.com/video-site/backend/internal/catalog"
+	"github.com/video-site/backend/internal/drives"
 	"github.com/video-site/backend/internal/mediaasset"
 	"github.com/video-site/backend/internal/proxy"
 )
@@ -67,6 +69,68 @@ func TestVideoSourceKeepsDirectStreamForMp4(t *testing.T) {
 	}
 }
 
+func TestVideoURLsEscapePathSegments(t *testing.T) {
+	updated := time.UnixMilli(1778863000123)
+	v := &catalog.Video{
+		ID:        "wopan-drive-fid/with space",
+		DriveID:   "drive-1",
+		FileID:    "fid/with space",
+		Title:     "Video",
+		UpdatedAt: updated,
+	}
+
+	dto := mapVideo(v)
+	if dto.Href != "/video/wopan-drive-fid%2Fwith%20space" {
+		t.Fatalf("href = %q, want escaped video id", dto.Href)
+	}
+	if dto.PreviewSrc != "/p/preview/wopan-drive-fid%2Fwith%20space?v=1778863000123" {
+		t.Fatalf("preview = %q, want escaped video id", dto.PreviewSrc)
+	}
+	if dto.Thumbnail != "/p/thumb/wopan-drive-fid%2Fwith%20space?v=1778863000123" {
+		t.Fatalf("thumbnail = %q, want escaped video id", dto.Thumbnail)
+	}
+	if got := videoSource(v); got != "/p/stream/drive-1/fid%2Fwith%20space" {
+		t.Fatalf("video source = %q, want escaped file id", got)
+	}
+}
+
+func TestThumbnailURLRewritesStoredLocalURLForUnsafeVideoID(t *testing.T) {
+	got := thumbnailURL(&catalog.Video{
+		ID:           "wopan-drive-fid/with space",
+		ThumbnailURL: "/p/thumb/wopan-drive-fid/with space",
+		UpdatedAt:    time.UnixMilli(1778863000123),
+	})
+
+	if got != "/p/thumb/wopan-drive-fid%2Fwith%20space?v=1778863000123" {
+		t.Fatalf("thumbnail URL = %q, want escaped local URL", got)
+	}
+}
+
+func TestHandleStreamDecodesEscapedWildcardFileID(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "video.mp4")
+	if err := os.WriteFile(local, []byte("ok"), 0o644); err != nil {
+		t.Fatalf("write local video: %v", err)
+	}
+	drv := &apiStreamFakeDrive{localPath: local}
+	reg := proxy.NewRegistry()
+	reg.Set("drive-1", drv)
+	srv := &Server{Proxy: proxy.New(reg)}
+
+	router := chi.NewRouter()
+	router.Get("/p/stream/{driveID}/*", srv.handleStream)
+	req := httptest.NewRequest(http.MethodGet, "/p/stream/drive-1/fid%2Fwith%20space", nil)
+	rr := httptest.NewRecorder()
+
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if drv.fileID != "fid/with space" {
+		t.Fatalf("fileID = %q, want decoded original", drv.fileID)
+	}
+}
+
 func TestVideoSourceUsesLocalUploadRoute(t *testing.T) {
 	v := &catalog.Video{
 		ID:      "video-1",
@@ -98,6 +162,49 @@ func TestPreviewURLFallsBackWithoutUpdatedAt(t *testing.T) {
 
 	if got != "/p/preview/video-1" {
 		t.Fatalf("preview URL = %q, want unversioned URL", got)
+	}
+}
+
+func TestHandleVideoDetailDecodesEscapedVideoID(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:          "wopan-drive-fid/with space",
+		DriveID:     "drive-1",
+		FileID:      "fid/with space",
+		Title:       "Video",
+		PublishedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+
+	router := chi.NewRouter()
+	router.Get("/api/video/{id}", (&Server{Catalog: cat}).handleVideoDetail)
+	req := httptest.NewRequest(http.MethodGet, "/api/video/wopan-drive-fid%2Fwith%20space", nil)
+	rr := httptest.NewRecorder()
+
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got VideoDetailDTO
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.ID != "wopan-drive-fid/with space" {
+		t.Fatalf("id = %q, want original video id", got.ID)
 	}
 }
 
@@ -1211,7 +1318,7 @@ func TestHandleTagsReturnsUnifiedTagPool(t *testing.T) {
 	}
 }
 
-func TestHandleShortsNextUsesPreferredVideoLeastPopulatedTag(t *testing.T) {
+func TestHandleShortsNextReturnsRandomBatchExcludingSeen(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -1235,7 +1342,7 @@ func TestHandleShortsNextUsesPreferredVideoLeastPopulatedTag(t *testing.T) {
 		}
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/shorts/next", strings.NewReader(`{"seenIds":["current"],"count":3,"preferredFromVideoId":"current"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/shorts/next", strings.NewReader(`{"seenIds":["current"],"count":3}`))
 	rr := httptest.NewRecorder()
 	(&Server{Catalog: cat}).handleShortsNext(rr, req)
 
@@ -1258,16 +1365,83 @@ func TestHandleShortsNextUsesPreferredVideoLeastPopulatedTag(t *testing.T) {
 		t.Fatalf("total = %d, want 4", got.Total)
 	}
 	if got.RoundComplete {
-		t.Fatalf("roundComplete = true, want false with fallback-filled batch")
-	}
-	if !containsString(ids, "rare-1") {
-		t.Fatalf("ids = %#v, want rare-1 from least populated tag", ids)
+		t.Fatalf("roundComplete = true, want false with a full remaining batch")
 	}
 	if containsString(ids, "current") {
 		t.Fatalf("ids = %#v, should exclude current", ids)
 	}
 	if len(ids) != 3 {
 		t.Fatalf("ids = %#v, want 3 items", ids)
+	}
+	for _, want := range []string{"common-1", "common-2", "rare-1"} {
+		if !containsString(ids, want) {
+			t.Fatalf("ids = %#v, want remaining id %s", ids, want)
+		}
+	}
+}
+
+func TestHandleShortsNextDoesNotResetForStaleSeenIDs(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	for _, v := range []*catalog.Video{
+		{ID: "seen-1", DriveID: "drive", FileID: "f-seen-1", Title: "seen 1", PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "fresh-1", DriveID: "drive", FileID: "f-fresh-1", Title: "fresh 1", PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "fresh-2", DriveID: "drive", FileID: "f-fresh-2", Title: "fresh 2", PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "hidden-1", DriveID: "drive", FileID: "f-hidden-1", Title: "hidden 1", PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed %s: %v", v.ID, err)
+		}
+	}
+	if err := cat.HideVideo(ctx, "hidden-1"); err != nil {
+		t.Fatalf("hide hidden-1: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/shorts/next", strings.NewReader(`{"seenIds":["seen-1","hidden-1","deleted-stale"],"count":3}`))
+	rr := httptest.NewRecorder()
+	(&Server{Catalog: cat}).handleShortsNext(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Items         []ShortsItemDTO `json:"items"`
+		Total         int             `json:"total"`
+		RoundComplete bool            `json:"roundComplete"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	ids := make([]string, 0, len(got.Items))
+	for _, item := range got.Items {
+		ids = append(ids, item.ID)
+	}
+	if got.Total != 3 {
+		t.Fatalf("total = %d, want 3", got.Total)
+	}
+	if !got.RoundComplete {
+		t.Fatalf("roundComplete = false, want true after returning all unviewed visible videos")
+	}
+	if containsString(ids, "seen-1") || containsString(ids, "hidden-1") {
+		t.Fatalf("ids = %#v, should not reset and return seen or hidden videos", ids)
+	}
+	for _, want := range []string{"fresh-1", "fresh-2"} {
+		if !containsString(ids, want) {
+			t.Fatalf("ids = %#v, want %s", ids, want)
+		}
+	}
+	if len(ids) != 2 {
+		t.Fatalf("ids = %#v, want exactly the two unviewed visible videos", ids)
 	}
 }
 
@@ -1591,6 +1765,37 @@ func sameStringSet(a, b []string) bool {
 	}
 	return true
 }
+
+type apiStreamFakeDrive struct {
+	localPath string
+	fileID    string
+}
+
+func (d *apiStreamFakeDrive) Kind() string { return "fake" }
+func (d *apiStreamFakeDrive) ID() string   { return "drive-1" }
+func (d *apiStreamFakeDrive) Init(context.Context) error {
+	return nil
+}
+func (d *apiStreamFakeDrive) List(context.Context, string) ([]drives.Entry, error) {
+	return nil, drives.ErrNotSupported
+}
+func (d *apiStreamFakeDrive) Stat(context.Context, string) (*drives.Entry, error) {
+	return nil, drives.ErrNotSupported
+}
+func (d *apiStreamFakeDrive) StreamURL(_ context.Context, fileID string) (*drives.StreamLink, error) {
+	d.fileID = fileID
+	return &drives.StreamLink{
+		URL:     d.localPath,
+		Expires: time.Now().Add(time.Minute),
+	}, nil
+}
+func (d *apiStreamFakeDrive) Upload(context.Context, string, string, io.Reader, int64) (string, error) {
+	return "", drives.ErrNotSupported
+}
+func (d *apiStreamFakeDrive) EnsureDir(context.Context, string) (string, error) {
+	return "", drives.ErrNotSupported
+}
+func (d *apiStreamFakeDrive) RootID() string { return "root" }
 
 func requestWithVideoID(method, target, videoID string, body *strings.Reader) *http.Request {
 	return requestWithRouteParam(method, target, "id", videoID, body)

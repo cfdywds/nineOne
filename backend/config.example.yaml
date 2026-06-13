@@ -36,11 +36,8 @@ scanner:
   video_extensions: [".mp4", ".mkv", ".mov", ".webm", ".avi", ".strm"]
 
 nightly:
-  # 凌晨流水线触发整点（0-23），默认 1 即每天 01:00。流程：
-  #   Phase 1  扫所有非 spider91 / 非 localupload 网盘 → 检测新增 / 删除
-  #            → 入队封面和预览视频 → 等所有队列 idle
-  #   Phase 2  spider91 爬虫（如配置）→ 入队预览视频 → 等队列 idle
-  #   Phase 3  spider91 → 云盘迁移（一次性 sweep）
+  # 凌晨流水线触发整点（0-23），默认 1 即每天 01:00。
+  # 运行时会统一编排扫描、媒体资产生成和后续清理任务。
   cron_hour: 1
   # 单次流水线总耗时上限（软超时）；超过后当前 phase 跑完不启动后续 phase。
   max_duration: 6h
@@ -74,6 +71,11 @@ preview:
 #   root_id: "root"
 #   params:
 #     refresh_token: "..."
+#     # 默认 use_online_api=true，会使用 OpenList 在线续期 API。
+#     # 如需使用自己创建的 Google OAuth 客户端，取消下面三行注释：
+#     # use_online_api: "false"
+#     # client_id: "..."
+#     # client_secret: "..."
 # 本地存储示例：
 # - id: "local-media"
 #   kind: "localstorage"

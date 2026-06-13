@@ -167,6 +167,46 @@ func (d *Driver) EnsureDir(ctx context.Context, pathFromRoot string) (string, er
 	return "", drives.ErrNotSupported
 }
 
+func (d *Driver) Remove(ctx context.Context, fileID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	videoPath, err := d.VideoPath(fileID)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(videoPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			removeThumbCandidates(d.ThumbPath, strings.TrimSuffix(fileID, filepath.Ext(fileID)))
+			return nil
+		}
+		return err
+	}
+	if info.IsDir() {
+		return errors.New("spider91: refusing to remove directory")
+	}
+	if err := os.Remove(videoPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	removeThumbCandidates(d.ThumbPath, strings.TrimSuffix(fileID, filepath.Ext(fileID)))
+	return nil
+}
+
+func removeThumbCandidates(pathFor func(string) (string, error), stem string) {
+	stem = strings.TrimSpace(stem)
+	if stem == "" {
+		return
+	}
+	for _, ext := range []string{".jpg", ".jpeg", ".png", ".webp"} {
+		path, err := pathFor(stem + ext)
+		if err != nil {
+			continue
+		}
+		_ = os.Remove(path)
+	}
+}
+
 // safeJoin 把 fileID 拼到 root 下，保证最终路径不会逃出 root。
 // fileID 必须是单纯的文件名（不含 / 或 .. 等组件）。
 func safeJoin(root, fileID string) (string, error) {
@@ -192,3 +232,4 @@ func safeJoin(root, fileID string) (string, error) {
 }
 
 var _ drives.Drive = (*Driver)(nil)
+var _ drives.Remover = (*Driver)(nil)

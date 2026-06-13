@@ -16,23 +16,23 @@ import (
 )
 
 const (
-	defaultUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch"
+	defaultUA      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch"
 	defaultReferer = "https://pan.quark.cn"
 	defaultAPI     = "https://drive.quark.cn/1/clouddrive"
 	defaultPR      = "ucpro"
 )
 
 type Driver struct {
-	id                     string
-	cookie                 string
-	rootID                 string
-	ua                     string
-	referer                string
-	apiBase                string
-	pr                     string
-	client                 *resty.Client
-	onCookieUpdate         func(string)
-	useTranscodingAddress  bool
+	id                    string
+	cookie                string
+	rootID                string
+	ua                    string
+	referer               string
+	apiBase               string
+	pr                    string
+	client                *resty.Client
+	onCookieUpdate        func(string)
+	useTranscodingAddress bool
 }
 
 type Config struct {
@@ -60,7 +60,7 @@ func New(c Config) *Driver {
 		onCookieUpdate:        c.OnCookieUpdate,
 	}
 	d.client = resty.New().
-		SetTimeout(30 * time.Second).
+		SetTimeout(30*time.Second).
 		SetHeader("Accept", "application/json, text/plain, */*").
 		SetHeader("Referer", d.referer).
 		SetHeader("User-Agent", d.ua)
@@ -269,6 +269,22 @@ func (d *Driver) Upload(ctx context.Context, parentID, name string, r io.Reader,
 	return "", drives.ErrNotSupported
 }
 
+func (d *Driver) Remove(ctx context.Context, fileID string) error {
+	fileID = strings.TrimSpace(fileID)
+	if fileID == "" {
+		return errors.New("quark remove: empty file id")
+	}
+	body := map[string]any{
+		"action_type":  1,
+		"exclude_fids": []string{},
+		"filelist":     []string{fileID},
+	}
+	if err := d.request(ctx, "/file/delete", http.MethodPost, nil, body, nil); err != nil {
+		return fmt.Errorf("quark remove: %w", err)
+	}
+	return nil
+}
+
 // ---------- helpers ----------
 
 func fileToEntry(f *file, parentID string) drives.Entry {
@@ -343,3 +359,4 @@ func setCookieValue(cookie, key, value string) string {
 }
 
 var _ drives.Drive = (*Driver)(nil)
+var _ drives.Remover = (*Driver)(nil)

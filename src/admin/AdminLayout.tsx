@@ -14,6 +14,7 @@ import {
 import * as api from "./api";
 import { useAuth } from "./AuthContext";
 import { useToast } from "./ToastContext";
+import { SpiderIcon } from "./icons/SpiderIcon";
 
 export function AdminLayout() {
   const { logout } = useAuth();
@@ -77,41 +78,79 @@ export function AdminLayout() {
           <span className="admin-sidebar__brand-text">91后台</span>
         </div>
         <nav className="admin-nav">
-          <NavLink to="/" className="admin-nav__link">
-            <Home size={16} /> 返回主站
-          </NavLink>
-          <NavLink
-            to="/admin/drives"
-            className={({ isActive }) =>
-              `admin-nav__link ${isActive ? "is-active" : ""}`
-            }
-          >
-            <HardDrive size={16} /> 网盘管理
-          </NavLink>
-          <NavLink
-            to="/admin/videos"
-            className={({ isActive }) =>
-              `admin-nav__link ${isActive ? "is-active" : ""}`
-            }
-          >
-            <Film size={16} /> 视频管理
-          </NavLink>
-          <NavLink
-            to="/admin/tags"
-            className={({ isActive }) =>
-              `admin-nav__link ${isActive ? "is-active" : ""}`
-            }
-          >
-            <Tags size={16} /> 标签管理
-          </NavLink>
-          <NavLink
-            to="/admin/theme"
-            className={({ isActive }) =>
-              `admin-nav__link ${isActive ? "is-active" : ""}`
-            }
-          >
-            <Palette size={16} /> 主题外观
-          </NavLink>
+          <div className="admin-nav__group admin-nav__group--home">
+            <span className="admin-nav__group-label">主站</span>
+            <NavLink to="/" className="admin-nav__link">
+              <span className="admin-nav__icon"><Home size={16} /></span>
+              <span className="admin-nav__text">
+                <span className="admin-nav__title">返回主站</span>
+              </span>
+            </NavLink>
+          </div>
+          <div className="admin-nav__group">
+            <span className="admin-nav__group-label">资源</span>
+            <NavLink
+              to="/admin/drives"
+              className={({ isActive }) =>
+                `admin-nav__link ${isActive ? "is-active" : ""}`
+              }
+            >
+              <span className="admin-nav__icon"><HardDrive size={16} /></span>
+              <span className="admin-nav__text">
+                <span className="admin-nav__title">网盘管理</span>
+              </span>
+            </NavLink>
+            <NavLink
+              to="/admin/crawlers"
+              className={({ isActive }) =>
+                `admin-nav__link ${isActive ? "is-active" : ""}`
+              }
+            >
+              <span className="admin-nav__icon"><SpiderIcon size={16} /></span>
+              <span className="admin-nav__text">
+                <span className="admin-nav__title">爬虫管理</span>
+              </span>
+            </NavLink>
+          </div>
+          <div className="admin-nav__group">
+            <span className="admin-nav__group-label">管理</span>
+            <NavLink
+              to="/admin/videos"
+              className={({ isActive }) =>
+                `admin-nav__link ${isActive ? "is-active" : ""}`
+              }
+            >
+              <span className="admin-nav__icon"><Film size={16} /></span>
+              <span className="admin-nav__text">
+                <span className="admin-nav__title">视频管理</span>
+              </span>
+            </NavLink>
+            <NavLink
+              to="/admin/tags"
+              className={({ isActive }) =>
+                `admin-nav__link ${isActive ? "is-active" : ""}`
+              }
+            >
+              <span className="admin-nav__icon"><Tags size={16} /></span>
+              <span className="admin-nav__text">
+                <span className="admin-nav__title">标签管理</span>
+              </span>
+            </NavLink>
+          </div>
+          <div className="admin-nav__group">
+            <span className="admin-nav__group-label">系统</span>
+            <NavLink
+              to="/admin/theme"
+              className={({ isActive }) =>
+                `admin-nav__link ${isActive ? "is-active" : ""}`
+              }
+            >
+              <span className="admin-nav__icon"><Palette size={16} /></span>
+              <span className="admin-nav__text">
+                <span className="admin-nav__title">主题外观</span>
+              </span>
+            </NavLink>
+          </div>
         </nav>
         <div className="admin-sidebar__footer">
           <button
@@ -139,6 +178,9 @@ export function AdminLayout() {
         <div className="admin-sidebar__mobile-overlay" onClick={() => setMobileMenuOpen(false)} />
       )}
       <div className={`admin-sidebar__mobile-panel${mobileMenuOpen ? " is-open" : ""}`}>
+        <NavLink to="/" className="admin-sidebar__home" onClick={() => setMobileMenuOpen(false)}>
+          <Home size={14} /> 返回主站
+        </NavLink>
         <button
           className="admin-sidebar__check-update"
           onClick={() => { handleCheckUpdate(); setMobileMenuOpen(false); }}

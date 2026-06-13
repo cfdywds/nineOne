@@ -10,6 +10,18 @@ const driveComponentsSource = readFileSync(
   new URL("../src/admin/drive/DriveComponents.tsx", import.meta.url),
   "utf8"
 );
+const crawlerPageSource = readFileSync(
+  new URL("../src/admin/CrawlersPage.tsx", import.meta.url),
+  "utf8"
+);
+const adminLayoutSource = readFileSync(
+  new URL("../src/admin/AdminLayout.tsx", import.meta.url),
+  "utf8"
+);
+const appSource = readFileSync(
+  new URL("../src/App.tsx", import.meta.url),
+  "utf8"
+);
 const spider91UploadTargetSource = readFileSync(
   new URL("../src/admin/drive/Spider91UploadTargetField.tsx", import.meta.url),
   "utf8"
@@ -51,21 +63,15 @@ function assertDriveTypeOption(value: string, label: string) {
   );
 }
 
-test("spider91 drive form does not expose advanced crawler credentials", () => {
-  const match =
-    /case "spider91":\s*return \[([\s\S]*?)\];\s*case "spiderxvideos":/.exec(
-      combinedSource
-    );
-  assert.ok(match, "spider91 credential field block should be present");
-  const fields = match[1];
-
-  assert.match(fields, /key: "proxy"/);
-  assert.match(fields, /label: "代理地址（可选）"/);
-  assert.match(fields, /支持 http:\/\/、https:\/\/、socks5:\/\/、socks5h:\/\/代理/);
-  assert.doesNotMatch(fields, /target_new/);
-  assert.doesNotMatch(fields, /crawl_hour/);
-  assert.doesNotMatch(fields, /python_path/);
-  assert.doesNotMatch(fields, /script_path/);
+test("crawler sources are not selectable as storage drives", () => {
+  assert.ok(
+    !driveTypeOptions().some((option) => option.value === "spider91"),
+    "spider91 should not be a storage drive option"
+  );
+  assert.ok(
+    !driveTypeOptions().some((option) => option.value === "scriptcrawler"),
+    "scriptcrawler should not be a storage drive option"
+  );
 });
 
 test("xvideos drive form exposes editable crawler config and rehydrates saved values", () => {
@@ -95,7 +101,7 @@ test("xvideos drive form exposes editable crawler config and rehydrates saved va
   assert.match(apiSource, /spiderCrawlerConfig\?: Record<string, string>/);
   assert.match(
     drivesPageSource,
-    /creds: d\.spiderCrawlerConfig \? \{ \.\.\.d\.spiderCrawlerConfig \} : d\.kind === "spider91"/
+    /d\.spiderCrawlerConfig\s*\?\s*\{ \.\.\.d\.spiderCrawlerConfig \}/
   );
 });
 
@@ -119,8 +125,9 @@ test("spider91 upload target uses explicit local-save option instead of auto tar
   assert.match(combinedSource, /本地保存，不上传/);
   assert.match(
     combinedSource,
-    /d\.kind === "pikpak" \|\| d\.kind === "p115" \|\| d\.kind === "p123" \|\| d\.kind === "onedrive"/
+    /d\.kind === "pikpak"[\s\S]*d\.kind === "p115"[\s\S]*d\.kind === "p123"[\s\S]*d\.kind === "onedrive"[\s\S]*d\.kind === "googledrive"[\s\S]*d\.kind === "wopan"/
   );
+  assert.match(crawlerPageSource, /UPLOAD_TARGET_KINDS[\s\S]*"wopan"/);
   assert.doesNotMatch(combinedSource, /自动：唯一/);
   assert.doesNotMatch(combinedSource, /自动模式/);
   assert.doesNotMatch(combinedSource, /较早的视频会上传到该云盘根目录下的 91 Spider 文件夹/);
@@ -166,7 +173,7 @@ test("onedrive drive form only exposes required default-app fields", () => {
   assert.doesNotMatch(fields, /key: "site_id"/);
 });
 
-test("googledrive drive form only exposes refresh token", () => {
+test("googledrive drive form supports online API and custom OAuth client modes", () => {
   assertDriveTypeOption("googledrive", "Google Drive");
 
   const match =
@@ -177,10 +184,25 @@ test("googledrive drive form only exposes refresh token", () => {
   const fields = match[1];
 
   assert.match(fields, /key: "refresh_token"/);
-  assert.doesNotMatch(fields, /key: "access_token"/);
+  assert.match(fields, /key: "use_online_api"/);
+  assert.match(fields, /type: "select"/);
+  assert.match(fields, /defaultValue: "true"/);
+  assert.match(fields, /OpenList 在线 API/);
+  assert.match(fields, /自建 Google OAuth 客户端/);
+  assert.match(fields, /key: "client_id"/);
+  assert.match(fields, /key: "client_secret"/);
+  assert.match(fields, /googleDriveUsesOnlineAPI\(creds\)/);
   assert.doesNotMatch(fields, /key: "api_url_address"/);
-  assert.doesNotMatch(fields, /key: "client_id"/);
-  assert.doesNotMatch(fields, /key: "client_secret"/);
+  assert.doesNotMatch(fields, /在线 API 模式填写 OpenList 获取的 refresh_token/);
+  assert.doesNotMatch(constantsSource, /请参考OpenList文档中关于谷歌云盘的配置方法。/);
+  assert.doesNotMatch(constantsSource, /选择自建 Google OAuth 客户端后，服务端会直接请求 Google OAuth token 接口续期。/);
+  assert.match(driveFormSource, /<select/);
+  assert.match(driveFormSource, /value=\{form\.creds\[f\.key\] \?\? f\.defaultValue \?\? ""\}/);
+  assert.match(driveFormSource, /className="admin-form-select"/);
+  assert.match(driveFormSource, /ChevronDown/);
+  assert.match(drivesPageSource, /googleDriveUseOnlineAPI/);
+  assert.match(apiSource, /googleDriveUseOnlineAPI\?: boolean/);
+  assert.doesNotMatch(fields, /key: "access_token"/);
 });
 
 test("pikpak drive form only exposes account login fields", () => {
@@ -219,16 +241,77 @@ test("localstorage drive form asks for a server directory path", () => {
 test("drive type selector keeps primary source order", () => {
   assert.deepEqual(driveTypeOptions(), [
     { value: "p115", label: "115 网盘" },
-    { value: "p123", label: "123 云盘" },
+    { value: "p123", label: "123网盘" },
     { value: "pikpak", label: "PikPak" },
     { value: "onedrive", label: "OneDrive" },
     { value: "googledrive", label: "Google Drive" },
     { value: "localstorage", label: "本地存储" },
-    { value: "spider91", label: "91 爬虫" },
     { value: "spiderxvideos", label: "XVideos Spider" },
     { value: "quark", label: "夸克网盘" },
-    { value: "wopan", label: "联通沃盘" },
+    { value: "wopan", label: "联通网盘" },
   ]);
+});
+
+test("crawler management is a separate admin section", () => {
+  assert.match(adminLayoutSource, /to="\/admin\/crawlers"/);
+  assert.match(adminLayoutSource, /admin-nav__title">爬虫管理/);
+  assert.match(adminLayoutSource, /admin-nav__icon"><SpiderIcon size=\{16\} \/>/);
+  assert.match(appSource, /path="crawlers" element=\{<CrawlersPage \/>/);
+  assert.match(crawlerPageSource, /export function CrawlersPage/);
+  assert.match(crawlerPageSource, /SpiderIcon/);
+  assert.match(crawlerPageSource, /添加爬虫/);
+  // 新设计：列表 + Modal 三步编辑器，删除确认走 ConfirmModal，任务进行中自动轮询
+  assert.match(crawlerPageSource, /CrawlerEditorModal/);
+  assert.match(crawlerPageSource, /ConfirmModal/);
+  assert.doesNotMatch(crawlerPageSource, /window\.confirm/);
+  assert.match(crawlerPageSource, /POLL_INTERVAL_MS/);
+  assert.match(crawlerPageSource, /api\.listCrawlers/);
+  assert.match(crawlerPageSource, /api\.listDrives/);
+  assert.match(crawlerPageSource, /api\.upsertCrawler/);
+  assert.match(crawlerPageSource, /api\.runCrawler/);
+  assert.match(crawlerPageSource, /api\.stopCrawlerTasks/);
+  assert.match(crawlerPageSource, /api\.deleteCrawler/);
+  assert.match(crawlerPageSource, /api\.importCrawlerScriptFile/);
+  assert.match(crawlerPageSource, /api\.importCrawlerScriptURL/);
+  assert.match(crawlerPageSource, /api\.testCrawlerScript/);
+  assert.match(crawlerPageSource, /type="file"/);
+  assert.match(crawlerPageSource, /链接导入/);
+  assert.match(crawlerPageSource, /测试脚本/);
+  assert.match(crawlerPageSource, /测试通过/);
+  assert.match(crawlerPageSource, /Spider91UploadTargetField/);
+  assert.match(crawlerPageSource, /uploadDriveId/);
+  assert.match(crawlerPageSource, /UPLOAD_TARGET_KINDS/);
+  assert.doesNotMatch(crawlerPageSource, /新建脚本/);
+  assert.doesNotMatch(crawlerPageSource, /爬虫 ID/);
+  assert.doesNotMatch(crawlerPageSource, /crawler-id/);
+  assert.doesNotMatch(crawlerPageSource, /crawler-name/);
+  // 脚本路径只读展示，不允许手动填写
+  assert.doesNotMatch(crawlerPageSource, /crawler-script-path/);
+  assert.doesNotMatch(crawlerPageSource, /Python 解释器/);
+  assert.doesNotMatch(crawlerPageSource, /自定义配置 JSON/);
+  assert.doesNotMatch(crawlerPageSource, /Bot/);
+  // 项目不再内置任何爬虫：不允许出现内置 91 预设
+  assert.doesNotMatch(crawlerPageSource, /builtin/);
+  assert.doesNotMatch(crawlerPageSource, /内置 91/);
+  assert.match(apiSource, /type AdminCrawler/);
+  assert.match(apiSource, /uploadDriveId\?: string/);
+  assert.match(apiSource, /"\/crawlers"/);
+  assert.match(apiSource, /"\/crawlers\/import-file"/);
+  assert.match(apiSource, /"\/crawlers\/import-url"/);
+  assert.match(apiSource, /"\/crawlers\/test-script"/);
+  assert.match(apiSource, /type CrawlerDryRunResult/);
+  assert.match(apiSource, /id\?: string/);
+  assert.match(apiSource, /new FormData\(\)/);
+  assert.doesNotMatch(driveFormSource, /scriptcrawler/);
+});
+
+test("drive cards use configured abbreviations and visible fallback icon colors", () => {
+  assert.match(constantsSource, /googledrive:\s*"GD"/);
+  assert.match(constantsSource, /function driveKindAbbr\(kind: string\)/);
+  assert.match(constantsSource, /\.slice\(0, 2\)\.toUpperCase\(\)/);
+  assert.match(drivesPageSource, /driveKindAbbr\(d\.kind\)/);
+  assert.match(adminCss, /\.admin-drive-card__brand-icon\s*\{[^}]*background:\s*var\(--accent\);/s);
+  assert.match(adminCss, /\.admin-drive-card__brand-icon\[data-kind="googledrive"\]\s*\{\s*background:\s*#4285f4;\s*\}/);
 });
 
 test("drive management exposes stop task controls", () => {
@@ -239,6 +322,43 @@ test("drive management exposes stop task controls", () => {
   assert.match(drivesPageSource, /is-stop/);
   assert.match(drivesPageSource, /停止所有任务/);
   assert.match(drivesPageSource, /停止所有网盘任务/);
+});
+
+test("drive rescan reports busy storage tasks instead of queueing duplicates", () => {
+  assert.match(apiSource, /accepted:\s*boolean;\s*message\?:\s*string/);
+  assert.match(apiSource, /scanGenerationStatus\?: DriveGenerationStatus/);
+  assert.match(drivesPageSource, /当前存储有正在进行的任务，请稍后重试/);
+  assert.match(drivesPageSource, /function isDriveBusy\(d: api\.AdminDrive\)/);
+  assert.match(drivesPageSource, /d\.scanGenerationStatus/);
+  assert.match(drivesPageSource, /status\?\.state \|\| "idle"/);
+  assert.match(drivesPageSource, /scanningDriveIdsRef\.current\.has\(d\.id\)/);
+  assert.match(drivesPageSource, /if \(!resp\.accepted\)/);
+  assert.doesNotMatch(drivesPageSource, /disabled=\{!!scanningDriveId\}/);
+});
+
+test("nightly scan duplicate trigger uses full-scan busy message", () => {
+  assert.match(apiSource, /status:\s*NightlyJobStatus;\s*message\?:\s*string/);
+  assert.match(drivesPageSource, /当前有全量扫描任务正在进行，请稍后重试/);
+  assert.match(drivesPageSource, /resp\.message \|\| NIGHTLY_BUSY_MESSAGE/);
+  assert.match(constantsSource, /当前有全量扫描任务正在进行，请稍后重试/);
+});
+
+test("drive generation panel shows scan or crawler status first", () => {
+  assert.match(driveComponentsSource, /label=\{d\.kind === "spider91" \? "已废弃" : "扫盘"\}/);
+  assert.match(driveComponentsSource, /status=\{d\.scanGenerationStatus\}/);
+  assert.match(driveComponentsSource, /showCounts=\{false\}/);
+  assert.match(driveComponentsSource, /status\?\.scannedCount/);
+  assert.match(driveComponentsSource, /预计新增/);
+  assert.match(apiSource, /scannedCount:\s*number/);
+  assert.match(apiSource, /addedCount:\s*number/);
+  assert.match(constantsSource, /if \(state === "scanning"\) return "扫盘中"/);
+});
+
+test("legacy spider91 storage is disabled in drive management", () => {
+  assert.match(drivesPageSource, /91Spider 不再支持通过网盘运行，请到爬虫管理添加爬虫脚本/);
+  assert.match(drivesPageSource, /disabled=\{d\.kind === "spider91"\}/);
+  assert.match(drivesPageSource, /已废弃，请到爬虫管理添加/);
+  assert.match(constantsSource, /91Spider 不再支持通过网盘添加或编辑/);
 });
 
 test("drive detail selection is stored in the URL history", () => {

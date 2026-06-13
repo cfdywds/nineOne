@@ -78,11 +78,37 @@ func (d *Driver) EnsureDir(context.Context, string) (string, error) {
 	return "", drives.ErrNotSupported
 }
 
+func (d *Driver) Remove(ctx context.Context, fileID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	path, err := d.uploadPath(fileID)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if info.IsDir() {
+		return errors.New("localupload: refusing to remove directory")
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 func (d *Driver) RootID() string { return d.uploadDir() }
 
 func (d *Driver) uploadDir() string {
 	return d.uploadDirPath
 }
+
+var _ drives.Remover = (*Driver)(nil)
 
 func (d *Driver) uploadPath(fileID string) (string, error) {
 	if strings.TrimSpace(fileID) == "" || filepath.Base(fileID) != fileID {

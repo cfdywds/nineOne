@@ -91,6 +91,84 @@ func TestRunIgnoresZeroSizeVideoFiles(t *testing.T) {
 	}
 }
 
+func TestRunScannedCountsOnlyVideoCandidates(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	drv := &scannerFakeDrive{
+		entries: []drives.Entry{
+			{ID: "file-1", Name: "clip.mp4", Size: 123},
+			{ID: "file-2", Name: "notes.txt", Size: 123},
+			{ID: "file-3", Name: "empty.mp4", Size: 0},
+		},
+	}
+	sc := New(cat, drv, []string{".mp4"}, nil, nil)
+
+	stats, err := sc.Run(ctx, "")
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if stats.Scanned != 1 {
+		t.Fatalf("scanned = %d, want one non-empty video candidate", stats.Scanned)
+	}
+	if stats.Added != 1 {
+		t.Fatalf("added = %d, want one added video", stats.Added)
+	}
+}
+
+func TestRunUsesPathSafeVideoIDForUnsafeFileID(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	drv := &scannerFakeDrive{
+		entries: []drives.Entry{{
+			ID:   "fid/with space",
+			Name: "clip.mp4",
+			Size: 123,
+		}},
+	}
+	sc := New(cat, drv, []string{".mp4"}, nil, nil)
+
+	stats, err := sc.Run(ctx, "")
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if stats.Added != 1 {
+		t.Fatalf("added = %d, want 1", stats.Added)
+	}
+	if _, ok := stats.SeenFileIDs["fid/with space"]; !ok {
+		t.Fatalf("seen file ids = %#v, want original file id", stats.SeenFileIDs)
+	}
+
+	wantID := "fake-drive-b64_ZmlkL3dpdGggc3BhY2U"
+	got, err := cat.GetVideo(ctx, wantID)
+	if err != nil {
+		t.Fatalf("get video %s: %v", wantID, err)
+	}
+	if strings.Contains(got.ID, "/") {
+		t.Fatalf("video id = %q, must not contain slash", got.ID)
+	}
+	if got.FileID != "fid/with space" {
+		t.Fatalf("file id = %q, want original", got.FileID)
+	}
+}
+
 func TestRunStopsWhenContextCanceledDuringFileLoop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")

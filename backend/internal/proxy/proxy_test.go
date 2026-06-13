@@ -201,6 +201,31 @@ func TestServeStreamRedirectsP123(t *testing.T) {
 	}
 }
 
+func TestServeStreamRedirectsWopan(t *testing.T) {
+	reg := NewRegistry()
+	drv := &proxyFakeSimpleDrive{
+		kind: "wopan",
+		url:  "https://du.smartont.net:8445/openapi/download?fid=encoded",
+	}
+	reg.Set("wopan", drv)
+
+	p := New(reg)
+	req := httptest.NewRequest(http.MethodGet, "/p/stream/wopan/file-1", nil)
+	rr := httptest.NewRecorder()
+
+	p.ServeStream(rr, req, "wopan", "file-1")
+
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusFound)
+	}
+	if got := rr.Header().Get("Location"); got != "https://du.smartont.net:8445/openapi/download?fid=encoded" {
+		t.Fatalf("Location = %q", got)
+	}
+	if drv.calls != 1 {
+		t.Fatalf("link calls = %d, want 1", drv.calls)
+	}
+}
+
 func TestServeStreamServesLocalFilePath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "video.mp4")
 	if err := os.WriteFile(path, []byte("0123456789"), 0o644); err != nil {

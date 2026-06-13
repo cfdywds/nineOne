@@ -2,6 +2,7 @@ package fingerprint
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -82,6 +83,51 @@ func TestComputeRemoteUsesRangeSamples(t *testing.T) {
 	}
 	if fmt.Sprint(ranges) != fmt.Sprint(want) {
 		t.Fatalf("ranges = %#v, want %#v", ranges, want)
+	}
+}
+
+func TestComputeRemoteGoogleQuotaExceededReturnsRateLimit(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"code":403,"message":"The download quota for this file has been exceeded.","errors":[{"domain":"usageLimits","reason":"downloadQuotaExceeded","message":"The download quota for this file has been exceeded."}]}}`))
+	}))
+	defer srv.Close()
+
+	drv := &fakeDrive{paths: map[string]string{"remote": srv.URL + "/drive/v3/files/file-1?alt=media"}}
+	_, err := Compute(ctx, drv, &catalog.Video{ID: "remote", FileID: "remote", Size: 1024 * 1024}, Config{
+		SampleSizeBytes: 4,
+		FullHashMaxSize: 8,
+		HTTPClient:      srv.Client(),
+	}, srv.Client())
+	if err == nil {
+		t.Fatal("compute succeeded, want rate limit")
+	}
+	var rateLimit *drives.RateLimitError
+	if !errors.As(err, &rateLimit) {
+		t.Fatalf("error = %T %[1]v, want RateLimitError", err)
+	}
+	if rateLimit.RetryAfter != time.Minute {
+		t.Fatalf("retry after = %s, want 1m", rateLimit.RetryAfter)
+	}
+}
+
+func TestWopanRemoteRangeErrorsLookRateLimited(t *testing.T) {
+	for _, tc := range []struct {
+		rawURL string
+		status int
+	}{
+		{rawURL: "https://gxdownload.pan.wo.cn:8445/openapi/download?fid=encoded", status: http.StatusForbidden},
+		{rawURL: "https://du.smartont.net:8445/openapi/download?fid=encoded", status: http.StatusServiceUnavailable},
+		{rawURL: "https://du.smartont.net:8445/openapi/download?fid=encoded", status: 509},
+	} {
+		if !remoteRangeResponseLooksRateLimited(tc.rawURL, tc.status, nil) {
+			t.Fatalf("remoteRangeResponseLooksRateLimited(%q, %d) = false, want true", tc.rawURL, tc.status)
+		}
+	}
+	if remoteRangeResponseLooksRateLimited("https://example.com/video.mp4", http.StatusForbidden, nil) {
+		t.Fatal("generic 403 should not be treated as wopan rate limit")
 	}
 }
 

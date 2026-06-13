@@ -1,6 +1,7 @@
 import { useId, useMemo, useState } from "react";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, ChevronDown } from "lucide-react";
 import { P123QRCodeLogin } from "./P123QRCodeLogin";
+import { WopanQRCodeLogin } from "./WopanQRCodeLogin";
 import { Spider91UploadTargetField } from "./Spider91UploadTargetField";
 import {
   FormState,
@@ -22,15 +23,14 @@ type DriveOption = {
 
 const DRIVE_OPTIONS: DriveOption[] = [
   { kind: "p115", label: "115 网盘", abbr: "115", desc: "302直链，不占带宽" },
-  { kind: "p123", label: "123 云盘", abbr: "123", desc: "扫码登录，302直链" },
+  { kind: "p123", label: "123网盘", abbr: "123", desc: "扫码登录，302直链" },
   { kind: "pikpak", label: "PikPak", abbr: "Pk", desc: "302直链，稳定快速" },
   { kind: "onedrive", label: "OneDrive", abbr: "OD", desc: "302直链，微软网盘" },
   { kind: "googledrive", label: "Google Drive", abbr: "GD", desc: "服务器中转模式" },
   { kind: "localstorage", label: "本地存储", abbr: "Lo", desc: "本机文件目录" },
-  { kind: "spider91", label: "91 爬虫", abbr: "91", desc: "自动抓取热门视频" },
   { kind: "spiderxvideos", label: "XVideos Spider", abbr: "XV", desc: "按规则抓取 XVideos" },
   { kind: "quark", label: "夸克网盘", abbr: "Qk", desc: "302直链" },
-  { kind: "wopan", label: "联通沃盘", abbr: "Wo", desc: "302直链" },
+  { kind: "wopan", label: "联通网盘", abbr: "Wo", desc: "302直链" },
 ];
 
 export function DriveForm({
@@ -51,7 +51,7 @@ export function DriveForm({
   onBack?: () => void;
 }) {
   const idPrefix = useId();
-  const fields = useMemo(() => credentialFields(form.kind), [form.kind]);
+  const fields = useMemo(() => credentialFields(form.kind, form.creds), [form.kind, form.creds]);
   const help = credentialHelp(form.kind, isEdit);
   const [step, setStep] = useState<"type" | "form">(isEdit ? "form" : "type");
   const nameId = `${idPrefix}-drive-name`;
@@ -180,27 +180,71 @@ export function DriveForm({
             />
           )}
 
+          {form.kind === "wopan" && (
+            <WopanQRCodeLogin
+              onCredentials={(credentials) =>
+                onChange({
+                  ...form,
+                  creds: {
+                    ...form.creds,
+                    access_token: credentials.accessToken,
+                    refresh_token: credentials.refreshToken,
+                    ...(credentials.familyID ? { family_id: credentials.familyID } : {}),
+                  },
+                })
+              }
+            />
+          )}
+
           {fields.map((f) => (
             <div key={f.key} className="admin-form__row">
-              <label htmlFor={`${idPrefix}-credential-${f.key}`}>
-                {f.label}
-                {f.required && " *"}
-              </label>
-              {f.multiline ? (
-                <textarea
-                  id={`${idPrefix}-credential-${f.key}`}
-                  value={form.creds[f.key] ?? ""}
-                  onChange={(e) => setCred(f.key, e.target.value)}
-                  placeholder={f.placeholder}
-                />
+              {f.type === "select" ? (
+                <>
+                  <label htmlFor={`${idPrefix}-credential-${f.key}`}>
+                    {f.label}
+                    {f.required && " *"}
+                  </label>
+                  <div className="admin-form-select-wrap">
+                    <select
+                      id={`${idPrefix}-credential-${f.key}`}
+                      className="admin-form-select"
+                      value={form.creds[f.key] ?? f.defaultValue ?? ""}
+                      onChange={(e) => setCred(f.key, e.target.value)}
+                    >
+                      {(f.options ?? []).map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                    <ChevronDown size={15} className="admin-form-select__icon" aria-hidden="true" />
+                  </div>
+                </>
               ) : (
-                <input
-                  id={`${idPrefix}-credential-${f.key}`}
-                  type={credentialInputType(f.key)}
-                  value={form.creds[f.key] ?? ""}
-                  onChange={(e) => setCred(f.key, e.target.value)}
-                  placeholder={f.placeholder}
-                />
+                <>
+                  <label htmlFor={`${idPrefix}-credential-${f.key}`}>
+                    {f.label}
+                    {f.required && " *"}
+                  </label>
+                  {f.multiline ? (
+                    <textarea
+                      id={`${idPrefix}-credential-${f.key}`}
+                      value={form.creds[f.key] ?? ""}
+                      onChange={(e) => setCred(f.key, e.target.value)}
+                      placeholder={f.placeholder}
+                      required={f.required && !isEdit}
+                    />
+                  ) : (
+                    <input
+                      id={`${idPrefix}-credential-${f.key}`}
+                      type={credentialInputType(f.key)}
+                      value={form.creds[f.key] ?? ""}
+                      onChange={(e) => setCred(f.key, e.target.value)}
+                      placeholder={f.placeholder}
+                      required={f.required && !isEdit}
+                    />
+                  )}
+                </>
               )}
               {f.help && <div className="admin-form__help">{f.help}</div>}
             </div>

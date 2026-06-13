@@ -12,13 +12,14 @@ async function request<T>(
   path: string,
   init: RequestInit = {}
 ): Promise<T> {
+  const headers = new Headers(init.headers ?? {});
+  if (!(init.body instanceof FormData) && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
   const res = await fetch(BASE + path, {
     credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-      ...(init.headers ?? {}),
-    },
     ...init,
+    headers,
   });
   if (res.status === 401) {
     throw new UnauthorizedError();
@@ -97,6 +98,11 @@ export type AdminDrive = {
   spider91Proxy?: string;
   // spider crawler editable config returned for edit form rehydration.
   spiderCrawlerConfig?: Record<string, string>;
+  // Google Drive 是否使用 OpenList 在线续期 API；未配置时后端按 true 返回。
+  googleDriveUseOnlineAPI?: boolean;
+  // localstorage 的 .strm 是否允许指向存储根目录之外；未配置时后端按 false 返回。
+  strmAllowOutsideRoot?: boolean;
+  scanGenerationStatus?: DriveGenerationStatus;
   thumbnailGenerationStatus?: DriveGenerationStatus;
   previewGenerationStatus?: DriveGenerationStatus;
   fingerprintGenerationStatus?: DriveGenerationStatus;
@@ -110,6 +116,12 @@ export type AdminDrive = {
   fingerprintReadyCount: number;
   fingerprintPendingCount: number;
   fingerprintFailedCount: number;
+  // 浏览器兼容性转码：候选(待处理)/已转码/失败/检测后无需转码 计数与任务状态。
+  transcodeGenerationStatus?: DriveGenerationStatus;
+  transcodePendingCount: number;
+  transcodeReadyCount: number;
+  transcodeFailedCount: number;
+  transcodeSkippedCount: number;
 };
 
 export type DriveGenerationStatus = {
@@ -117,6 +129,10 @@ export type DriveGenerationStatus = {
   currentTitle?: string;
   queueLength: number;
   cooldownUntil?: string;
+  scannedCount: number;
+  addedCount: number;
+  doneCount: number;
+  totalCount: number;
 };
 
 export function listDrives() {
@@ -172,7 +188,7 @@ export function deleteDrive(id: string, body: DeleteDriveInput) {
 }
 
 export function rescan(id: string) {
-  return request<{ ok: boolean }>(
+  return request<{ ok: boolean; accepted: boolean; message?: string; status?: NightlyJobStatus }>(
     `/drives/${encodeURIComponent(id)}/rescan`,
     { method: "POST" }
   );
@@ -210,6 +226,134 @@ export function getDriveCrawlStatus(id: string) {
   );
 }
 
+// ---------- Crawlers ----------
+
+export type AdminCrawler = {
+  id: string;
+  name: string;
+  kind: "scriptcrawler" | "spider91";
+  status: string;
+  lastError?: string;
+  scriptPath: string;
+  scriptSourceUrl?: string;
+  proxy?: string;
+  targetNew?: string;
+  uploadDriveId?: string;
+  lastCrawlAt?: number;
+  scanGenerationStatus?: DriveGenerationStatus;
+  thumbnailGenerationStatus?: DriveGenerationStatus;
+  previewGenerationStatus?: DriveGenerationStatus;
+  fingerprintGenerationStatus?: DriveGenerationStatus;
+  uploadGenerationStatus?: DriveGenerationStatus;
+  thumbnailReadyCount: number;
+  thumbnailPendingCount: number;
+  thumbnailFailedCount: number;
+  teaserReadyCount: number;
+  teaserPendingCount: number;
+  teaserFailedCount: number;
+  fingerprintReadyCount: number;
+  fingerprintPendingCount: number;
+  fingerprintFailedCount: number;
+  totalCrawledCount: number;
+  localVideoCount: number;
+  migratedVideoCount: number;
+};
+
+export type UpsertCrawlerInput = {
+  id?: string;
+  scriptPath: string;
+  scriptSourceUrl?: string;
+  proxy?: string;
+  targetNew?: string;
+  uploadDriveId?: string;
+};
+
+export type ImportCrawlerScriptResult = {
+  scriptPath: string;
+  name: string;
+  sourceUrl?: string;
+};
+
+export type CrawlerDryRunItem = {
+  title: string;
+  sourceId?: string;
+  mediaUrl?: string;
+  mediaLocalFile?: string;
+  thumbnailUrl?: string;
+  detailUrl?: string;
+};
+
+export type CrawlerDryRunMediaCheck = {
+  ok: boolean;
+  status?: number;
+  contentType?: string;
+  contentLengthBytes?: number;
+  error?: string;
+};
+
+export type CrawlerDryRunResult = {
+  ok: boolean;
+  items: CrawlerDryRunItem[];
+  mediaCheck?: CrawlerDryRunMediaCheck;
+  error?: string;
+  log?: string[];
+  durationMs: number;
+};
+
+export function listCrawlers() {
+  return request<AdminCrawler[]>("/crawlers");
+}
+
+export function upsertCrawler(body: UpsertCrawlerInput) {
+  return request<{ ok: boolean; id: string; warning?: string }>("/crawlers", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function importCrawlerScriptFile(file: File) {
+  const form = new FormData();
+  form.append("file", file);
+  return request<ImportCrawlerScriptResult>("/crawlers/import-file", {
+    method: "POST",
+    body: form,
+  });
+}
+
+export function importCrawlerScriptURL(url: string) {
+  return request<ImportCrawlerScriptResult>("/crawlers/import-url", {
+    method: "POST",
+    body: JSON.stringify({ url }),
+  });
+}
+
+export function testCrawlerScript(body: { scriptPath: string; proxy?: string }) {
+  return request<CrawlerDryRunResult>("/crawlers/test-script", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function runCrawler(id: string) {
+  return request<{ ok: boolean; accepted: boolean; message?: string; status?: NightlyJobStatus }>(
+    `/crawlers/${encodeURIComponent(id)}/run`,
+    { method: "POST" }
+  );
+}
+
+export function stopCrawlerTasks(id: string) {
+  return request<{ ok: boolean; stopped: boolean }>(
+    `/crawlers/${encodeURIComponent(id)}/tasks/stop`,
+    { method: "POST" }
+  );
+}
+
+export function deleteCrawler(id: string) {
+  return request<{ ok: boolean; deletedVideos: number; deletedScript?: boolean; warning?: string }>(`/crawlers/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
 export type P123QRSession = {
   loginUuid: string;
   uniID: string;
@@ -235,6 +379,28 @@ export function getP123QRStatus(uniID: string, loginUuid: string) {
   return request<P123QRStatus>(
     `/drives/p123/qr/${encodeURIComponent(uniID)}?${qs.toString()}`
   );
+}
+
+export type WopanQRSession = {
+  uuid: string;
+  qrImageDataUrl: string;
+  expiresAt?: string;
+};
+
+export type WopanQRStatus = {
+  state: number;
+  statusText: string;
+  accessToken?: string;
+  refreshToken?: string;
+  familyID?: string;
+};
+
+export function startWopanQRLogin() {
+  return request<WopanQRSession>("/drives/wopan/qr", { method: "POST" });
+}
+
+export function getWopanQRStatus(uuid: string) {
+  return request<WopanQRStatus>(`/drives/wopan/qr/${encodeURIComponent(uuid)}`);
 }
 
 /**
@@ -318,6 +484,26 @@ export function regenFailedFingerprints(id: string) {
   );
 }
 
+/**
+ * 手动开启某存储的浏览器兼容性转码（AVI/WMV 等浏览器播不动的视频转 H.264 MP4，
+ * 产物上传回同一存储）。转码默认关闭、从不自动运行，这是唯一入口；
+ * 任务处理完候选列表后自然结束。
+ */
+export function startDriveTranscode(id: string) {
+  return request<{ ok: boolean; accepted: boolean; message?: string }>(
+    `/drives/${encodeURIComponent(id)}/transcode/start`,
+    { method: "POST" }
+  );
+}
+
+/** 手动停止某存储正在进行的转码任务。 */
+export function stopDriveTranscode(id: string) {
+  return request<{ ok: boolean; stopped: boolean }>(
+    `/drives/${encodeURIComponent(id)}/transcode/stop`,
+    { method: "POST" }
+  );
+}
+
 // ---------- Videos ----------
 
 export type AdminVideo = {
@@ -351,7 +537,9 @@ export type AdminVideoList = {
   size: number;
 };
 
-export function listVideos(params: { driveId?: string; page?: number; size?: number; keyword?: string } = {}) {
+export function listVideos(
+  params: { driveId?: string; page?: number; size?: number; keyword?: string } = {}
+) {
   const qs = new URLSearchParams();
   if (params.driveId) qs.set("driveId", params.driveId);
   if (params.page) qs.set("page", String(params.page));
@@ -359,6 +547,50 @@ export function listVideos(params: { driveId?: string; page?: number; size?: num
   if (params.keyword) qs.set("keyword", params.keyword);
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
   return request<AdminVideoList>(`/videos${suffix}`);
+}
+
+// 后台视频管理两个标签页的计数。
+export type VideoStats = {
+  current: number;
+  blacklisted: number;
+};
+
+export function getVideoStats() {
+  return request<VideoStats>("/videos/stats");
+}
+
+// 黑名单（被拉黑/手动删除、扫盘不再入库的视频）。原始记录已删除，
+// 只剩文件名/来源盘/大小/拉黑时间。
+export type AdminDeletedVideo = {
+  id: string;
+  driveId: string;
+  fileId: string;
+  fileName: string;
+  size: number;
+  deletedAt: number;
+};
+
+export type AdminBlacklistList = {
+  items: AdminDeletedVideo[];
+  total: number;
+  page: number;
+  size: number;
+};
+
+export function listBlacklist(params: { page?: number; size?: number; keyword?: string } = {}) {
+  const qs = new URLSearchParams();
+  if (params.page) qs.set("page", String(params.page));
+  if (params.size) qs.set("size", String(params.size));
+  if (params.keyword) qs.set("keyword", params.keyword);
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  return request<AdminBlacklistList>(`/blacklist${suffix}`);
+}
+
+// 把视频移出黑名单（删除墓碑），下次扫盘会重新入库。
+export function removeBlacklist(id: string) {
+  return request<{ ok: boolean }>(`/blacklist/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
 }
 
 export type UpdateVideoInput = Partial<{
@@ -380,10 +612,13 @@ export function updateVideo(id: string, body: UpdateVideoInput) {
   });
 }
 
-export function deleteVideo(id: string) {
+export function deleteVideo(id: string, options: { deleteSource?: boolean } = {}) {
   return request<{ ok: boolean; deletedSource: boolean }>(
     `/videos/${encodeURIComponent(id)}`,
-    { method: "DELETE" }
+    {
+      method: "DELETE",
+      body: JSON.stringify({ deleteSource: !!options.deleteSource }),
+    }
   );
 }
 
@@ -429,9 +664,9 @@ export type Theme = "dark" | "pink";
 export type Settings = {
   theme: Theme;
   /**
-   * spider91 视频迁移到云盘时的目标 drive ID（必须是已挂载的 pikpak、p115、p123 或 onedrive drive）。
+   * spider91 视频迁移到云盘时的目标 drive ID（必须是已挂载的 pikpak、p115、p123、onedrive、googledrive 或 wopan drive）。
    * - 空字符串：本地保存，不上传到云盘。
-   * - 非空：显式指定。后端会校验 drive 存在且 kind ∈ {pikpak, p115, p123, onedrive}。
+   * - 非空：显式指定。后端会校验 drive 存在且 kind ∈ {pikpak, p115, p123, onedrive, googledrive, wopan}。
    */
   spider91UploadDriveId: string;
 };
@@ -475,7 +710,7 @@ export function getNightlyJobStatus() {
 }
 
 export function runNightlyJob() {
-  return request<{ ok: boolean; accepted: boolean; status: NightlyJobStatus }>(
+  return request<{ ok: boolean; accepted: boolean; status: NightlyJobStatus; message?: string }>(
     "/jobs/nightly/run",
     { method: "POST" }
   );

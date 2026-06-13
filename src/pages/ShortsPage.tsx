@@ -32,9 +32,21 @@ const BATCH_SIZE = 5;
 // 当队列里"还没看过的视频"少于这个数时，提前请求下一批。
 const PREFETCH_THRESHOLD = 2;
 
-// 距离 activeIndex 多少屏内的视频会被 mount 真实 <video>。
-// =1 表示上一屏 / 当前 / 下一屏 都加载，这样切换时几乎无空白。
-const MOUNT_RADIUS = 1;
+// 当前视频至少有这么多秒的前向缓冲后，才允许后续视频开始预加载。
+const ACTIVE_PRELOAD_BUFFER_SECONDS = 12;
+
+// 当前视频流畅播放后，向后预加载多少条视频。
+const PRELOAD_AHEAD_COUNT = 2;
+
+// 预加载授权一旦发出，只有当前视频前向缓冲跌破这个秒数（或发生 stall）
+// 才收回。高低水位之间不动作，避免缓冲量在 12s 附近波动时
+// 反复绑定/剥离后续视频的 src、丢弃已预加载的数据。
+const ACTIVE_PRELOAD_KEEP_SECONDS = 4;
+
+// 维护一个固定大小的视频窗口：窗口内才 mount 真实 <video> 壳。
+// 当前屏先绑定 src；后续预加载要等当前屏缓冲健康后才开始。
+// 窗口内只要已经产生过可复用缓冲，就保留 src 复用浏览器缓存。
+const VIDEO_WINDOW_SIZE = 6;
 
 function loadSeenIds(): string[] {
   try {
@@ -120,7 +132,6 @@ export default function ShortsPage() {
 
   // seenIds 用 ref 维护，方便在异步 callback 里读到最新值
   const seenIdsRef = useRef<string[]>(loadSeenIds());
-  const preferredFromVideoIdRef = useRef<string | null>(null);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   // 整个页面根元素，用于 requestFullscreen
@@ -130,6 +141,11 @@ export default function ShortsPage() {
   const activeIndexRef = useRef(0);
   const ignoreIntersectionUntilRef = useRef(0);
   const fullscreenRestoreTimersRef = useRef<number[]>([]);
+  const [activeReadyForPreload, setActiveReadyForPreload] = useState(false);
+  const [cacheableSourceIds, setCacheableSourceIds] = useState<Set<string>>(
+    () => new Set()
+  );
+  const [cacheWindowHighIndex, setCacheWindowHighIndex] = useState(-1);
 
   // 当前是否处在浏览器全屏（Fullscreen API）状态。
   // iOS Safari 不支持元素级 Fullscreen API，这里会一直保持 false，
@@ -146,6 +162,29 @@ export default function ShortsPage() {
   useEffect(() => {
     activeIndexRef.current = activeIndex;
   }, [activeIndex]);
+
+  const handleActiveReadyForPreload = useCallback((index: number) => {
+    if (index === activeIndexRef.current) {
+      setActiveReadyForPreload(true);
+    }
+  }, []);
+
+  const handleActiveNeedsPriority = useCallback((index: number) => {
+    if (index === activeIndexRef.current) {
+      setActiveReadyForPreload(false);
+    }
+  }, []);
+
+  // 标记某条视频"浏览器里已有可复用的缓冲"。之后只要它还在缓存窗口内，
+  // 就保留 src 不剥离，回滑/再前滑时直接续用已缓冲数据，秒开不卡顿。
+  const handleSourceCached = useCallback((videoId: string) => {
+    setCacheableSourceIds((prev) => {
+      if (prev.has(videoId)) return prev;
+      const next = new Set(prev);
+      next.add(videoId);
+      return next;
+    });
+  }, []);
 
   /**
    * 切换点赞状态。
@@ -171,11 +210,6 @@ export default function ShortsPage() {
         );
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = (await res.json()) as { likes?: number };
-        if (liked) {
-          preferredFromVideoIdRef.current = videoId;
-        } else if (preferredFromVideoIdRef.current === videoId) {
-          preferredFromVideoIdRef.current = null;
-        }
         return typeof data.likes === "number" ? data.likes : null;
       } catch {
         // 请求失败：回滚集合，让 Slide 自己回滚 UI
@@ -204,11 +238,7 @@ export default function ShortsPage() {
     setLoading(true);
     try {
       const seen = seenIdsRef.current;
-      const resp = await fetchShortsNext(
-        seen,
-        BATCH_SIZE,
-        preferredFromVideoIdRef.current ?? undefined
-      );
+      const resp = await fetchShortsNext(seen, BATCH_SIZE);
       if (resp.items.length === 0) {
         setEmpty((prev) => prev || true /* 维持 true 即可 */);
         setRoundComplete(true);
@@ -242,6 +272,8 @@ export default function ShortsPage() {
     const active = items[activeIndex];
     if (!active) return;
 
+    setCacheWindowHighIndex((prev) => Math.max(prev, activeIndex));
+
     if (!seenIdsRef.current.includes(active.id)) {
       seenIdsRef.current = [...seenIdsRef.current, active.id];
       saveSeenIds(seenIdsRef.current);
@@ -250,8 +282,10 @@ export default function ShortsPage() {
     const remaining = items.length - 1 - activeIndex;
     if (remaining < PREFETCH_THRESHOLD && !loading) {
       if (roundComplete) {
-        // 上一次后端说"本轮已耗尽"，且当前已经看到队列接近末尾。
-        // 清空 localStorage 后再请求即可开新一轮。
+        // 上一次后端说"本轮已耗尽"时，必须等用户真正滑到当前队列最后一条
+        // 再清空已看记录开新一轮。否则退出后重新进入会把未完成轮次提前重置，
+        // 导致刚刷过的视频再次出现在下一次会话里。
+        if (remaining > 0) return;
         seenIdsRef.current = [];
         saveSeenIds([]);
         setRoundComplete(false);
@@ -280,7 +314,11 @@ export default function ShortsPage() {
             if (!Number.isNaN(idx)) bestIndex = idx;
           }
         }
-        if (bestIndex >= 0) setActiveIndex(bestIndex);
+        if (bestIndex >= 0 && bestIndex !== activeIndexRef.current) {
+          activeIndexRef.current = bestIndex;
+          setActiveReadyForPreload(false);
+          setActiveIndex(bestIndex);
+        }
       },
       {
         root,
@@ -300,21 +338,10 @@ export default function ShortsPage() {
         video.muted = muted;
         video.volume = volume;
         if (video.paused) {
-          // 切到这个视频时从头开始播
-          try {
-            video.currentTime = 0;
-          } catch {
-            // ignore
-          }
           video.play().catch(() => undefined);
         }
       } else {
         if (!video.paused) video.pause();
-        try {
-          video.currentTime = 0;
-        } catch {
-          // ignore
-        }
       }
     });
   }, [activeIndex, muted, volume, items.length]);
@@ -594,6 +621,8 @@ export default function ShortsPage() {
     }
   }, [items.length, showHud]);
 
+  const videoWindow = getVideoWindowBounds(cacheWindowHighIndex, items.length);
+
   return (
     <div className="shorts-page" ref={pageRef}>
       <header className="shorts-header">
@@ -652,26 +681,49 @@ export default function ShortsPage() {
           </div>
         )}
 
-        {items.map((item, index) => (
-          <ShortsSlide
-            key={item.id}
-            item={item}
-            index={index}
-            isActive={index === activeIndex}
-            // 距离 active 在 MOUNT_RADIUS 之内才挂载真正的 <video>，
-            // 其它槽位用海报占位以节省内存和带宽
-            shouldMount={Math.abs(index - activeIndex) <= MOUNT_RADIUS}
-            muted={muted}
-            volume={volume}
-            setMuted={setMuted}
-            setVolume={setVolume}
-            videoRef={setVideoRef(index)}
-            onLikeToggle={handleLikeToggle}
-            hasLiked={hasLiked}
-            onHideSuccess={handleHideSuccess}
-            showHud={showHud}
-          />
-        ))}
+        {items.map((item, index) => {
+          const isActiveSlide = index === activeIndex;
+          const isInCacheWindow =
+            index >= videoWindow.start && index <= videoWindow.end;
+          const preloadOffset = index - activeIndex;
+          const shouldPreload =
+            activeReadyForPreload &&
+            preloadOffset > 0 &&
+            preloadOffset <= PRELOAD_AHEAD_COUNT;
+          const shouldMount = isActiveSlide || isInCacheWindow || shouldPreload;
+          // 视频窗口内已经缓冲过的视频保留 src：
+          // 在窗口内来回切换时，直接复用浏览器已缓冲数据。
+          const shouldRetainCached =
+            isInCacheWindow && !isActiveSlide && cacheableSourceIds.has(item.id);
+          const shouldLoad = isActiveSlide || shouldPreload || shouldRetainCached;
+          const shouldEagerLoad = isActiveSlide || shouldPreload;
+          return (
+            <ShortsSlide
+              key={item.id}
+              item={item}
+              index={index}
+              isActive={isActiveSlide}
+              // 固定 6 条视频窗口内才挂载 <video> 壳；
+              // 当前屏先绑定 src；后两个视频等当前屏缓冲健康后再预加载；
+              // 已缓冲过的窗口内视频保留 src，便于来回切换复用缓存。
+              shouldMount={shouldMount}
+              shouldLoad={shouldLoad}
+              shouldEagerLoad={shouldEagerLoad}
+              muted={muted}
+              volume={volume}
+              setMuted={setMuted}
+              setVolume={setVolume}
+              videoRef={setVideoRef(index)}
+              onLikeToggle={handleLikeToggle}
+              hasLiked={hasLiked}
+              onHideSuccess={handleHideSuccess}
+              onActiveReadyForPreload={handleActiveReadyForPreload}
+              onActiveNeedsPriority={handleActiveNeedsPriority}
+              onSourceCached={handleSourceCached}
+              showHud={showHud}
+            />
+          );
+        })}
 
         {!empty && items.length > 0 && loading && (
           <div className="shorts-loading">
@@ -689,6 +741,8 @@ type SlideProps = {
   index: number;
   isActive: boolean;
   shouldMount: boolean;
+  shouldLoad: boolean;
+  shouldEagerLoad: boolean;
   muted: boolean;
   volume: number;
   setMuted: (muted: boolean) => void;
@@ -702,6 +756,10 @@ type SlideProps = {
   /** 父组件查询某 id 是否已经在本次会话内点过赞 */
   hasLiked: (videoId: string) => boolean;
   onHideSuccess: (index: number) => void;
+  onActiveReadyForPreload: (index: number) => void;
+  onActiveNeedsPriority: (index: number) => void;
+  /** 本条视频在浏览器里已有可复用缓冲，之后在视频窗口内保留 src */
+  onSourceCached: (videoId: string) => void;
   showHud: (text: string, icon?: React.ReactNode) => void;
 };
 
@@ -717,6 +775,8 @@ function ShortsSlide({
   index,
   isActive,
   shouldMount,
+  shouldLoad,
+  shouldEagerLoad,
   muted,
   volume,
   setMuted,
@@ -725,6 +785,9 @@ function ShortsSlide({
   onLikeToggle,
   hasLiked,
   onHideSuccess,
+  onActiveReadyForPreload,
+  onActiveNeedsPriority,
+  onSourceCached,
   showHud,
 }: SlideProps) {
   const localRef = useRef<HTMLVideoElement | null>(null);
@@ -778,6 +841,23 @@ function ShortsSlide({
     [videoRef]
   );
 
+  // 非当前屏/后续预加载/视频窗口内缓存视频不保留媒体源，确保离开窗口后浏览器中止原始网盘流。
+  useEffect(() => {
+    if (shouldLoad) return;
+    const video = localRef.current;
+    if (!video) return;
+    try {
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+    } catch {
+      // ignore
+    }
+    setDuration(0);
+    setCurrentTime(0);
+    setIsBuffering(false);
+  }, [shouldLoad, item.id]);
+
   // 离开活跃后清掉本地的暂停状态，避免回来时 UI 还显示着 paused
   useEffect(() => {
     if (!isActive) {
@@ -810,7 +890,8 @@ function ShortsSlide({
   }, [isMarkedHidden]);
 
   // 监听 video 的时长 / 进度 / 缓冲状态 / 音量物理键变化。
-  // MOUNT_RADIUS 会让第三屏以后的 slide 先以海报占位，之后才挂载 video；
+  // VIDEO_WINDOW_SIZE 会让窗口外的 slide 先以海报占位，之后才挂载 video 壳；
+  // 只有 shouldLoad=true 的当前屏/后续预加载/缓存窗口视频会绑定 src，因此不会一次拉完整队列。
   // 因此这里必须跟随 shouldMount 重新绑定，否则后续视频没有 timeupdate 事件。
   useEffect(() => {
     if (!shouldMount) {
@@ -832,14 +913,28 @@ function ShortsSlide({
     const handleTime = () => {
       // 拖动期间不要被 timeupdate 覆盖 UI
       if (!scrubbingRef.current) setCurrentTime(video.currentTime);
+      syncActivePreloadReadiness(video);
     };
     const handleWaiting = () => {
       setIsBuffering(true);
+      if (isActive) onActiveNeedsPriority(index);
     };
     const handlePlayingOrCanPlay = () => {
       setIsBuffering(false);
+      // 已经能解码播放，说明浏览器里有了值得复用的数据。
+      if (shouldLoad) onSourceCached(item.id);
+      syncActivePreloadReadiness(video);
+    };
+    const handleProgress = () => {
+      syncActivePreloadReadiness(video);
+      // 窗口内视频只要已经产生缓冲，就标记为可复用；
+      // 之后预加载授权被收回时不再丢弃它的 src 和已缓冲数据。
+      if (shouldLoad && videoHasBufferedData(video)) {
+        onSourceCached(item.id);
+      }
     };
     const handleVolumeChange = () => {
+      if (!isActive) return;
       // 当检测到 video 自身的 mute 状态或 volume 改变时，同步更新 React 状态。
       // 这可以在移动端浏览器支持物理音量键调整时，自动反向取消静音并展示音量 HUD。
       if (video.muted !== muted) {
@@ -850,6 +945,17 @@ function ShortsSlide({
       }
     };
 
+    function syncActivePreloadReadiness(currentVideo: HTMLVideoElement) {
+      if (!isActive) return;
+      if (videoHasComfortableBuffer(currentVideo)) {
+        onActiveReadyForPreload(index);
+      } else if (videoBufferIsCritical(currentVideo)) {
+        // 高低水位滞回：只有缓冲真正告急才收回预加载授权，
+        // 在两个水位之间维持现状，避免阈值附近来回抖动。
+        onActiveNeedsPriority(index);
+      }
+    }
+
     handleLoaded();
     handleTime();
     video.addEventListener("loadedmetadata", handleLoaded);
@@ -858,6 +964,7 @@ function ShortsSlide({
     video.addEventListener("waiting", handleWaiting);
     video.addEventListener("playing", handlePlayingOrCanPlay);
     video.addEventListener("canplay", handlePlayingOrCanPlay);
+    video.addEventListener("progress", handleProgress);
     video.addEventListener("volumechange", handleVolumeChange);
 
     // 挂载时如果已经在播放但是状态不到 ready 则置 buffering
@@ -872,9 +979,10 @@ function ShortsSlide({
       video.removeEventListener("waiting", handleWaiting);
       video.removeEventListener("playing", handlePlayingOrCanPlay);
       video.removeEventListener("canplay", handlePlayingOrCanPlay);
+      video.removeEventListener("progress", handleProgress);
       video.removeEventListener("volumechange", handleVolumeChange);
     };
-  }, [shouldMount, item.id, muted, volume, setMuted, setVolume]);
+  }, [shouldMount, shouldLoad, item.id, index, isActive, muted, volume, setMuted, setVolume, onActiveReadyForPreload, onActiveNeedsPriority, onSourceCached]);
 
   // 长按 2 倍速：直接绑原生事件
   useEffect(() => {
@@ -1175,9 +1283,9 @@ function ShortsSlide({
         <video
           ref={setRef}
           className="shorts-slide__video"
-          src={item.videoSrc}
+          src={shouldLoad ? item.videoSrc : undefined}
           poster={item.poster}
-          preload="auto"
+          preload={shouldLoad ? (shouldEagerLoad ? "auto" : "metadata") : "none"}
           playsInline
           loop
           muted={muted}
@@ -1210,7 +1318,7 @@ function ShortsSlide({
       )}
 
       {/* 视频加载/缓冲旋转器 */}
-      {isBuffering && isActive && shouldMount && !isMarkedHidden && (
+      {isBuffering && isActive && shouldLoad && !isMarkedHidden && (
         <div className="shorts-slide__buffering" aria-hidden="true">
           <Loader2 size={30} className="shorts-slide__buffering-icon" />
         </div>
@@ -1309,7 +1417,7 @@ function ShortsSlide({
       )}
 
       {/* 进度条 */}
-      {shouldMount && !isMarkedHidden && (
+      {isActive && shouldLoad && !isMarkedHidden && (
         <div
           className={`shorts-slide__progress ${
             scrubbing ? "is-scrubbing" : ""
@@ -1345,6 +1453,58 @@ function ShortsSlide({
 
 function clamp(n: number, min: number, max: number) {
   return n < min ? min : n > max ? max : n;
+}
+
+function getVideoWindowBounds(highestViewedIndex: number, itemCount: number) {
+  const size = Math.min(VIDEO_WINDOW_SIZE, itemCount);
+  if (size <= 0 || highestViewedIndex < 0) return { start: 0, end: -1 };
+
+  const end = clamp(highestViewedIndex, 0, itemCount - 1);
+  const start = Math.max(0, end - size + 1);
+  return { start, end };
+}
+
+/** 已经缓冲到片尾（含误差余量），不会再因网络卡顿 */
+function videoBufferedToEnd(video: HTMLVideoElement) {
+  const duration = Number.isFinite(video.duration) ? video.duration : 0;
+  if (duration <= 0) return false;
+  const remaining = Math.max(0, duration - (video.currentTime || 0));
+  return bufferedAheadSeconds(video) >= remaining - 0.25;
+}
+
+function videoHasBufferedData(video: HTMLVideoElement) {
+  for (let i = 0; i < video.buffered.length; i += 1) {
+    if (video.buffered.end(i) > video.buffered.start(i)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** 前向缓冲健康（达到高水位或已缓冲到结尾），可以放心预加载后续视频 */
+function videoHasComfortableBuffer(video: HTMLVideoElement) {
+  if (video.readyState < 3) return false;
+  if (videoBufferedToEnd(video)) return true;
+  return bufferedAheadSeconds(video) >= ACTIVE_PRELOAD_BUFFER_SECONDS;
+}
+
+/** 前向缓冲告急（跌破低水位且没缓冲到结尾），应收回预加载授权 */
+function videoBufferIsCritical(video: HTMLVideoElement) {
+  if (video.readyState < 3) return true;
+  if (videoBufferedToEnd(video)) return false;
+  return bufferedAheadSeconds(video) < ACTIVE_PRELOAD_KEEP_SECONDS;
+}
+
+function bufferedAheadSeconds(video: HTMLVideoElement) {
+  const current = video.currentTime || 0;
+  for (let i = 0; i < video.buffered.length; i += 1) {
+    const start = video.buffered.start(i);
+    const end = video.buffered.end(i);
+    if (start <= current + 0.25 && end > current) {
+      return Math.max(0, end - current);
+    }
+  }
+  return 0;
 }
 
 function formatClock(seconds: number) {

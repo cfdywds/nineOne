@@ -461,6 +461,23 @@ func (d *Driver) Rename(ctx context.Context, fileID, newName string) error {
 	return nil
 }
 
+func (d *Driver) Remove(ctx context.Context, fileID string) error {
+	if d.client == nil {
+		return errors.New("p115 remove: driver not initialized")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	fileID = strings.TrimSpace(fileID)
+	if fileID == "" {
+		return errors.New("p115 remove: empty fileID")
+	}
+	if err := d.client.Delete(fileID); err != nil {
+		return fmt.Errorf("p115 remove: %w", err)
+	}
+	return nil
+}
+
 // bufferAndHashSha1 把 r 全量复制到一个临时文件，同时计算 SHA1。
 // 返回临时文件（位置在末尾，需调用方 Seek 回 0）、SHA1 hex 大写、实际字节数。
 //
@@ -563,3 +580,4 @@ func guessMime(name string) string {
 }
 
 var _ drives.Drive = (*Driver)(nil)
+var _ drives.Remover = (*Driver)(nil)

@@ -1,4 +1,4 @@
-import { PlayCircle, Power, PowerOff, RotateCcw } from "lucide-react";
+import { CircleStop, PlayCircle, Power, PowerOff, RotateCcw, Wand2 } from "lucide-react";
 import * as api from "../api";
 import { formatBytes } from "../storageFormat";
 import {
@@ -101,13 +101,17 @@ export function StatusTag({
   error?: string;
   hasCred: boolean;
 }) {
+  if (kind === "spider91") {
+    return (
+      <span className="admin-status is-error" title={error || "请到爬虫管理添加爬虫脚本"}>
+        已废弃
+      </span>
+    );
+  }
   if (kind !== "spider91" && !hasCred) {
     return <span className="admin-status is-pending">未配置凭证</span>;
   }
   if (status === "ok") {
-    if (kind === "spider91") {
-      return <span className="admin-status is-ok">已就绪</span>;
-    }
     return <span className="admin-status is-ok">已连接</span>;
   }
   if (status === "error")
@@ -159,20 +163,26 @@ export function DriveGenerationPanel({
   regenFailedThumbId,
   regenFailedFingerprintId,
   togglingTeaserId,
+  togglingTranscodeId,
   onToggleTeaser,
   onRegenFailed,
   onRegenFailedThumbnails,
   onRegenFailedFingerprints,
+  onStartTranscode,
+  onStopTranscode,
 }: {
   d: api.AdminDrive;
   regenFailedId: string;
   regenFailedThumbId: string;
   regenFailedFingerprintId: string;
   togglingTeaserId: string;
+  togglingTranscodeId: string;
   onToggleTeaser: () => void;
   onRegenFailed: () => void;
   onRegenFailedThumbnails: () => void;
   onRegenFailedFingerprints: () => void;
+  onStartTranscode: () => void;
+  onStopTranscode: () => void;
 }) {
   const canQueueThumbnails =
     (d.thumbnailFailedCount ?? 0) > 0 ||
@@ -182,6 +192,12 @@ export function DriveGenerationPanel({
     (d.teaserFailedCount ?? 0) > 0 || (d.teaserPendingCount ?? 0) > 0;
   const canQueueFingerprints =
     (d.fingerprintFailedCount ?? 0) > 0 || (d.fingerprintPendingCount ?? 0) > 0;
+  // 转码默认不运行，只能在这里手动开启/停止。
+  // 候选 = 还没出结果的不兼容格式视频 + 上次失败的（重新开始会自动重试）。
+  const transcodeRunning =
+    (d.transcodeGenerationStatus?.state || "idle") !== "idle";
+  const canStartTranscode =
+    (d.transcodePendingCount ?? 0) > 0 || (d.transcodeFailedCount ?? 0) > 0;
 
   return (
     <div className="admin-detail-card">
@@ -205,6 +221,11 @@ export function DriveGenerationPanel({
 
       <div className="admin-gen-columns">
         <DriveGenCol
+          label={d.kind === "spider91" ? "已废弃" : "扫盘"}
+          status={d.scanGenerationStatus}
+          showCounts={false}
+        />
+        <DriveGenCol
           label="封面"
           status={d.thumbnailGenerationStatus}
           ready={d.thumbnailReadyCount}
@@ -225,6 +246,13 @@ export function DriveGenerationPanel({
           ready={d.fingerprintReadyCount}
           pending={d.fingerprintPendingCount}
           failed={d.fingerprintFailedCount}
+        />
+        <DriveGenCol
+          label="转码"
+          status={d.transcodeGenerationStatus}
+          ready={d.transcodeReadyCount}
+          pending={d.transcodePendingCount}
+          failed={d.transcodeFailedCount}
         />
       </div>
 
@@ -253,6 +281,33 @@ export function DriveGenerationPanel({
           <RotateCcw size={13} />
           <span>{(d.fingerprintFailedCount ?? 0) > 0 ? "重试失败指纹" : "继续生成指纹"}</span>
         </button>
+        {transcodeRunning ? (
+          <button
+            className="admin-btn is-stop"
+            disabled={togglingTranscodeId === d.id}
+            onClick={onStopTranscode}
+            title="停止当前的转码任务。未处理的视频保持原状态，下次开始时继续。"
+          >
+            <CircleStop size={13} />
+            <span>{togglingTranscodeId === d.id ? "停止中..." : "停止转码"}</span>
+          </button>
+        ) : (
+          <button
+            className="admin-btn"
+            disabled={!canStartTranscode || togglingTranscodeId === d.id}
+            onClick={onStartTranscode}
+            title="把浏览器播放不了的视频（AVI/WMV/RMVB、MPEG-4 等老格式）转码成 H.264 MP4 并上传回本存储。转码不会自动运行，只能在这里手动开启。"
+          >
+            <Wand2 size={13} />
+            <span>
+              {togglingTranscodeId === d.id
+                ? "开启中..."
+                : (d.transcodeFailedCount ?? 0) > 0 && (d.transcodePendingCount ?? 0) === 0
+                ? "重试失败转码"
+                : "开始转码"}
+            </span>
+          </button>
+        )}
       </div>
     </div>
   );
@@ -265,6 +320,7 @@ function DriveGenCol({
   pending,
   failed,
   extra,
+  showCounts = true,
 }: {
   label: string;
   status?: api.DriveGenerationStatus;
@@ -272,10 +328,14 @@ function DriveGenCol({
   pending?: number;
   failed?: number;
   extra?: number;
+  showCounts?: boolean;
 }) {
   const state = status?.state || "idle";
   const detail = generationDetail(status);
   const title = generationTitle(status, detail);
+  const stateLabel = label === "抓取" && state === "scanning" ? "抓取中" : generationStateLabel(state);
+  const showScanProgress = !showCounts && (state === "scanning" || (status?.scannedCount ?? 0) > 0 || (status?.addedCount ?? 0) > 0);
+  const scannedLabel = label === "抓取" ? "已抓取" : "已扫描";
   return (
     <div className="admin-gen-col">
       <div className="admin-gen-col__head">
@@ -284,18 +344,26 @@ function DriveGenCol({
           className={`admin-status admin-generation-state is-${generationStateClass(state)}`}
           title={title || undefined}
         >
-          {generationStateLabel(state)}
+          {stateLabel}
         </span>
       </div>
       {detail && <div className="admin-gen-col__detail">{detail}</div>}
-      <div className="admin-gen-col__counts">
-        <div className="admin-gen-col__count"><span>就绪</span><strong>{ready ?? 0}</strong></div>
-        <div className="admin-gen-col__count"><span>待生成</span><strong>{pending ?? 0}</strong></div>
-        <div className="admin-gen-col__count"><span>失败</span><strong>{failed ?? 0}</strong></div>
-        {(extra ?? 0) > 0 && (
-          <div className="admin-gen-col__count"><span>待补时长</span><strong>{extra}</strong></div>
-        )}
-      </div>
+      {showScanProgress && (
+        <div className="admin-gen-col__counts admin-gen-col__counts--scan">
+          <div className="admin-gen-col__count"><span>{scannedLabel}</span><strong>{status?.scannedCount ?? 0}</strong></div>
+          <div className="admin-gen-col__count"><span>预计新增</span><strong>{status?.addedCount ?? 0}</strong></div>
+        </div>
+      )}
+      {showCounts && (
+        <div className="admin-gen-col__counts">
+          <div className="admin-gen-col__count"><span>就绪</span><strong>{ready ?? 0}</strong></div>
+          <div className="admin-gen-col__count"><span>待生成</span><strong>{pending ?? 0}</strong></div>
+          <div className="admin-gen-col__count"><span>失败</span><strong>{failed ?? 0}</strong></div>
+          {(extra ?? 0) > 0 && (
+            <div className="admin-gen-col__count"><span>待补时长</span><strong>{extra}</strong></div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

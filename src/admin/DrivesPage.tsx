@@ -20,6 +20,7 @@ import { formatBytes } from "./storageFormat";
 import { makeUniqueDriveId } from "./driveId";
 import {
   FormState,
+  driveKindAbbr,
   kindLabel,
   emptyForm,
   idleNightlyStatus,
@@ -38,6 +39,22 @@ import {
 import { DriveForm } from "./drive/DriveForm";
 import { DeleteDriveModal } from "./drive/DeleteDriveModal";
 import { SkipDirsPanel } from "./drive/SkipDirsPanel";
+
+const DRIVE_BUSY_MESSAGE = "当前存储有正在进行的任务，请稍后重试";
+const NIGHTLY_BUSY_MESSAGE = "当前有全量扫描任务正在进行，请稍后重试";
+
+function isDriveBusy(d: api.AdminDrive) {
+  return [
+    d.scanGenerationStatus,
+    d.thumbnailGenerationStatus,
+    d.previewGenerationStatus,
+    d.fingerprintGenerationStatus,
+    d.transcodeGenerationStatus,
+  ].some((status) => {
+    const state = status?.state || "idle";
+    return state !== "idle";
+  });
+}
 
 export function DrivesPage() {
   const [list, setList] = useState<api.AdminDrive[]>([]);
@@ -60,10 +77,12 @@ export function DrivesPage() {
   const [regenFailedThumbId, setRegenFailedThumbId] = useState("");
   const [regenFailedFingerprintId, setRegenFailedFingerprintId] = useState("");
   const [togglingTeaserId, setTogglingTeaserId] = useState("");
+  const [togglingTranscodeId, setTogglingTranscodeId] = useState("");
   const [scanningAll, setScanningAll] = useState(false);
   const [stoppingAll, setStoppingAll] = useState(false);
   const [trackingNightly, setTrackingNightly] = useState(false);
-  const [scanningDriveId, setScanningDriveId] = useState("");
+  const [scanningDriveIds, setScanningDriveIds] = useState<Record<string, boolean>>({});
+  const scanningDriveIdsRef = useRef(new Set<string>());
   const [stoppingDriveId, setStoppingDriveId] = useState("");
   const [searchParams, setSearchParams] = useSearchParams();
   const selectedDriveId = searchParams.get("drive") || null;
@@ -77,7 +96,16 @@ export function DrivesPage() {
     : hasCreateFormChanges(form, initialForm);
 
   const uploadTargets = useMemo(
-    () => list.filter((d) => d.kind === "pikpak" || d.kind === "p115" || d.kind === "p123" || d.kind === "onedrive"),
+    () =>
+      list.filter(
+        (d) =>
+          d.kind === "pikpak" ||
+          d.kind === "p115" ||
+          d.kind === "p123" ||
+          d.kind === "onedrive" ||
+          d.kind === "googledrive" ||
+          d.kind === "wopan"
+      ),
     [list]
   );
 
@@ -204,7 +232,16 @@ export function DrivesPage() {
       kind: d.kind,
       name: d.name,
       rootId: d.rootId,
-      creds: d.spiderCrawlerConfig ? { ...d.spiderCrawlerConfig } : d.kind === "spider91" ? { proxy: d.spider91Proxy ?? "" } : {},
+      creds:
+        d.spiderCrawlerConfig
+          ? { ...d.spiderCrawlerConfig }
+          : d.kind === "spider91"
+          ? { proxy: d.spider91Proxy ?? "" }
+          : d.kind === "googledrive"
+          ? { use_online_api: (d.googleDriveUseOnlineAPI ?? true) ? "true" : "false" }
+          : d.kind === "localstorage"
+          ? { strm_allow_outside_root: (d.strmAllowOutsideRoot ?? false) ? "true" : "false" }
+          : {},
       spider91UploadDriveId: settings?.spider91UploadDriveId ?? "",
     };
     setForm(nextForm);
@@ -315,26 +352,52 @@ export function DrivesPage() {
   }
 
   async function handleRescan(d: api.AdminDrive) {
-    if (scanningDriveId) return;
-    setScanningDriveId(d.id);
+    if (d.kind === "spider91") {
+      show("91Spider 不再支持通过网盘运行，请到爬虫管理添加爬虫脚本", "info");
+      return;
+    }
+    if (nightlyBusy) {
+      show(nightlyBusyText(nightlyStatus) || NIGHTLY_BUSY_MESSAGE, "info");
+      return;
+    }
+    if (isDriveBusy(d) || scanningDriveIdsRef.current.has(d.id)) {
+      show(DRIVE_BUSY_MESSAGE, "info");
+      return;
+    }
+    scanningDriveIdsRef.current.add(d.id);
+    setScanningDriveIds((prev) => ({ ...prev, [d.id]: true }));
     try {
-      await api.rescan(d.id);
+      const resp = await api.rescan(d.id);
+      if (!resp.accepted) {
+        if (resp.status) {
+          setNightlyStatus(resp.status);
+        }
+        show(resp.message || DRIVE_BUSY_MESSAGE, "info");
+        refreshDriveList();
+        return;
+      }
       if (isSpiderCrawlerKind(d.kind)) {
         show("已触发抓取任务，需要 2-4 分钟，可稍后刷新视频列表查看", "success");
         refreshCrawlStatus(d.id);
       } else {
         show("已触发扫描，可稍后刷新视频列表查看", "success");
       }
+      refreshDriveList();
     } catch (e) {
       show(e instanceof Error ? e.message : "触发失败", "error");
     } finally {
-      setScanningDriveId("");
+      scanningDriveIdsRef.current.delete(d.id);
+      setScanningDriveIds((prev) => {
+        const next = { ...prev };
+        delete next[d.id];
+        return next;
+      });
     }
   }
 
   async function handleRunNightly() {
     if (nightlyBusy) {
-      show(nightlyBusyText(nightlyStatus) || "当前已有扫描所有网盘任务", "info");
+      show(nightlyBusyText(nightlyStatus) || NIGHTLY_BUSY_MESSAGE, "info");
       return;
     }
     setScanningAll(true);
@@ -345,7 +408,7 @@ export function DrivesPage() {
         setTrackingNightly(!resp.status.running);
         show("已触发扫描所有网盘，耗时较长，可在任务状态和 backend 日志观察进度", "success");
       } else {
-        show("当前已有扫描所有网盘任务", "info");
+        show(resp.message || NIGHTLY_BUSY_MESSAGE, "info");
       }
     } catch (e) {
       show(e instanceof Error ? e.message : "触发失败", "error");
@@ -467,6 +530,41 @@ export function DrivesPage() {
     }
   }
 
+  async function handleStartTranscode(d: api.AdminDrive) {
+    setTogglingTranscodeId(d.id);
+    try {
+      const resp = await api.startDriveTranscode(d.id);
+      if (resp.accepted) {
+        show(`已开始「${d.name || d.id}」的视频转码`, "success");
+      } else {
+        show(resp.message || "转码任务未能开启", "info");
+      }
+      refreshDriveList();
+    } catch (e) {
+      show(e instanceof Error ? e.message : "开启失败", "error");
+    } finally {
+      setTogglingTranscodeId("");
+    }
+  }
+
+  async function handleStopTranscode(d: api.AdminDrive) {
+    setTogglingTranscodeId(d.id);
+    try {
+      const resp = await api.stopDriveTranscode(d.id);
+      show(
+        resp.stopped
+          ? `已停止「${d.name || d.id}」的视频转码`
+          : `「${d.name || d.id}」没有正在运行的转码任务`,
+        "success"
+      );
+      refreshDriveList();
+    } catch (e) {
+      show(e instanceof Error ? e.message : "停止失败", "error");
+    } finally {
+      setTogglingTranscodeId("");
+    }
+  }
+
   const selectedDrive = useMemo(() => {
     return selectedDriveId ? list.find((d) => d.id === selectedDriveId) : null;
   }, [selectedDriveId, list]);
@@ -519,10 +617,8 @@ export function DrivesPage() {
                 )}
                 {isSpiderCrawlerKind(d.kind) && (
                   <div className="admin-detail-row">
-                    <span className="admin-detail-label">上次抓取时间</span>
-                    <span className="admin-detail-value">
-                      {d.lastCrawlAt ? new Date(d.lastCrawlAt * 1000).toLocaleString() : "尚未抓取"}
-                    </span>
+                    <span className="admin-detail-label">配置状态</span>
+                    <span className="admin-detail-value">已废弃，请到爬虫管理添加</span>
                   </div>
                 )}
               </div>
@@ -536,17 +632,27 @@ export function DrivesPage() {
                     type="button"
                     className="admin-btn is-primary"
                     onClick={() => handleRescan(d)}
-                    disabled={!!scanningDriveId}
+                    disabled={d.kind === "spider91"}
+                    aria-disabled={d.kind === "spider91" || nightlyBusy || isDriveBusy(d) || !!scanningDriveIds[d.id]}
+                    title={
+                      d.kind === "spider91"
+                        ? "91Spider 不再支持通过网盘运行，请到爬虫管理添加爬虫脚本"
+                        : nightlyBusy
+                        ? nightlyBusyText(nightlyStatus) || NIGHTLY_BUSY_MESSAGE
+                        : isDriveBusy(d) || scanningDriveIds[d.id]
+                        ? DRIVE_BUSY_MESSAGE
+                        : undefined
+                    }
                   >
                     {isSpiderCrawlerKind(d.kind) ? (
                       <>
-                        <Download size={13} className={scanningDriveId === d.id ? "admin-spin" : undefined} />
-                        {scanningDriveId === d.id ? "触发中..." : "立即抓取"}
+                        <Download size={13} className={scanningDriveIds[d.id] ? "admin-spin" : undefined} />
+                        已废弃
                       </>
                     ) : (
                       <>
-                        <RefreshCw size={13} className={scanningDriveId === d.id ? "admin-spin" : undefined} />
-                        {scanningDriveId === d.id ? "触发中..." : "立即重扫"}
+                        <RefreshCw size={13} className={scanningDriveIds[d.id] ? "admin-spin" : undefined} />
+                        {scanningDriveIds[d.id] ? "触发中..." : "立即重扫"}
                       </>
                     )}
                   </button>
@@ -561,9 +667,11 @@ export function DrivesPage() {
                     {stoppingDriveId === d.id ? "停止中..." : "停止所有任务"}
                   </button>
                 </div>
-                <button type="button" className="admin-btn" onClick={() => openEdit(d)}>
-                  {isSpiderCrawlerKind(d.kind) ? "编辑配置" : "编辑配置凭证"}
-                </button>
+                {d.kind !== "spider91" && (
+                  <button type="button" className="admin-btn" onClick={() => openEdit(d)}>
+                    {isSpiderCrawlerKind(d.kind) ? "编辑配置" : "编辑配置凭证"}
+                  </button>
+                )}
                 <button type="button" className="admin-btn is-danger admin-detail-actions__danger" onClick={() => setDeleteTarget(d)}>
                   <Trash2 size={13} /> 删除网盘
                 </button>
@@ -655,10 +763,13 @@ export function DrivesPage() {
               regenFailedThumbId={regenFailedThumbId}
               regenFailedFingerprintId={regenFailedFingerprintId}
               togglingTeaserId={togglingTeaserId}
+              togglingTranscodeId={togglingTranscodeId}
               onToggleTeaser={() => handleToggleTeaser(d)}
               onRegenFailed={() => handleRegenFailed(d)}
               onRegenFailedThumbnails={() => handleRegenFailedThumbnails(d)}
               onRegenFailedFingerprints={() => handleRegenFailedFingerprints(d)}
+              onStartTranscode={() => handleStartTranscode(d)}
+              onStopTranscode={() => handleStopTranscode(d)}
             />
 
             <div className="admin-detail-card">
@@ -804,7 +915,7 @@ export function DrivesPage() {
               <div className="admin-drive-card__header">
                 <div className="admin-drive-card__title">
                   <span className="admin-drive-card__brand-icon" data-kind={d.kind}>
-                    {d.kind.substring(0, 2)}
+                    {driveKindAbbr(d.kind)}
                   </span>
                   <span>{d.name || d.id}</span>
                 </div>

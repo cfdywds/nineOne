@@ -42,6 +42,7 @@ const (
 	endpointDownloadInfo = "/file/download_info"
 	endpointMkdir        = "/file/upload_request"
 	endpointRename       = "/file/rename"
+	endpointTrash        = "/file/trash"
 	endpointUpload       = "/file/upload_request"
 	endpointS3Auth       = "/file/s3_upload_object/auth"
 	endpointS3Parts      = "/file/s3_repare_upload_parts_batch"
@@ -259,8 +260,8 @@ func (d *Driver) Upload(ctx context.Context, parentID, name string, r io.Reader,
 
 // UploadResult 是 UploadAndReportHash 的返回值。
 //
-// FileID 是 123 云盘分配的新文件 ID；Hash 是本次上传的 MD5 HEX（小写），
-// 与 123 云盘列表返回的 Etag 一致；Size 是实际上传字节数。
+// FileID 是 123网盘分配的新文件 ID；Hash 是本次上传的 MD5 HEX（小写），
+// 与 123网盘列表返回的 Etag 一致；Size 是实际上传字节数。
 type UploadResult struct {
 	FileID string
 	Hash   string
@@ -269,7 +270,7 @@ type UploadResult struct {
 
 // UploadAndReportHash 把 r 上传到 parentID 目录下的指定文件名，返回新文件元数据。
 //
-// 123 云盘 Web 上传协议需要先计算文件 MD5 作为 etag 申请 upload_request。
+// 123网盘 Web 上传协议需要先计算文件 MD5 作为 etag 申请 upload_request。
 // 命中 Reuse 时服务端已经秒传；否则用返回的 S3 预签名 URL 分片 PUT，最后
 // 调 upload_complete/v2 完成。
 func (d *Driver) UploadAndReportHash(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error) {
@@ -522,7 +523,7 @@ func (d *Driver) cacheUploadedFile(fileID, parentID, name, md5Hex string, size i
 	}, parentID)
 }
 
-// Rename 调用 123 云盘 Web API 把指定 fileID 重命名为 newName。
+// Rename 调用 123网盘 Web API 把指定 fileID 重命名为 newName。
 func (d *Driver) Rename(ctx context.Context, fileID, newName string) error {
 	fileID = strings.TrimSpace(fileID)
 	if fileID == "" {
@@ -542,6 +543,32 @@ func (d *Driver) Rename(ctx context.Context, fileID, newName string) error {
 		return fmt.Errorf("123pan rename: %w", err)
 	}
 	d.renameCachedFile(fileID, newName)
+	return nil
+}
+
+func (d *Driver) Remove(ctx context.Context, fileID string) error {
+	fileID = strings.TrimSpace(fileID)
+	if fileID == "" {
+		return errors.New("123pan remove: empty file id")
+	}
+	f, _, err := d.findFile(ctx, fileID)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "not found") {
+			return nil
+		}
+		return fmt.Errorf("123pan remove metadata: %w", err)
+	}
+	body := map[string]any{
+		"driveId":           0,
+		"operation":         true,
+		"fileTrashInfoList": []panFile{f},
+	}
+	if _, err := d.request(ctx, endpointTrash, http.MethodPost, func(req *resty.Request) {
+		req.SetBody(body)
+	}, nil); err != nil {
+		return fmt.Errorf("123pan remove: %w", err)
+	}
+	d.removeCachedFile(fileID)
 	return nil
 }
 
@@ -583,7 +610,7 @@ func (d *Driver) makeDir(ctx context.Context, parentID, name string) (string, er
 	if resp.Data.FileID != 0 {
 		return strconv.FormatInt(resp.Data.FileID, 10), nil
 	}
-	// 123 云盘创建目录的返回字段不稳定；创建成功但没回 fileId 时回读父目录确认。
+	// 123网盘创建目录的返回字段不稳定；创建成功但没回 fileId 时回读父目录确认。
 	childID, err := d.findChildDir(ctx, parentID, name)
 	if err != nil {
 		return "", err
@@ -942,6 +969,12 @@ func (d *Driver) renameCachedFile(fileID, newName string) {
 	}
 }
 
+func (d *Driver) removeCachedFile(fileID string) {
+	d.fileMu.Lock()
+	delete(d.files, fileID)
+	d.fileMu.Unlock()
+}
+
 func (d *Driver) cachedFile(fileID string) (panFile, string, bool) {
 	d.fileMu.RLock()
 	defer d.fileMu.RUnlock()
@@ -1008,7 +1041,7 @@ func loginError(message string) error {
 	message = strings.TrimSpace(message)
 	if strings.Contains(message, "境外登录风险") ||
 		(strings.Contains(message, "短信验证码") && strings.Contains(message, "微信")) {
-		return errors.New("123pan login: 账号密码登录被 123 云盘风控拦截，请在浏览器完成短信/微信验证后复制 access_token，并在后台编辑该 123 云盘时只填写 access_token")
+		return errors.New("123pan login: 账号密码登录被 123网盘风控拦截，请在浏览器完成短信/微信验证后复制 access_token，并在后台编辑该 123网盘时只填写 access_token")
 	}
 	if message == "" {
 		message = "login failed"
@@ -1111,3 +1144,4 @@ func guessMime(name string) string {
 }
 
 var _ drives.Drive = (*Driver)(nil)
+var _ drives.Remover = (*Driver)(nil)

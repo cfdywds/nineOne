@@ -14,9 +14,9 @@ test("admin videos page uses responsive page size", () => {
 
 test("admin videos batch delete runs deletions sequentially", () => {
   assert.match(videosPageSource, /for \(const id of ids\) \{/);
-  assert.match(videosPageSource, /const result = await api\.deleteVideo\(id\);/);
+  assert.match(videosPageSource, /const result = await api\.deleteVideo\(id, \{ deleteSource: batchDeleteSource \}\);/);
   assert.doesNotMatch(
     videosPageSource,
-    /Promise\.allSettled\(\s*ids\.map\(\(id\) => api\.deleteVideo\(id\)\)\s*\)/
+    /Promise\.allSettled\(\s*ids\.map\(\(id\) => api\.deleteVideo\(id(?:, [^)]+)?\)\)\s*\)/
   );
 });

@@ -23,17 +23,24 @@ const maxSTRMBytes = 64 * 1024
 type Config struct {
 	ID       string
 	RootPath string
+	// STRMAllowOutsideRoot 允许 .strm 指向存储根目录之外的本地路径。
+	// 默认关闭：strm 等于可以让 /p/stream 读到服务器上的任意文件，只有
+	// 管理员明确知道自己在做什么（例如 strm 库与 rclone 挂载目录分离）
+	// 时才应打开。
+	STRMAllowOutsideRoot bool
 }
 
 type Driver struct {
-	id       string
-	rootPath string
+	id                   string
+	rootPath             string
+	strmAllowOutsideRoot bool
 }
 
 func New(c Config) *Driver {
 	return &Driver{
-		id:       c.ID,
-		rootPath: c.RootPath,
+		id:                   c.ID,
+		rootPath:             c.RootPath,
+		strmAllowOutsideRoot: c.STRMAllowOutsideRoot,
 	}
 }
 
@@ -230,8 +237,8 @@ func (d *Driver) localSTRMLink(strmPath, target string) (*drives.StreamLink, err
 	if err != nil {
 		return nil, err
 	}
-	if !within {
-		return nil, errors.New("localstorage: strm target escapes root")
+	if !within && !d.strmAllowOutsideRoot {
+		return nil, errors.New("localstorage: strm target escapes root (enable strm_allow_outside_root to allow)")
 	}
 	if strings.EqualFold(filepath.Ext(p), ".strm") || strings.EqualFold(filepath.Ext(realPath), ".strm") {
 		return nil, errors.New("localstorage: nested strm target is not supported")
@@ -257,6 +264,39 @@ func (d *Driver) EnsureDir(context.Context, string) (string, error) {
 	return "", drives.ErrNotSupported
 }
 
+func (d *Driver) Remove(ctx context.Context, fileID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	p, rel, err := d.pathForID(fileID)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if rel == "" {
+		return errors.New("localstorage: refusing to remove root")
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if info.IsDir() {
+		return errors.New("localstorage: refusing to remove directory")
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("localstorage: refusing to remove non-regular file")
+	}
+	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 func (d *Driver) root() (string, error) {
 	raw := strings.TrimSpace(d.rootPath)
 	if raw == "" {
@@ -275,6 +315,8 @@ func (d *Driver) root() (string, error) {
 	}
 	return filepath.Abs(raw)
 }
+
+var _ drives.Remover = (*Driver)(nil)
 
 func (d *Driver) pathForID(id string) (string, string, error) {
 	root, err := d.root()

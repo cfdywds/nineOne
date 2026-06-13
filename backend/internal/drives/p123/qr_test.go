@@ -150,7 +150,7 @@ func TestQRCodePollUsesAppToken(t *testing.T) {
 	if wxCodeRequested {
 		t.Fatalf("wx_code should not be called when app token is already returned")
 	}
-	if got.AccessToken != "app-token" || got.PlatformText != "123 云盘 App" {
+	if got.AccessToken != "app-token" || got.PlatformText != "123网盘 App" {
 		t.Fatalf("status = %#v, want app token", got)
 	}
 }

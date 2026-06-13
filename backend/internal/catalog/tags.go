@@ -66,6 +66,21 @@ func (c *Catalog) migrate(ctx context.Context) error {
 	if err := c.addColumnIfMissing(ctx, "videos", "thumbnail_failures", "INTEGER DEFAULT 0"); err != nil {
 		return err
 	}
+	// videos.transcode_*：浏览器兼容性转码状态。
+	// status：''=未检测 / pending=已入队 / ready=已转码 / skipped=检测后无需转码 / failed=失败。
+	// transcoded_file_id 指向转码产物在同一 drive 上的 fileID，播放源优先使用它。
+	if err := c.addColumnIfMissing(ctx, "videos", "transcode_status", "TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := c.addColumnIfMissing(ctx, "videos", "transcode_error", "TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := c.addColumnIfMissing(ctx, "videos", "transcoded_file_id", "TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := c.addColumnIfMissing(ctx, "videos", "transcoded_size", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
 	// drives.teaser_enabled：每盘预览视频开关，替代旧的全局 preview.enabled。
 	// 升级路径：直接让 ALTER TABLE 的 DEFAULT 1 兜底 —— 每个现存 drive 都默认开启，
 	// 不读旧的 settings.preview.enabled 字段。这样老用户即便之前关过全局开关，
@@ -297,7 +312,7 @@ UPDATE videos
 }
 
 func (c *Catalog) clearRemoteP123ThumbnailsOnce(ctx context.Context) error {
-	// 123 云盘列表返回的缩略图尺寸和稳定性都不适合作为站内封面；清空历史写入的
+	// 123网盘列表返回的缩略图尺寸和稳定性都不适合作为站内封面；清空历史写入的
 	// 远程 URL，让封面 worker 统一从视频直链抽帧生成本地 /p/thumb/<id>。
 	const markerKey = "videos.p123.remote_thumbnails_cleared"
 	marker, err := c.GetSetting(ctx, markerKey, "")

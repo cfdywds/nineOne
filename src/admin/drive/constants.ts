@@ -23,12 +23,22 @@ export const kindAbbr: Record<string, string> = {
   spiderxvideos: "XV",
 };
 
+export function driveKindAbbr(kind: string): string {
+  const explicit = kindAbbr[kind];
+  if (explicit) return explicit;
+
+  const trimmed = kind.trim();
+  if (!trimmed) return "??";
+  const compact = trimmed.replace(/[^a-zA-Z0-9]+/g, "");
+  return (compact || trimmed).slice(0, 2).toUpperCase();
+}
+
 export const kindLabel: Record<string, string> = {
   quark: "夸克网盘",
   p115: "115 网盘",
-  p123: "123 云盘",
+  p123: "123网盘",
   pikpak: "PikPak",
-  wopan: "联通沃盘",
+  wopan: "联通网盘",
   onedrive: "OneDrive",
   googledrive: "Google Drive",
   localstorage: "本地存储",
@@ -72,12 +82,13 @@ export function nightlyButtonText(status: { running: boolean; queued: boolean },
 }
 
 export function nightlyBusyText(status: { running: boolean; queued: boolean }) {
-  if (status.running) return "扫描任务正在运行";
-  if (status.queued) return "扫描任务已排队";
+  if (status.running || status.queued) return "当前有全量扫描任务正在进行，请稍后重试";
   return "";
 }
 
 export function generationStateLabel(state: string): string {
+  if (state === "scanning") return "扫盘中";
+  if (state === "uploading") return "上传中";
   if (state === "generating") return "生成中";
   if (state === "cooling") return "冷却中";
   if (state === "queued") return "排队中";
@@ -85,7 +96,8 @@ export function generationStateLabel(state: string): string {
 }
 
 export function generationStateClass(state: string): string {
-  if (state === "generating" || state === "cooling" || state === "queued") {
+  if (state === "scanning" || state === "uploading" || state === "generating" || state === "cooling" || state === "queued") {
+    if (state === "scanning" || state === "uploading") return "generating";
     return state;
   }
   return "idle";
@@ -154,19 +166,21 @@ export function credentialHelp(kind: Kind, isEdit: boolean): string {
     case "p115":
       return `登录 115.com 后复制 Cookie，形如 "UID=...; CID=...; SEID=...; KID=..."。${note}`;
     case "p123":
-      return `推荐使用扫码登录自动获取 access_token；账号密码登录被 123 云盘风控拦截时，也可以只填写 access_token。播放走 302 跳转到 123 云盘返回的短期 CDN 地址。${note}`;
+      return `推荐使用扫码登录自动获取 access_token；账号密码登录被 123网盘风控拦截时，也可以只填写 access_token。播放走 302 跳转到 123网盘返回的短期 CDN 地址。${note}`;
     case "pikpak":
       return `填写 PikPak 账号和密码即可。平台、设备 ID、验证码 token 和 refresh token 会由服务端自动处理并保存。${note}`;
     case "wopan":
-      return `需要 access_token 和 refresh_token。后续会加扫码/短信登录入口，第一版只能手工粘贴。${note}`;
+      return `推荐使用扫码登录自动获取 access_token 和 refresh_token；也可以手工粘贴已有凭证。${note}`;
     case "onedrive":
       return `按 OpenList 默认应用在线挂载，只需要 refresh_token；保存时会自动刷新并保存 token。${note}`;
     case "googledrive":
-      return `按 OpenList 在线 API 挂载，只需要 Google Drive refresh_token；保存时会自动刷新并保存 token。播放不走 302，会由后端带 Authorization 代理转发。${note}`;
+      return isEdit
+        ? "请参考OpenList文档中关于谷歌云盘的配置方法；如不修改凭证，留空即可，保存时会沿用旧值"
+        : "请参考OpenList文档中关于谷歌云盘的配置方法";
     case "localstorage":
-      return `填写服务器可访问的本地目录绝对路径，例如 /mnt/videos。系统会扫描该目录及子目录中的视频文件和 .strm 文件；.strm 可指向 HTTP/HTTPS 直链，或指向本地存储根目录内的真实视频路径。Docker 部署时请填写容器内路径。${note}`;
+      return `填写服务器可访问的本地目录绝对路径，例如 /mnt/videos。系统会扫描该目录及子目录中的视频文件和 .strm 文件；.strm 可指向 HTTP/HTTPS 直链或本地视频路径（指向目录外需开启下方开关）。Docker 部署时请填写容器内路径。${note}`;
     case "spider91":
-      return "91 爬虫会把定时抓取到的视频和封面先保存到本机，并作为一个视频来源接入站点；可按服务器网络情况单独配置代理。后续流水线会把较早的视频上传到你选择的 115 / PikPak / OneDrive 目标盘。";
+      return "91Spider 不再支持通过网盘添加或编辑。请到后台爬虫管理页面添加爬虫脚本。";
     case "spiderxvideos":
       return "XVideos 爬虫会把定时抓取到的视频和封面先保存到本机，并作为一个视频来源接入站点；可按服务器网络情况单独配置代理和过滤条件。";
     default:
@@ -174,14 +188,31 @@ export function credentialHelp(kind: Kind, isEdit: boolean): string {
   }
 }
 
-export function credentialFields(kind: Kind): Array<{
+export type CredentialField = {
   key: string;
   label: string;
   placeholder: string;
+  type?: "text" | "select";
+  options?: Array<{ value: string; label: string }>;
   multiline?: boolean;
   required?: boolean;
+  defaultValue?: string;
   help?: string;
-}> {
+};
+
+export function credentialBoolValue(value: string | undefined, defaultValue: boolean): boolean {
+  const normalized = (value ?? "").trim().toLowerCase();
+  if (normalized === "") return defaultValue;
+  if (normalized === "true" || normalized === "1" || normalized === "yes" || normalized === "on") return true;
+  if (normalized === "false" || normalized === "0" || normalized === "no" || normalized === "off") return false;
+  return defaultValue;
+}
+
+export function googleDriveUsesOnlineAPI(creds: Record<string, string> = {}): boolean {
+  return credentialBoolValue(creds.use_online_api, true);
+}
+
+export function credentialFields(kind: Kind, creds: Record<string, string> = {}): CredentialField[] {
   switch (kind) {
     case "quark":
       return [
@@ -213,7 +244,7 @@ export function credentialFields(kind: Kind): Array<{
         {
           key: "password",
           label: "密码（可选）",
-          placeholder: "123 云盘密码",
+          placeholder: "123网盘密码",
         },
         {
           key: "access_token",
@@ -245,6 +276,7 @@ export function credentialFields(kind: Kind): Array<{
           label: "access_token",
           placeholder: "",
           required: true,
+          help: "扫码成功后会自动填入该字段；如果 token 过期，重新扫码后保存即可。",
         },
         {
           key: "refresh_token",
@@ -271,12 +303,41 @@ export function credentialFields(kind: Kind): Array<{
     case "googledrive":
       return [
         {
+          key: "use_online_api",
+          label: "认证方式",
+          placeholder: "",
+          type: "select",
+          defaultValue: "true",
+          options: [
+            { value: "true", label: "OpenList 在线 API" },
+            { value: "false", label: "自建 Google OAuth 客户端" },
+          ],
+        },
+        {
           key: "refresh_token",
           label: "refresh_token",
           placeholder: "OpenList Google Drive refresh_token",
           multiline: true,
           required: true,
         },
+        ...(googleDriveUsesOnlineAPI(creds)
+          ? []
+          : [
+              {
+                key: "client_id",
+                label: "客户端 ID",
+                placeholder: "xxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com",
+                required: true,
+                help: "Google Cloud Console 中 OAuth 2.0 客户端的 Client ID",
+              },
+              {
+                key: "client_secret",
+                label: "客户端密钥",
+                placeholder: "Google OAuth client secret",
+                required: true,
+                help: "Google Cloud Console 中同一个 OAuth 客户端的 Client Secret",
+              },
+            ]),
       ];
     case "localstorage":
       return [
@@ -286,6 +347,18 @@ export function credentialFields(kind: Kind): Array<{
           placeholder: "/mnt/videos",
           required: true,
           help: "路径必须是后端服务器上的已有目录；保存后可手动重扫，系统会递归扫描支持的视频格式。",
+        },
+        {
+          key: "strm_allow_outside_root",
+          label: ".strm 允许指向目录外",
+          placeholder: "",
+          type: "select",
+          defaultValue: "false",
+          options: [
+            { value: "false", label: "关闭（默认，仅允许目录内路径）" },
+            { value: "true", label: "开启（允许任意本地路径）" },
+          ],
+          help: "开启后 .strm 可指向本目录之外的本地文件（如 rclone 挂载点）。注意：等于允许通过 .strm 读取服务器上任意文件，请只在自己完全掌控媒体目录时开启。Docker 部署时路径必须是容器内路径。",
         },
       ];
     case "spider91":

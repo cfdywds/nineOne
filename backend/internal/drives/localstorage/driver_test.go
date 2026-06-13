@@ -195,6 +195,46 @@ func TestStreamURLRejectsSTRMTargetEscapingRootThroughSymlink(t *testing.T) {
 	}
 }
 
+func TestStreamURLAllowsSTRMTargetOutsideRootWhenEnabled(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	target := filepath.Join(outside, "movie.mp4")
+	writeLocalStorageTestFile(t, target, []byte("movie-data"))
+	writeLocalStorageTestFile(t, filepath.Join(root, "movie.strm"), []byte(target+"\n"))
+
+	// 默认关闭：根目录外的目标仍被拒绝
+	strict := New(Config{ID: "local", RootPath: root})
+	if _, err := strict.StreamURL(context.Background(), encodeRel("movie.strm")); err == nil || !strings.Contains(err.Error(), "strm target escapes root") {
+		t.Fatalf("default error = %v, want strm target escapes root", err)
+	}
+
+	// 开启 strm_allow_outside_root 后放行
+	relaxed := New(Config{ID: "local", RootPath: root, STRMAllowOutsideRoot: true})
+	link, err := relaxed.StreamURL(context.Background(), encodeRel("movie.strm"))
+	if err != nil {
+		t.Fatalf("StreamURL with allow-outside-root: %v", err)
+	}
+	resolved, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatalf("eval target: %v", err)
+	}
+	if link.URL != resolved {
+		t.Fatalf("link url = %q, want %q", link.URL, resolved)
+	}
+}
+
+func TestStreamURLAllowOutsideRootStillRejectsNestedSTRM(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	writeLocalStorageTestFile(t, filepath.Join(outside, "inner.strm"), []byte("http://example.com/v.mp4\n"))
+	writeLocalStorageTestFile(t, filepath.Join(root, "movie.strm"), []byte(filepath.Join(outside, "inner.strm")+"\n"))
+
+	drv := New(Config{ID: "local", RootPath: root, STRMAllowOutsideRoot: true})
+	if _, err := drv.StreamURL(context.Background(), encodeRel("movie.strm")); err == nil || !strings.Contains(err.Error(), "nested strm") {
+		t.Fatalf("error = %v, want nested strm rejection", err)
+	}
+}
+
 func TestStreamURLRejectsSymlinkFileIDEscapingRoot(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()

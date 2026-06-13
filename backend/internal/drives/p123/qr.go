@@ -278,7 +278,7 @@ func qrScanPlatformText(platform int) string {
 	case 4:
 		return "微信"
 	case 7:
-		return "123 云盘 App"
+		return "123网盘 App"
 	default:
 		return ""
 	}

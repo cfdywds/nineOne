@@ -2,7 +2,7 @@
 
 视频聚合站的 Go 后端。提供三件事：
 
-1. 多家网盘统一抽象（夸克 / 115 / PikPak / 联通沃盘 / OneDrive / Google Drive / 本地存储）
+1. 多家网盘统一抽象（夸克 / 115 / PikPak / 联通网盘 / OneDrive / Google Drive / 本地存储）
 2. 视频元数据目录（SQLite）+ 扫描 + 预览视频预生成
 3. REST API（前台）+ 管理后台 + 直链代理
 4. 标签池、视频隐藏、按网盘统计和详情页来源网盘类型展示能力
@@ -19,7 +19,7 @@ internal/
     quark/                  夸克（自己实现，参考 OpenList quark_uc）
     p115/                   115（壳子 + SheltonZhu/115driver）
     pikpak/                 PikPak（自己实现，参考 OpenList pikpak）
-    wopan/                  联通沃盘（壳子 + OpenListTeam/wopan-sdk-go）
+    wopan/                  联通网盘（壳子 + OpenListTeam/wopan-sdk-go）
     onedrive/               OneDrive（OpenList 在线续期 + Microsoft Graph 文件接口）
     googledrive/            Google Drive（OpenList 在线续期 + Google Drive API；播放走后端代理）
     localstorage/           本地目录扫描（服务器已有视频目录）
@@ -109,7 +109,7 @@ go run ./cmd/server 后端 9192
 | pikpak | `username`、`password`（token、验证码和设备 ID 由服务端自动处理并保存） |
 | wopan  | `access_token`、`refresh_token`，可选 `family_id`              |
 | onedrive | `refresh_token` |
-| googledrive | `refresh_token` |
+| googledrive | 默认只需 `refresh_token`；自建 OAuth 客户端模式还需 `use_online_api=false`、`client_id`、`client_secret` |
 | localstorage | `path`（服务器上的已有视频目录，如 `/mnt/videos`） |
 
 ### PikPak 速度说明
@@ -120,7 +120,7 @@ go run ./cmd/server 后端 9192
 
 OneDrive 按 OpenList 默认应用方式调用 `https://api.oplist.org/onedrive/renewapi` 在线刷新 token，不需要配置 Azure 应用的 `client_id` / `client_secret` / `redirect_uri`。后台新建 OneDrive 时只需要填 OpenList 代刷得到的 `refresh_token`；服务端会默认挂载根目录并自动回写新 token。
 
-Google Drive 按 OpenList 在线 API 调用 `https://api.oplist.org/googleui/renewapi` 刷新 token。后台新建 Google Drive 时只需要填 OpenList Google Drive 获取到的 `refresh_token`。Google Drive 下载地址必须携带 `Authorization` 头，浏览器不能直接 302 使用，所以本站会由后端代理 `/p/stream` 播放，不加入零带宽 302 白名单。
+Google Drive 默认按 OpenList 在线 API 调用 `https://api.oplist.org/googleui/renewapi` 刷新 token。后台新建 Google Drive 时只需要填 OpenList Google Drive 获取到的 `refresh_token`。如果不想依赖 OpenList 在线 API，可以关闭“使用 OpenList 在线续期 API”，并填写同一个 Google OAuth 客户端授权得到的 `refresh_token`、`client_id`、`client_secret`，服务端会直接请求 Google OAuth token 接口续期。Google Drive 下载地址必须携带 `Authorization` 头，浏览器不能直接 302 使用，所以本站会由后端代理 `/p/stream` 播放，不加入零带宽 302 白名单。
 
 ## 文件名约定
 
@@ -145,18 +145,18 @@ Google Drive 按 OpenList 在线 API 调用 `https://api.oplist.org/googleui/ren
 
 1. 同一网盘同一文件按 `(drive_id, file_id)` 形成稳定视频 ID，重复扫描只更新同一行。
 2. 扫描时优先按网盘侧 `content_hash` 去重；没有 hash 时退化为 `file_name + size_bytes`。
-3. 扫描、爬虫、本地上传或服务启动挂载网盘后，后台指纹 worker 会异步读取视频的少量 Range 片段，生成 `sampled_sha256`。前台列表、首页、搜索、推荐会按 `size_bytes + sampled_sha256` 只展示最早入库的 canonical 视频。
+3. 扫描、本地上传或服务启动挂载网盘后，后台指纹 worker 会异步读取视频的少量 Range 片段，生成 `sampled_sha256`。前台列表、首页、搜索、推荐会按 `size_bytes + sampled_sha256` 只展示最早入库的 canonical 视频。
 
-`sampled_sha256` 是文件级去重：适合识别同一个视频文件被复制到 115 / PikPak / OneDrive 等不同网盘的情况。它不会删除任何网盘文件，也不用于识别转码、裁剪、加水印后的同源视频。
+`sampled_sha256` 是文件级去重：适合识别同一个视频文件被复制到 115 / PikPak / OneDrive / Google Drive 等不同网盘的情况。它不会删除任何网盘文件，也不用于识别转码、裁剪、加水印后的同源视频。
 
 封面和预览视频仍然优先生成，不等待指纹完成。夜间流水线最后会做一次重复资产清理：对 `size_bytes + sampled_sha256` 命中的非 canonical 视频，只删除本机生成的重复封面和预览视频，并把对应字段重置为 `pending`。网盘原文件和视频元数据记录不会被删除；如果 canonical 视频以后被移除，这些重复项会重新进入生成队列。
 
 ## 管理能力
 
 - `/admin/drives`：新增、编辑、删除网盘，触发扫描。
-- `/admin/videos`：按网盘筛选视频，每页 100 条分页，查看各网盘预览视频统计，编辑标题/作者/分类/标签，单条或全量重生预览视频。
+- `/admin/videos`：按网盘筛选视频，每页 100 条分页，查看各网盘预览视频统计，编辑标题/作者/分类/标签，单条或全量重生预览视频；拉黑视频页可查看被删除或被隐藏的视频，并支持移出黑名单后在下次扫盘重新入库。
 - `/admin/tags`：新增标签并用内置规则自动匹配已有视频；删除非系统标签时会从所有视频上同步移除该标签。
-- 播放页视频信息会展示来源网盘类型；同时提供“不再展示”，点击后会把视频标记为全局隐藏。隐藏视频不会再出现在首页、列表、搜索、相关推荐和详情接口中。目前没有管理后台恢复入口，如需恢复可把数据库里对应视频的 `hidden` 字段改回 `0`。
+- 播放页视频信息会展示来源网盘类型，并提供删除入口。被删除或被隐藏的视频会进入黑名单，不会再出现在首页、列表、搜索和详情接口中；在后台移出黑名单后，会在下次扫盘时重新发现并入库。
 
 ## 预览视频生成
 
@@ -170,7 +170,7 @@ ffmpeg -ss <起点> -headers "UA/Cookie/Referer" -i <直链> \
 
 当前策略是每段固定 3 秒；30 秒以下最多 3 段，30 秒及以上固定 4 段；长视频在 20% 到 80% 区间均匀取段。生成的预览视频和封面都只保存在本地 `data/previews/`，不会回写到网盘；旧数据中的 `preview_file_id` 会被忽略。
 
-服务启动或网盘重新挂载时，如果预览视频开关已开启，后端会把历史 `pending` 任务重新入队，避免重启后长期停在“待生成”。OneDrive 扫盘和直链生成预览视频 / 封面时可能触发 Microsoft Graph 429、`TooManyRequests`、`activityLimitReached` 或 throttled 文本；后端会识别这类错误并让当前网盘进入冷却期，保留任务为 `pending`，避免连续请求触发更严重限流。扫盘阶段会按 `Retry-After` 或默认冷却时间等待后继续当前目录。
+服务启动或网盘重新挂载时，如果预览视频开关已开启，后端会把历史 `pending` 任务重新入队，避免重启后长期停在“待生成”。OneDrive 扫盘和直链生成预览视频 / 封面时可能触发 Microsoft Graph 429、`TooManyRequests`、`activityLimitReached` 或 throttled 文本；Google Drive 可能返回 429、`usageLimits`、`userRateLimitExceeded`、`downloadQuotaExceeded` 等限制标识。后端会识别这类错误并让当前网盘进入冷却期，保留任务为 `pending`，避免连续请求触发更严重限流。扫盘阶段会按 `Retry-After` 或默认冷却时间等待后继续当前目录。
 
 前端卡片的 `previewSrc` 统一指向 `/p/preview/<videoID>`，后端只从本地 `preview_local` 文件读取。
 

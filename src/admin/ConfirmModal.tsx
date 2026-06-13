@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { AlertTriangle } from "lucide-react";
 import { Modal } from "./Modal";
 
@@ -12,6 +13,7 @@ type ConfirmModalProps = {
   centerMessage?: boolean;
   modalClassName?: string;
   loading?: boolean;
+  children?: ReactNode;
   onCancel: () => void;
   onConfirm: () => void;
 };
@@ -27,6 +29,7 @@ export function ConfirmModal({
   centerMessage = false,
   modalClassName = "",
   loading = false,
+  children,
   onCancel,
   onConfirm,
 }: ConfirmModalProps) {
@@ -65,6 +68,7 @@ export function ConfirmModal({
               ))}
             </ul>
           )}
+          {children}
         </div>
       </div>
     </Modal>

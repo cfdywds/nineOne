@@ -14,10 +14,13 @@ import (
 
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/drives/googledrive"
 	"github.com/video-site/backend/internal/drives/p123"
 	"github.com/video-site/backend/internal/drives/pikpak"
+	"github.com/video-site/backend/internal/drives/scriptcrawler"
 	"github.com/video-site/backend/internal/drives/spider91"
 	"github.com/video-site/backend/internal/drives/spiderxvideos"
+	"github.com/video-site/backend/internal/drives/wopan"
 )
 
 // fakeRegistry 是 Registry 接口的最小实现。
@@ -353,6 +356,19 @@ func setupSpiderXVideos(t *testing.T) (*spiderxvideos.Driver, string) {
 	return d, root
 }
 
+func seedSpiderXVideosDrive(t *testing.T, cat *catalog.Catalog, d *spiderxvideos.Driver) {
+	t.Helper()
+	if err := cat.UpsertDrive(context.Background(), &catalog.Drive{
+		ID:          d.ID(),
+		Kind:        spiderxvideos.Kind,
+		Name:        "XVideos",
+		RootID:      "/",
+		Credentials: map[string]string{},
+	}); err != nil {
+		t.Fatalf("seed spiderxvideos drive: %v", err)
+	}
+}
+
 func writeSpiderXVideosVideo(t *testing.T, cat *catalog.Catalog, d *spiderxvideos.Driver, sourceID, ext string, content []byte, publishedAt time.Time) string {
 	t.Helper()
 	fileID := sourceID + ext
@@ -390,6 +406,81 @@ func writeSpiderXVideosVideo(t *testing.T, cat *catalog.Catalog, d *spiderxvideo
 	}
 	if err := cat.UpsertVideo(context.Background(), v); err != nil {
 		t.Fatalf("upsert xvideos video: %v", err)
+	}
+	return id
+}
+
+func setupScriptCrawler(t *testing.T, id string) *scriptcrawler.Driver {
+	t.Helper()
+	d := scriptcrawler.New(scriptcrawler.Config{ID: id, RootDir: t.TempDir()})
+	if err := d.Init(context.Background()); err != nil {
+		t.Fatalf("scriptcrawler init: %v", err)
+	}
+	return d
+}
+
+func seedScriptCrawlerDrive(t *testing.T, cat *catalog.Catalog, d *scriptcrawler.Driver, uploadDriveID string) {
+	t.Helper()
+	if err := cat.UpsertDrive(context.Background(), &catalog.Drive{
+		ID:     d.ID(),
+		Kind:   scriptcrawler.Kind,
+		Name:   "Script Crawler",
+		RootID: "/",
+		Credentials: map[string]string{
+			"script_path":     "/tmp/crawler.py",
+			"upload_drive_id": uploadDriveID,
+		},
+	}); err != nil {
+		t.Fatalf("seed scriptcrawler drive: %v", err)
+	}
+}
+
+func writeScriptCrawlerVideo(t *testing.T, cat *catalog.Catalog, d *scriptcrawler.Driver, sourceID, ext string, content []byte, readyAssets bool) string {
+	t.Helper()
+	fileID := sourceID + ext
+	path, err := d.VideoPath(fileID)
+	if err != nil {
+		t.Fatalf("video path: %v", err)
+	}
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatalf("write video: %v", err)
+	}
+	thumbPath, err := d.ThumbPath(sourceID + ".jpg")
+	if err != nil {
+		t.Fatalf("thumb path: %v", err)
+	}
+	if err := os.WriteFile(thumbPath, []byte("thumb"), 0o644); err != nil {
+		t.Fatalf("write thumb: %v", err)
+	}
+	now := time.Now()
+	id := scriptcrawler.BuildVideoID(d.ID(), sourceID)
+	previewStatus := "pending"
+	if readyAssets {
+		previewStatus = "ready"
+	}
+	v := &catalog.Video{
+		ID:            id,
+		DriveID:       d.ID(),
+		FileID:        fileID,
+		FileName:      fileID,
+		Title:         "Crawler " + sourceID,
+		Author:        "tester",
+		Ext:           strings.TrimPrefix(ext, "."),
+		Quality:       "HD",
+		Size:          int64(len(content)),
+		ThumbnailURL:  "/p/thumb/" + id,
+		PreviewStatus: previewStatus,
+		PublishedAt:   now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	if err := cat.UpsertVideo(context.Background(), v); err != nil {
+		t.Fatalf("upsert scriptcrawler video: %v", err)
+	}
+	if readyAssets {
+		if err := cat.UpdateVideoFingerprint(context.Background(), id, "sampled-"+sourceID, "ready", ""); err != nil {
+			t.Fatalf("mark fingerprint ready: %v", err)
+		}
 	}
 	return id
 }
@@ -473,6 +564,7 @@ func TestRunOnceMigratesSpiderXVideosVideosAndCleansLocalFiles(t *testing.T) {
 	cat := setupCatalog(t)
 	src, _ := setupSpiderXVideos(t)
 	pp := newFakePikPak("pikpak-target", "pikpak-root-id")
+	seedSpiderXVideosDrive(t, cat, src)
 
 	reg := newFakeRegistry()
 	reg.Add(src)
@@ -480,17 +572,30 @@ func TestRunOnceMigratesSpiderXVideosVideosAndCleansLocalFiles(t *testing.T) {
 
 	now := time.Now()
 	id := writeSpiderXVideosVideo(t, cat, src, "12345678", ".mp4", []byte("xvideos bytes here"), now)
+	commonThumbDir := t.TempDir()
 
 	m := New(Config{
 		Catalog:          cat,
 		Registry:         reg,
 		GetTargetDriveID: func() string { return pp.ID() },
 		KeepLatestN:      -1,
+		CommonThumbDir:   commonThumbDir,
 	})
 	m.runOnce(context.Background())
 
 	if pp.uploadCalls != 1 {
 		t.Fatalf("upload calls = %d, want 1", pp.uploadCalls)
+	}
+	wantDir := "Script Crawlers/xvideos-x"
+	if len(pp.ensureCalls) != 1 || pp.ensureCalls[0] != wantDir {
+		t.Fatalf("ensure calls = %#v, want %q", pp.ensureCalls, wantDir)
+	}
+	wantName := desiredPikPakName("XVideos Sample 12345678", "12345678", "mp4")
+	if gotParent := pp.gotParents[wantName]; gotParent != "pikpak-root-id/"+wantDir {
+		t.Fatalf("upload parent = %q, want root/%s", gotParent, wantDir)
+	}
+	if _, ok := pp.gotBodies[wantName]; !ok {
+		t.Fatalf("target did not receive expected upload name %q (got names: %v)", wantName, keysOf(pp.gotBodies))
 	}
 	got, err := cat.GetVideo(context.Background(), id)
 	if err != nil {
@@ -498,13 +603,6 @@ func TestRunOnceMigratesSpiderXVideosVideosAndCleansLocalFiles(t *testing.T) {
 	}
 	if got.DriveID != pp.ID() {
 		t.Fatalf("drive_id = %q, want %q", got.DriveID, pp.ID())
-	}
-	wantName := desiredMigratedName("XVideos Sample 12345678", id, "mp4")
-	if !strings.HasPrefix(wantName, "xvideos-") {
-		t.Fatalf("xvideos migrated name = %q, want xvideos- prefix", wantName)
-	}
-	if _, ok := pp.gotBodies[wantName]; !ok {
-		t.Fatalf("target did not receive expected upload name %q (got names: %v)", wantName, keysOf(pp.gotBodies))
 	}
 	if got.FileName != wantName {
 		t.Fatalf("file_name = %q, want %q", got.FileName, wantName)
@@ -516,6 +614,178 @@ func TestRunOnceMigratesSpiderXVideosVideosAndCleansLocalFiles(t *testing.T) {
 	thumbPath, _ := src.ThumbPath("12345678.jpg")
 	if _, err := os.Stat(thumbPath); !os.IsNotExist(err) {
 		t.Fatalf("local xvideos thumb still exists or stat error %v", err)
+	}
+	commonThumbPath := filepath.Join(commonThumbDir, id+".jpg")
+	if data, err := os.ReadFile(commonThumbPath); err != nil || string(data) != "thumb" {
+		t.Fatalf("common thumb = %q, %v; want copied crawled thumb", string(data), err)
+	}
+}
+
+func TestRunOnceMigratesReadyScriptCrawlerVideoToConfiguredUploadDrive(t *testing.T) {
+	cat := setupCatalog(t)
+	src := setupScriptCrawler(t, "crawler-alpha")
+	pp := newFakePikPak("pikpak-target", "pikpak-root-id")
+	seedScriptCrawlerDrive(t, cat, src, pp.ID())
+
+	reg := newFakeRegistry()
+	reg.Add(src)
+	reg.Add(pp)
+
+	id := writeScriptCrawlerVideo(t, cat, src, "source-with-dash-001", ".mp4", []byte("script video bytes"), true)
+	commonThumbDir := t.TempDir()
+
+	m := New(Config{
+		Catalog:        cat,
+		Registry:       reg,
+		CommonThumbDir: commonThumbDir,
+	})
+	m.runOnce(context.Background())
+
+	if pp.uploadCalls != 1 {
+		t.Fatalf("upload calls = %d, want 1", pp.uploadCalls)
+	}
+	wantDir := "Script Crawlers/crawler-alpha"
+	if len(pp.ensureCalls) != 1 || pp.ensureCalls[0] != wantDir {
+		t.Fatalf("ensure calls = %#v, want %q", pp.ensureCalls, wantDir)
+	}
+	wantName := desiredPikPakName("Crawler source-with-dash-001", "source-with-dash-001", "mp4")
+	if gotParent := pp.gotParents[wantName]; gotParent != "pikpak-root-id/"+wantDir {
+		t.Fatalf("upload parent = %q, want root/%s", gotParent, wantDir)
+	}
+
+	got, err := cat.GetVideo(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get migrated video: %v", err)
+	}
+	if got.DriveID != pp.ID() {
+		t.Fatalf("drive_id = %q, want %q", got.DriveID, pp.ID())
+	}
+	if got.FileID != "remote-"+wantName {
+		t.Fatalf("file_id = %q, want remote upload id", got.FileID)
+	}
+	if got.FileName != wantName {
+		t.Fatalf("file_name = %q, want %q", got.FileName, wantName)
+	}
+	if got.PreviewStatus != "ready" || got.FingerprintStatus != "ready" || got.SampledSHA256 == "" {
+		t.Fatalf("generated assets not preserved after migration: preview=%q fingerprint=%q sampled=%q", got.PreviewStatus, got.FingerprintStatus, got.SampledSHA256)
+	}
+	videoPath, _ := src.VideoPath("source-with-dash-001.mp4")
+	if _, err := os.Stat(videoPath); !os.IsNotExist(err) {
+		t.Fatalf("local scriptcrawler video still exists or stat error %v", err)
+	}
+	thumbPath, _ := src.ThumbPath("source-with-dash-001.jpg")
+	if _, err := os.Stat(thumbPath); !os.IsNotExist(err) {
+		t.Fatalf("local scriptcrawler thumb still exists or stat error %v", err)
+	}
+	commonThumbPath := filepath.Join(commonThumbDir, id+".jpg")
+	if data, err := os.ReadFile(commonThumbPath); err != nil || string(data) != "thumb" {
+		t.Fatalf("common thumb = %q, %v; want copied crawled thumb", string(data), err)
+	}
+}
+
+func TestRunOnceSkipsScriptCrawlerVideoUntilPreviewAndFingerprintReady(t *testing.T) {
+	cat := setupCatalog(t)
+	src := setupScriptCrawler(t, "crawler-beta")
+	pp := newFakePikPak("pikpak-target", "pikpak-root-id")
+	seedScriptCrawlerDrive(t, cat, src, pp.ID())
+
+	reg := newFakeRegistry()
+	reg.Add(src)
+	reg.Add(pp)
+
+	id := writeScriptCrawlerVideo(t, cat, src, "pending-assets", ".mp4", []byte("script video bytes"), false)
+	m := New(Config{Catalog: cat, Registry: reg})
+	m.runOnce(context.Background())
+
+	if pp.uploadCalls != 0 {
+		t.Fatalf("upload calls = %d, want 0 while generated assets are pending", pp.uploadCalls)
+	}
+	got, err := cat.GetVideo(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if got.DriveID != src.ID() {
+		t.Fatalf("drive_id = %q, want local crawler drive %q", got.DriveID, src.ID())
+	}
+	videoPath, _ := src.VideoPath("pending-assets.mp4")
+	if _, err := os.Stat(videoPath); err != nil {
+		t.Fatalf("local video should remain while assets pending: %v", err)
+	}
+}
+
+func TestRunOnceBindsScriptCrawlerDuplicateToExistingTargetWithoutUpload(t *testing.T) {
+	cat := setupCatalog(t)
+	src := setupScriptCrawler(t, "crawler-duplicate")
+	pp := newFakePikPak("pikpak-target", "pikpak-root-id")
+	seedScriptCrawlerDrive(t, cat, src, pp.ID())
+
+	reg := newFakeRegistry()
+	reg.Add(src)
+	reg.Add(pp)
+
+	content := []byte("duplicate script video bytes")
+	id := writeScriptCrawlerVideo(t, cat, src, "duplicate-source", ".mp4", content, false)
+	sampled := "same-sampled-fingerprint"
+	if err := cat.UpdateVideoFingerprint(context.Background(), id, sampled, "ready", ""); err != nil {
+		t.Fatalf("mark source fingerprint ready: %v", err)
+	}
+
+	now := time.Now()
+	target := &catalog.Video{
+		ID:            "pikpak-existing-duplicate",
+		DriveID:       pp.ID(),
+		FileID:        "existing-target-file",
+		FileName:      "existing-target-name.mp4",
+		ContentHash:   "existing-content-hash",
+		Title:         "Existing duplicate",
+		Ext:           "mp4",
+		Size:          int64(len(content)),
+		PreviewStatus: "ready",
+		PublishedAt:   now.Add(-time.Hour),
+		CreatedAt:     now.Add(-time.Hour),
+		UpdatedAt:     now.Add(-time.Hour),
+	}
+	if err := cat.UpsertVideo(context.Background(), target); err != nil {
+		t.Fatalf("upsert existing target: %v", err)
+	}
+	if err := cat.UpdateVideoFingerprint(context.Background(), target.ID, sampled, "ready", ""); err != nil {
+		t.Fatalf("mark target fingerprint ready: %v", err)
+	}
+
+	commonThumbDir := t.TempDir()
+	m := New(Config{Catalog: cat, Registry: reg, CommonThumbDir: commonThumbDir})
+	m.runOnce(context.Background())
+
+	if pp.uploadCalls != 0 {
+		t.Fatalf("upload calls = %d, want 0 when equivalent target file already exists", pp.uploadCalls)
+	}
+	got, err := cat.GetVideo(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get bound video: %v", err)
+	}
+	if got.DriveID != pp.ID() {
+		t.Fatalf("drive_id = %q, want %q", got.DriveID, pp.ID())
+	}
+	if got.FileID != target.FileID {
+		t.Fatalf("file_id = %q, want existing target file %q", got.FileID, target.FileID)
+	}
+	if got.FileName != target.FileName {
+		t.Fatalf("file_name = %q, want existing target name %q", got.FileName, target.FileName)
+	}
+	if got.ContentHash != target.ContentHash {
+		t.Fatalf("content_hash = %q, want %q", got.ContentHash, target.ContentHash)
+	}
+	videoPath, _ := src.VideoPath("duplicate-source.mp4")
+	if _, err := os.Stat(videoPath); !os.IsNotExist(err) {
+		t.Fatalf("local duplicate video still exists or stat error %v", err)
+	}
+	thumbPath, _ := src.ThumbPath("duplicate-source.jpg")
+	if _, err := os.Stat(thumbPath); !os.IsNotExist(err) {
+		t.Fatalf("local duplicate thumb still exists or stat error %v", err)
+	}
+	commonThumbPath := filepath.Join(commonThumbDir, id+".jpg")
+	if data, err := os.ReadFile(commonThumbPath); err != nil || string(data) != "thumb" {
+		t.Fatalf("common thumb = %q, %v; want copied crawled thumb", string(data), err)
 	}
 }
 
@@ -678,7 +948,10 @@ func TestCleanupRemovesAllAlreadyMigratedOrphans(t *testing.T) {
 		GetTargetDriveID: func() string { return pp.ID() },
 	})
 
-	deleted, err := m.cleanupOldLocalVideos(context.Background(), src, spider91.Kind)
+	deleted, err := m.cleanupOldLocalVideos(context.Background(), migrationPlan{
+		source:      src,
+		sourceKinds: []string{spider91.Kind},
+	})
 	if err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
@@ -697,6 +970,95 @@ func TestCleanupRemovesAllAlreadyMigratedOrphans(t *testing.T) {
 		if !p.migrated && !exists {
 			t.Errorf("%s not migrated → should be retained", p.viewkey)
 		}
+	}
+}
+
+func TestRunOnceMigratesBuiltInSpider91ScriptCrawlerSource(t *testing.T) {
+	ctx := context.Background()
+	cat := setupCatalog(t)
+	src := scriptcrawler.New(scriptcrawler.Config{ID: "spider-script", RootDir: t.TempDir()})
+	if err := src.Init(ctx); err != nil {
+		t.Fatalf("scriptcrawler init: %v", err)
+	}
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:   src.ID(),
+		Kind: scriptcrawler.Kind,
+		Name: "Built-in Spider91",
+		Credentials: map[string]string{
+			"builtin":         "spider91",
+			"script_path":     "/tmp/spider91.py",
+			"upload_drive_id": "pikpak-target",
+		},
+	}); err != nil {
+		t.Fatalf("upsert source drive: %v", err)
+	}
+	pp := newFakePikPak("pikpak-target", "pikpak-root-id")
+	reg := newFakeRegistry()
+	reg.Add(src)
+	reg.Add(pp)
+
+	fileID := "vk-script.mp4"
+	videoPath, err := src.VideoPath(fileID)
+	if err != nil {
+		t.Fatalf("video path: %v", err)
+	}
+	if err := os.WriteFile(videoPath, []byte("scriptcrawler spider91 video"), 0o644); err != nil {
+		t.Fatalf("write video: %v", err)
+	}
+	thumbPath, err := src.ThumbPath("vk-script.jpg")
+	if err != nil {
+		t.Fatalf("thumb path: %v", err)
+	}
+	if err := os.WriteFile(thumbPath, []byte("thumb"), 0o644); err != nil {
+		t.Fatalf("write thumb: %v", err)
+	}
+	now := time.Now()
+	id := "spider91-" + src.ID() + "-vk-script"
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:            id,
+		DriveID:       src.ID(),
+		FileID:        fileID,
+		FileName:      fileID,
+		Title:         "Scriptcrawler Spider91",
+		Author:        "91porn",
+		Ext:           "mp4",
+		Quality:       "HD",
+		Size:          int64(len("scriptcrawler spider91 video")),
+		PreviewStatus: "ready",
+		PublishedAt:   now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}); err != nil {
+		t.Fatalf("upsert video: %v", err)
+	}
+	if err := cat.UpdateVideoFingerprint(ctx, id, "sampled-vk-script", "ready", ""); err != nil {
+		t.Fatalf("mark fingerprint ready: %v", err)
+	}
+
+	m := New(Config{
+		Catalog:          cat,
+		Registry:         reg,
+		GetTargetDriveID: func() string { return pp.ID() },
+		KeepLatestN:      -1,
+		CommonThumbDir:   t.TempDir(),
+	})
+	m.runOnce(ctx)
+
+	if pp.uploadCalls != 1 {
+		t.Fatalf("upload calls = %d, want 1", pp.uploadCalls)
+	}
+	got, err := cat.GetVideo(ctx, id)
+	if err != nil {
+		t.Fatalf("get migrated video: %v", err)
+	}
+	if got.DriveID != pp.ID() {
+		t.Fatalf("drive_id = %q, want %q", got.DriveID, pp.ID())
+	}
+	if _, err := os.Stat(videoPath); !os.IsNotExist(err) {
+		t.Fatalf("local video stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(thumbPath); !os.IsNotExist(err) {
+		t.Fatalf("local thumb stat err = %v, want not exist", err)
 	}
 }
 
@@ -1197,7 +1559,38 @@ func TestAdaptUploadTargetSupportsP123Driver(t *testing.T) {
 	}
 }
 
-// TestResolveTargetRejectsUnsupportedKind 验证当目标 drive 既不是 PikPak、115、123 也不是 OneDrive 时，
+func TestAdaptUploadTargetSupportsGoogleDriveDriver(t *testing.T) {
+	d := googledrive.New(googledrive.Config{
+		ID:           "google-target",
+		RootID:       "root-google",
+		RefreshToken: "refresh-token",
+	})
+	target, err := adaptUploadTarget(d)
+	if err != nil {
+		t.Fatalf("adaptUploadTarget() error = %v", err)
+	}
+	if target.ID() != "google-target" || target.Kind() != "googledrive" || target.RootID() != "root-google" {
+		t.Fatalf("target id/kind/root = %q/%q/%q, want google-target/googledrive/root-google", target.ID(), target.Kind(), target.RootID())
+	}
+}
+
+func TestAdaptUploadTargetSupportsWopanDriver(t *testing.T) {
+	d := wopan.New(wopan.Config{
+		ID:           "wopan-target",
+		RootID:       "root-wopan",
+		AccessToken:  "access-token",
+		RefreshToken: "refresh-token",
+	})
+	target, err := adaptUploadTarget(d)
+	if err != nil {
+		t.Fatalf("adaptUploadTarget() error = %v", err)
+	}
+	if target.ID() != "wopan-target" || target.Kind() != "wopan" || target.RootID() != "root-wopan" {
+		t.Fatalf("target id/kind/root = %q/%q/%q, want wopan-target/wopan/root-wopan", target.ID(), target.Kind(), target.RootID())
+	}
+}
+
+// TestResolveTargetRejectsUnsupportedKind 验证当目标 drive 既不是 PikPak、115、123、OneDrive、Google Drive 也不是联通网盘时，
 // resolveTarget 拒绝并返回 error，让 runOnce 静默跳过（不会做破坏性变更）。
 func TestResolveTargetRejectsUnsupportedKind(t *testing.T) {
 	cat := setupCatalog(t)
