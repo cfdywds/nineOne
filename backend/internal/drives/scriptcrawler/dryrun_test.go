@@ -48,6 +48,29 @@ echo '{"type":"done","stats":{"emitted":1}}'
 	}
 }
 
+func TestDryRunCapturesStderrWhenStoppingAfterFirstItem(t *testing.T) {
+	script := writeDryRunScript(t, `
+echo '[log] first item ready' >&2
+echo '{"type":"item","item":{"title":"Early Stop Video","media_url":"https://cdn.example.test/v.mp4","source_id":"early-stop"}}'
+sleep 30
+`)
+	start := time.Now()
+	result := DryRun(context.Background(), DryRunConfig{
+		PythonPath:     "/bin/sh",
+		ScriptPath:     script,
+		SkipMediaProbe: true,
+	})
+	if !result.OK {
+		t.Fatalf("ok = false, error = %q, log = %v", result.Error, result.Log)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("dry run took %s, script was not stopped after first item", elapsed)
+	}
+	if len(result.Log) == 0 || !strings.Contains(result.Log[0], "first item ready") {
+		t.Fatalf("log tail = %v, want stderr captured before early stop", result.Log)
+	}
+}
+
 func TestDryRunProbesMediaURL(t *testing.T) {
 	var gotRange, gotReferer string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -78,13 +78,13 @@ export function checkUpdate() {
 
 export type AdminDrive = {
   id: string;
-  kind: "quark" | "p115" | "p123" | "pikpak" | "wopan" | "onedrive" | "googledrive" | "localstorage" | "spider91" | "spiderxvideos";
+  kind: "quark" | "p115" | "p123" | "pikpak" | "wopan" | "guangyapan" | "onedrive" | "googledrive" | "localstorage" | "spider91" | "spiderxvideos";
   name: string;
   rootId: string;
   status: string;
   lastError?: string;
   hasCredential: boolean;
-  /** 当前是否给该盘生成预览视频/封面（per-drive 开关，替代旧的全局 preview.enabled）。 */
+  /** 当前是否给该盘生成预览视频（per-drive 开关，替代旧的全局 preview.enabled；封面不受影响）。 */
   teaserEnabled: boolean;
   /**
    * 用户在 admin 配置的"扫描跳过目录"集合（drive 侧目录 fileID 列表）。
@@ -100,6 +100,8 @@ export type AdminDrive = {
   spiderCrawlerConfig?: Record<string, string>;
   // Google Drive 是否使用 OpenList 在线续期 API；未配置时后端按 true 返回。
   googleDriveUseOnlineAPI?: boolean;
+  // Google Drive OpenList 在线续期 API 地址；为空时后端使用驱动默认值。
+  googleDriveOpenListApiUrl?: string;
   // localstorage 的 .strm 是否允许指向存储根目录之外；未配置时后端按 false 返回。
   strmAllowOutsideRoot?: boolean;
   scanGenerationStatus?: DriveGenerationStatus;
@@ -157,7 +159,7 @@ export function getDriveStorage() {
 
 export type UpsertDriveInput = {
   id: string;
-  kind: "quark" | "p115" | "p123" | "pikpak" | "wopan" | "onedrive" | "googledrive" | "localstorage" | "spider91" | "spiderxvideos";
+  kind: "quark" | "p115" | "p123" | "pikpak" | "wopan" | "guangyapan" | "onedrive" | "googledrive" | "localstorage" | "spider91" | "spiderxvideos";
   name: string;
   rootId: string;
   credentials: Record<string, string>;
@@ -239,6 +241,7 @@ export type AdminCrawler = {
   proxy?: string;
   targetNew?: string;
   uploadDriveId?: string;
+  teaserEnabled: boolean;
   lastCrawlAt?: number;
   scanGenerationStatus?: DriveGenerationStatus;
   thumbnailGenerationStatus?: DriveGenerationStatus;
@@ -341,6 +344,13 @@ export function runCrawler(id: string) {
   );
 }
 
+export function uploadCrawlerVideos(id: string) {
+  return request<{ ok: boolean; accepted: boolean; message?: string; status?: NightlyJobStatus }>(
+    `/crawlers/${encodeURIComponent(id)}/upload`,
+    { method: "POST" }
+  );
+}
+
 export function stopCrawlerTasks(id: string) {
   return request<{ ok: boolean; stopped: boolean }>(
     `/crawlers/${encodeURIComponent(id)}/tasks/stop`,
@@ -401,6 +411,33 @@ export function startWopanQRLogin() {
 
 export function getWopanQRStatus(uuid: string) {
   return request<WopanQRStatus>(`/drives/wopan/qr/${encodeURIComponent(uuid)}`);
+}
+
+export type GuangYaPanQRSession = {
+  deviceCode: string;
+  qrCodeUrl: string;
+  qrImageDataUrl: string;
+  intervalSeconds: number;
+  expiresAt?: string;
+};
+
+export type GuangYaPanQRStatus = {
+  state: "pending" | "success" | "expired" | "denied" | "error";
+  statusText: string;
+  intervalSeconds?: number;
+  accessToken?: string;
+  refreshToken?: string;
+  tokenType?: string;
+  expiresIn?: number;
+};
+
+export function startGuangYaPanQRLogin() {
+  return request<GuangYaPanQRSession>("/drives/guangyapan/qr", { method: "POST" });
+}
+
+export function getGuangYaPanQRStatus(deviceCode: string) {
+  const qs = new URLSearchParams({ deviceCode });
+  return request<GuangYaPanQRStatus>(`/drives/guangyapan/qr/status?${qs.toString()}`);
 }
 
 /**
@@ -659,7 +696,7 @@ export function deleteTag(id: number) {
 
 // ---------- Settings ----------
 
-export type Theme = "dark" | "pink";
+export type Theme = "dark" | "pink" | "sky";
 
 export type Settings = {
   theme: Theme;

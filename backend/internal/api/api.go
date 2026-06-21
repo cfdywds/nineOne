@@ -71,7 +71,7 @@ type Server struct {
 
 	progressHub *ProgressHub
 
-	// GetTheme 返回当前生效的主题（"dark" | "pink"）。前台 /api/settings/theme 用，
+	// GetTheme 返回当前生效的主题（"dark" | "pink" | "sky"）。前台 /api/settings/theme 用，
 	// 不需要登录。无注入时返回 "dark"。
 	GetTheme func() string
 }
@@ -172,11 +172,11 @@ func (s *Server) RegisterRoutes(r chi.Router, a *auth.Authenticator) {
 }
 
 // handleGetTheme 返回当前生效的主题。无需登录。响应永远是
-// {"theme": "dark"} 或 {"theme": "pink"}，便于前端无脑解析。
+// {"theme": "dark" | "pink" | "sky"}，便于前端无脑解析。
 func (s *Server) handleGetTheme(w http.ResponseWriter, r *http.Request) {
 	theme := "dark"
 	if s.GetTheme != nil {
-		if v := s.GetTheme(); v == "pink" || v == "dark" {
+		if v := s.GetTheme(); v == "pink" || v == "dark" || v == "sky" {
 			theme = v
 		}
 	}
@@ -1825,6 +1825,8 @@ func driveKindLabel(kind string) string {
 		return "PikPak"
 	case "wopan":
 		return "联通网盘"
+	case "guangyapan":
+		return "光鸭网盘"
 	case "onedrive":
 		return "OneDrive"
 	case "googledrive":

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -22,8 +23,9 @@ func TestIsTransient115ListError(t *testing.T) {
 		want bool
 	}{
 		{name: "nil", err: nil, want: false},
-		{name: "blocked html", err: errors.New(`<!doctype html><title>405</title>Sorry, your request has been blocked as it may cause potential threats to the server's security.`), want: true},
-		{name: "chinese waf", err: errors.New("很抱歉，由于您访问的URL有可能对网站造成安全威胁，您的访问被阻断。"), want: true},
+		{name: "blocked html without status context", err: errors.New(`<!doctype html><title>405</title>Sorry, your request has been blocked as it may cause potential threats to the server's security.`), want: false},
+		{name: "chinese waf", err: errors.New("很抱歉，由于您访问的URL有可能对网站造成安全威胁，您的访问被阻断。"), want: false},
+		{name: "status 405", err: errors.New("request failed with status: 405"), want: true},
 		{name: "rate limit", err: errors.New("429 too many requests"), want: true},
 		{name: "regular auth error", err: errors.New("invalid credential"), want: false},
 	}
@@ -43,10 +45,10 @@ func TestWrap115StreamTransientError(t *testing.T) {
 		err           error
 		wantRateLimit bool
 	}{
-		{name: "unexpected", err: errors.New("unexpected error"), wantRateLimit: true},
+		{name: "unexpected", err: errors.New("unexpected error"), wantRateLimit: false},
 		{name: "405 blocked", err: errors.New("405 request has been blocked"), wantRateLimit: true},
 		{name: "429", err: errors.New("429 too many requests"), wantRateLimit: true},
-		{name: "blocked", err: errors.New("blocked by waf"), wantRateLimit: true},
+		{name: "blocked", err: errors.New("blocked by waf"), wantRateLimit: false},
 		{name: "auth", err: errors.New("invalid credential"), wantRateLimit: false},
 	}
 
@@ -85,7 +87,7 @@ func TestBufferAndHashSha1(t *testing.T) {
 	wantHex := strings.ToUpper(hex.EncodeToString(want[:]))
 
 	t.Run("declared size matches", func(t *testing.T) {
-		tmp, gotHex, n, err := bufferAndHashSha1(bytes.NewReader(body), int64(len(body)))
+		tmp, gotHex, n, err := bufferAndHashSha1("", bytes.NewReader(body), int64(len(body)))
 		if err != nil {
 			t.Fatalf("bufferAndHashSha1 returned error: %v", err)
 		}
@@ -110,14 +112,14 @@ func TestBufferAndHashSha1(t *testing.T) {
 	})
 
 	t.Run("declared size mismatch returns error", func(t *testing.T) {
-		_, _, _, err := bufferAndHashSha1(bytes.NewReader(body), int64(len(body))+1)
+		_, _, _, err := bufferAndHashSha1("", bytes.NewReader(body), int64(len(body))+1)
 		if err == nil {
 			t.Fatal("expected size mismatch error, got nil")
 		}
 	})
 
 	t.Run("declared size zero is unchecked", func(t *testing.T) {
-		tmp, gotHex, n, err := bufferAndHashSha1(bytes.NewReader(body), 0)
+		tmp, gotHex, n, err := bufferAndHashSha1("", bytes.NewReader(body), 0)
 		if err != nil {
 			t.Fatalf("bufferAndHashSha1 returned error: %v", err)
 		}
@@ -127,6 +129,18 @@ func TestBufferAndHashSha1(t *testing.T) {
 		}
 		if n != int64(len(body)) {
 			t.Errorf("written = %d, want %d", n, len(body))
+		}
+	})
+
+	t.Run("uses configured temp dir", func(t *testing.T) {
+		tempDir := filepath.Join(t.TempDir(), "upload-tmp")
+		tmp, _, _, err := bufferAndHashSha1(tempDir, bytes.NewReader(body), int64(len(body)))
+		if err != nil {
+			t.Fatalf("bufferAndHashSha1 returned error: %v", err)
+		}
+		defer cleanup(tmp)
+		if gotDir := filepath.Dir(tmp.Name()); gotDir != tempDir {
+			t.Fatalf("tmp dir = %q, want %q", gotDir, tempDir)
 		}
 	})
 }

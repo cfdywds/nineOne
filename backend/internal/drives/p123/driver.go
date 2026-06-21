@@ -70,6 +70,7 @@ type Driver struct {
 	httpClient *http.Client
 
 	onTokenUpdate func(access string)
+	uploadTempDir string
 
 	tokenMu sync.RWMutex
 
@@ -90,6 +91,7 @@ type Config struct {
 
 	MainAPIBaseURL  string
 	LoginAPIBaseURL string
+	UploadTempDir   string
 
 	OnTokenUpdate func(access string)
 }
@@ -123,6 +125,7 @@ func New(c Config) *Driver {
 		referer:       defaultReferer,
 		userAgent:     defaultUserAgent,
 		onTokenUpdate: c.OnTokenUpdate,
+		uploadTempDir: strings.TrimSpace(c.UploadTempDir),
 		client: resty.New().
 			SetTimeout(30*time.Second).
 			SetHeader("Accept", "application/json, text/plain, */*"),
@@ -289,7 +292,7 @@ func (d *Driver) UploadAndReportHash(ctx context.Context, parentID, name string,
 		parentID = d.rootID
 	}
 
-	tmp, md5Hex, actualSize, err := bufferAndHashMD5(r, size)
+	tmp, md5Hex, actualSize, err := bufferAndHashMD5(d.uploadTempDir, r, size)
 	if err != nil {
 		return UploadResult{}, err
 	}
@@ -754,8 +757,8 @@ func (d *Driver) request(ctx context.Context, endpoint, method string, configure
 	return nil, errors.New("123pan request: unauthorized")
 }
 
-func isP123RateLimitResponse(res *resty.Response, code int, message string) bool {
-	if code == http.StatusTooManyRequests || isP123RateLimitMessage(message) {
+func isP123RateLimitResponse(res *resty.Response, code int, _ string) bool {
+	if code == http.StatusTooManyRequests {
 		return true
 	}
 	if res == nil {
@@ -764,7 +767,7 @@ func isP123RateLimitResponse(res *resty.Response, code int, message string) bool
 	return isP123RateLimitHTTPResponse(res.StatusCode(), res.Header().Get("Retry-After"), res.String())
 }
 
-func isP123RateLimitHTTPResponse(status int, retryAfter, body string) bool {
+func isP123RateLimitHTTPResponse(status int, retryAfter, _ string) bool {
 	if status == http.StatusTooManyRequests {
 		return true
 	}
@@ -774,33 +777,7 @@ func isP123RateLimitHTTPResponse(status int, retryAfter, body string) bool {
 			return true
 		}
 	}
-	if isP123RateLimitMessage(body) {
-		return true
-	}
 	return false
-}
-
-func isP123RateLimitMessage(message string) bool {
-	text := strings.ToLower(strings.TrimSpace(message))
-	if text == "" {
-		return false
-	}
-	return strings.Contains(text, "请求太频繁") ||
-		strings.Contains(text, "请求过于频繁") ||
-		strings.Contains(text, "请求频繁") ||
-		strings.Contains(text, "操作频繁") ||
-		strings.Contains(text, "频率限制") ||
-		strings.Contains(text, "请求次数过多") ||
-		strings.Contains(text, "too many request") ||
-		strings.Contains(text, "too many requests") ||
-		strings.Contains(text, "rate limit") ||
-		strings.Contains(text, "rate-limit") ||
-		strings.Contains(text, "ratelimit") ||
-		strings.Contains(text, "throttl") ||
-		strings.Contains(text, "temporarily blocked") ||
-		strings.Contains(text, "request has been blocked") ||
-		strings.Contains(text, "blocked") ||
-		strings.Contains(text, "访问被阻断")
 }
 
 func p123RateLimitError(res *resty.Response, code int, message string) error {
@@ -1084,8 +1061,14 @@ func splitPath(p string) []string {
 	return strings.Split(p, "/")
 }
 
-func bufferAndHashMD5(r io.Reader, declaredSize int64) (*os.File, string, int64, error) {
-	tmp, err := os.CreateTemp("", "p123-upload-*.bin")
+func bufferAndHashMD5(tempDir string, r io.Reader, declaredSize int64) (*os.File, string, int64, error) {
+	tempDir = strings.TrimSpace(tempDir)
+	if tempDir != "" {
+		if err := os.MkdirAll(tempDir, 0o755); err != nil {
+			return nil, "", 0, fmt.Errorf("123pan upload: create tmp dir: %w", err)
+		}
+	}
+	tmp, err := os.CreateTemp(tempDir, "p123-upload-*.bin")
 	if err != nil {
 		return nil, "", 0, fmt.Errorf("123pan upload: create tmp: %w", err)
 	}

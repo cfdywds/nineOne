@@ -226,6 +226,31 @@ func TestServeStreamRedirectsWopan(t *testing.T) {
 	}
 }
 
+func TestServeStreamRedirectsGuangYaPan(t *testing.T) {
+	reg := NewRegistry()
+	drv := &proxyFakeSimpleDrive{
+		kind: "guangyapan",
+		url:  "https://cdn.guangyapan.example/video.mp4?sign=encoded",
+	}
+	reg.Set("guangyapan", drv)
+
+	p := New(reg)
+	req := httptest.NewRequest(http.MethodGet, "/p/stream/guangyapan/file-1", nil)
+	rr := httptest.NewRecorder()
+
+	p.ServeStream(rr, req, "guangyapan", "file-1")
+
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusFound)
+	}
+	if got := rr.Header().Get("Location"); got != "https://cdn.guangyapan.example/video.mp4?sign=encoded" {
+		t.Fatalf("Location = %q", got)
+	}
+	if drv.calls != 1 {
+		t.Fatalf("link calls = %d, want 1", drv.calls)
+	}
+}
+
 func TestServeStreamServesLocalFilePath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "video.mp4")
 	if err := os.WriteFile(path, []byte("0123456789"), 0o644); err != nil {

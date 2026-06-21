@@ -647,7 +647,7 @@ func isGoogleUploadHTTPRateLimit(status int, header http.Header, body []byte, ap
 	if isGoogleRateLimit(nil, apiErr) {
 		return true
 	}
-	return googleLimitText(string(body))
+	return false
 }
 
 func googleUploadRateLimitError(status int, header http.Header, body []byte, message string) error {
@@ -910,7 +910,7 @@ func isGoogleRateLimit(res *resty.Response, body apiErrorBody) bool {
 		return true
 	}
 	for _, e := range body.Errors {
-		if googleLimitReason(e.Reason) || googleLimitText(e.Message) {
+		if googleLimitReason(e.Reason) {
 			return true
 		}
 		domain := compactGoogleLimitText(e.Domain)
@@ -918,7 +918,7 @@ func isGoogleRateLimit(res *resty.Response, body apiErrorBody) bool {
 			return true
 		}
 	}
-	return googleLimitText(body.Message)
+	return false
 }
 
 func isGoogleTokenRateLimit(res *resty.Response, out tokenResp) bool {
@@ -930,9 +930,7 @@ func isGoogleTokenRateLimit(res *resty.Response, out tokenResp) bool {
 			return true
 		}
 	}
-	return googleLimitText(out.Text) ||
-		googleLimitText(out.Error) ||
-		googleLimitText(out.ErrorDescription)
+	return googleLimitReason(out.Error)
 }
 
 func googleLimitReason(reason string) bool {
@@ -951,31 +949,6 @@ func googleLimitReason(reason string) bool {
 	default:
 		return false
 	}
-}
-
-func googleLimitText(text string) bool {
-	text = strings.ToLower(strings.TrimSpace(text))
-	if text == "" {
-		return false
-	}
-	compact := compactGoogleLimitText(text)
-	if strings.Contains(compact, "ratelimitexceeded") ||
-		strings.Contains(compact, "userratelimitexceeded") ||
-		strings.Contains(compact, "dailylimitexceeded") ||
-		strings.Contains(compact, "downloadquotaexceeded") ||
-		strings.Contains(compact, "sharingratelimitexceeded") ||
-		strings.Contains(compact, "quotaexceeded") ||
-		strings.Contains(compact, "toomanyrequests") {
-		return true
-	}
-	return strings.Contains(text, "rate limit") ||
-		strings.Contains(text, "too many requests") ||
-		strings.Contains(text, "quota exceeded") ||
-		strings.Contains(text, "download quota") ||
-		strings.Contains(text, "sharing rate") ||
-		strings.Contains(text, "daily limit") ||
-		strings.Contains(text, "user rate") ||
-		strings.Contains(text, "usage limit")
 }
 
 func compactGoogleLimitText(text string) string {

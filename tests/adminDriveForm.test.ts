@@ -125,9 +125,9 @@ test("spider91 upload target uses explicit local-save option instead of auto tar
   assert.match(combinedSource, /本地保存，不上传/);
   assert.match(
     combinedSource,
-    /d\.kind === "pikpak"[\s\S]*d\.kind === "p115"[\s\S]*d\.kind === "p123"[\s\S]*d\.kind === "onedrive"[\s\S]*d\.kind === "googledrive"[\s\S]*d\.kind === "wopan"/
+    /d\.kind === "pikpak"[\s\S]*d\.kind === "p115"[\s\S]*d\.kind === "p123"[\s\S]*d\.kind === "onedrive"[\s\S]*d\.kind === "googledrive"[\s\S]*d\.kind === "wopan"[\s\S]*d\.kind === "guangyapan"/
   );
-  assert.match(crawlerPageSource, /UPLOAD_TARGET_KINDS[\s\S]*"wopan"/);
+  assert.match(crawlerPageSource, /UPLOAD_TARGET_KINDS[\s\S]*"wopan"[\s\S]*"guangyapan"/);
   assert.doesNotMatch(combinedSource, /自动：唯一/);
   assert.doesNotMatch(combinedSource, /自动模式/);
   assert.doesNotMatch(combinedSource, /较早的视频会上传到该云盘根目录下的 91 Spider 文件夹/);
@@ -192,7 +192,8 @@ test("googledrive drive form supports online API and custom OAuth client modes",
   assert.match(fields, /key: "client_id"/);
   assert.match(fields, /key: "client_secret"/);
   assert.match(fields, /googleDriveUsesOnlineAPI\(creds\)/);
-  assert.doesNotMatch(fields, /key: "api_url_address"/);
+  assert.match(fields, /key: "api_url_address"/);
+  assert.match(fields, /OpenList 在线 API URL/);
   assert.doesNotMatch(fields, /在线 API 模式填写 OpenList 获取的 refresh_token/);
   assert.doesNotMatch(constantsSource, /请参考OpenList文档中关于谷歌云盘的配置方法。/);
   assert.doesNotMatch(constantsSource, /选择自建 Google OAuth 客户端后，服务端会直接请求 Google OAuth token 接口续期。/);
@@ -201,7 +202,9 @@ test("googledrive drive form supports online API and custom OAuth client modes",
   assert.match(driveFormSource, /className="admin-form-select"/);
   assert.match(driveFormSource, /ChevronDown/);
   assert.match(drivesPageSource, /googleDriveUseOnlineAPI/);
+  assert.match(drivesPageSource, /googleDriveOpenListApiUrl/);
   assert.match(apiSource, /googleDriveUseOnlineAPI\?: boolean/);
+  assert.match(apiSource, /googleDriveOpenListApiUrl\?: string/);
   assert.doesNotMatch(fields, /key: "access_token"/);
 });
 
@@ -220,6 +223,32 @@ test("pikpak drive form only exposes account login fields", () => {
   assert.doesNotMatch(fields, /key: "captcha_token"/);
   assert.doesNotMatch(fields, /key: "device_id"/);
   assert.doesNotMatch(fields, /key: "disable_media_link"/);
+});
+
+test("guangyapan drive form exposes qr login and token fields", () => {
+  assertDriveTypeOption("guangyapan", "光鸭网盘");
+  assert.match(driveFormSource, /GuangYaPanQRCodeLogin/);
+  assert.match(driveFormSource, /form\.kind === "guangyapan"/);
+  assert.match(apiSource, /startGuangYaPanQRLogin/);
+  assert.match(apiSource, /getGuangYaPanQRStatus/);
+
+  const match =
+    /case "guangyapan":\s*return \[([\s\S]*?)\];\s*case "onedrive":/.exec(
+      combinedSource
+    );
+  assert.ok(match, "guangyapan credential field block should be present");
+  const fields = match[1];
+
+  assert.match(fields, /key: "root_path"/);
+  assert.match(fields, /key: "refresh_token"/);
+  assert.match(fields, /key: "access_token"/);
+  assert.doesNotMatch(fields, /key: "phone_number"/);
+  assert.doesNotMatch(fields, /key: "send_code"/);
+  assert.doesNotMatch(fields, /key: "verify_code"/);
+  assert.doesNotMatch(fields, /key: "captcha_token"/);
+  assert.doesNotMatch(fields, /key: "client_id"/);
+  assert.doesNotMatch(fields, /key: "device_id"/);
+  assert.match(combinedSource, /if \(kind === "guangyapan"\) return ""/);
 });
 
 test("localstorage drive form asks for a server directory path", () => {
@@ -243,6 +272,7 @@ test("drive type selector keeps primary source order", () => {
     { value: "p115", label: "115 网盘" },
     { value: "p123", label: "123网盘" },
     { value: "pikpak", label: "PikPak" },
+    { value: "guangyapan", label: "光鸭网盘" },
     { value: "onedrive", label: "OneDrive" },
     { value: "googledrive", label: "Google Drive" },
     { value: "localstorage", label: "本地存储" },
@@ -269,6 +299,7 @@ test("crawler management is a separate admin section", () => {
   assert.match(crawlerPageSource, /api\.listDrives/);
   assert.match(crawlerPageSource, /api\.upsertCrawler/);
   assert.match(crawlerPageSource, /api\.runCrawler/);
+  assert.match(crawlerPageSource, /api\.uploadCrawlerVideos/);
   assert.match(crawlerPageSource, /api\.stopCrawlerTasks/);
   assert.match(crawlerPageSource, /api\.deleteCrawler/);
   assert.match(crawlerPageSource, /api\.importCrawlerScriptFile/);
@@ -280,6 +311,21 @@ test("crawler management is a separate admin section", () => {
   assert.match(crawlerPageSource, /测试通过/);
   assert.match(crawlerPageSource, /Spider91UploadTargetField/);
   assert.match(crawlerPageSource, /uploadDriveId/);
+  assert.match(crawlerPageSource, /api\.setDriveTeaserEnabled/);
+  assert.match(crawlerPageSource, /admin-crawler-preview-card-toggle/);
+  assert.match(crawlerPageSource, /预览：开/);
+  assert.match(crawlerPageSource, /预览：关/);
+  assert.match(crawlerPageSource, /上传视频/);
+  assert.match(crawlerPageSource, /aria-pressed=\{crawler\.teaserEnabled\}/);
+  assert.doesNotMatch(crawlerPageSource, /crawlerUploadBlockedReason/);
+  assert.doesNotMatch(crawlerPageSource, /disabled=\{uploading/);
+  assert.doesNotMatch(crawlerPageSource, /crawlerStatusLabel/);
+  assert.doesNotMatch(crawlerPageSource, /admin-crawler-preview-card-toggle \$\{crawler\.teaserEnabled/);
+  assert.doesNotMatch(adminCss, /admin-crawler-preview-card-toggle\.is-on/);
+  assert.doesNotMatch(crawlerPageSource, /admin-crawler-pipeline/);
+  assert.doesNotMatch(adminCss, /admin-crawler-(pipeline|stage)/);
+  assert.doesNotMatch(crawlerPageSource, /teaserEnabled: form\.teaserEnabled/);
+  assert.doesNotMatch(crawlerPageSource, /aria-pressed=\{form\.teaserEnabled\}/);
   assert.match(crawlerPageSource, /UPLOAD_TARGET_KINDS/);
   assert.doesNotMatch(crawlerPageSource, /新建脚本/);
   assert.doesNotMatch(crawlerPageSource, /爬虫 ID/);
@@ -295,7 +341,10 @@ test("crawler management is a separate admin section", () => {
   assert.doesNotMatch(crawlerPageSource, /内置 91/);
   assert.match(apiSource, /type AdminCrawler/);
   assert.match(apiSource, /uploadDriveId\?: string/);
+  assert.match(apiSource, /teaserEnabled: boolean/);
+  assert.doesNotMatch(apiSource, /teaserEnabled\?: boolean/);
   assert.match(apiSource, /"\/crawlers"/);
+  assert.match(apiSource, /\/crawlers\/\$\{encodeURIComponent\(id\)\}\/upload/);
   assert.match(apiSource, /"\/crawlers\/import-file"/);
   assert.match(apiSource, /"\/crawlers\/import-url"/);
   assert.match(apiSource, /"\/crawlers\/test-script"/);
@@ -312,6 +361,7 @@ test("drive cards use configured abbreviations and visible fallback icon colors"
   assert.match(drivesPageSource, /driveKindAbbr\(d\.kind\)/);
   assert.match(adminCss, /\.admin-drive-card__brand-icon\s*\{[^}]*background:\s*var\(--accent\);/s);
   assert.match(adminCss, /\.admin-drive-card__brand-icon\[data-kind="googledrive"\]\s*\{\s*background:\s*#4285f4;\s*\}/);
+  assert.match(adminCss, /\.admin-drive-card__brand-icon\[data-kind="guangyapan"\]\s*\{\s*background:\s*var\(--drive-guangyapan\);/);
 });
 
 test("drive management exposes stop task controls", () => {
@@ -322,6 +372,21 @@ test("drive management exposes stop task controls", () => {
   assert.match(drivesPageSource, /is-stop/);
   assert.match(drivesPageSource, /停止所有任务/);
   assert.match(drivesPageSource, /停止所有网盘任务/);
+});
+
+test("drive detail primary actions use the rescan button color", () => {
+  assert.match(
+    drivesPageSource,
+    /className="admin-btn is-primary"\s+onClick=\{\(\) => handleRescan\(d\)\}/
+  );
+  assert.match(
+    drivesPageSource,
+    /className="admin-btn is-primary"\s+onClick=\{\(\) => handleStopDriveTasks\(d\)\}/
+  );
+  assert.match(
+    drivesPageSource,
+    /className="admin-btn is-primary"\s+onClick=\{\(\) => openEdit\(d\)\}/
+  );
 });
 
 test("drive rescan reports busy storage tasks instead of queueing duplicates", () => {

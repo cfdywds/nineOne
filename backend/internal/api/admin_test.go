@@ -788,6 +788,31 @@ func TestHandleUpsertGoogleDriveMergesOAuthCredentials(t *testing.T) {
 	if got.Credentials["client_id"] != "google-client-id" || got.Credentials["client_secret"] != "google-client-secret" {
 		t.Fatalf("oauth client credentials = %#v, want saved", got.Credentials)
 	}
+	if got.Credentials["api_url_address"] != "https://api.oplist.org/googleui/renewapi" {
+		t.Fatalf("api_url_address = %q, want preserved", got.Credentials["api_url_address"])
+	}
+
+	clearReq := httptest.NewRequest(http.MethodPost, "/admin/api/drives", bytes.NewBufferString(`{
+		"id": "google-main",
+		"kind": "googledrive",
+		"name": "Google Drive",
+		"rootId": "root",
+		"credentials": {
+			"api_url_address": ""
+		}
+	}`))
+	clearRR := httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleUpsertDrive(clearRR, clearReq)
+	if clearRR.Code != http.StatusOK {
+		t.Fatalf("clear status = %d, body = %s", clearRR.Code, clearRR.Body.String())
+	}
+	cleared, err := cat.GetDrive(ctx, "google-main")
+	if err != nil {
+		t.Fatalf("get cleared drive: %v", err)
+	}
+	if _, ok := cleared.Credentials["api_url_address"]; ok {
+		t.Fatalf("api_url_address was not cleared: %#v", cleared.Credentials)
+	}
 }
 
 func TestHandleUpsertSpider91DriveIsRejected(t *testing.T) {
@@ -810,7 +835,7 @@ func TestHandleUpsertSpider91DriveIsRejected(t *testing.T) {
 		Credentials: map[string]string{
 			"last_crawl_at": "1800000000",
 			"proxy":         "http://old-proxy.local:7890",
-			"script_path":   "/opt/video-site-91/91VideoSpider/spider_91porn.py",
+			"script_path":   "/opt/video-site-91/data/crawler-scripts/legacy-spider.py",
 		},
 		Status: "ok",
 	}); err != nil {
@@ -1155,7 +1180,8 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 				"script_path":     scriptPath,
 				"upload_drive_id": "p115-target",
 			},
-			Status: "ok",
+			Status:        "ok",
+			TeaserEnabled: false,
 		},
 		{
 			ID:          "p115-target",
@@ -1238,6 +1264,7 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 		Kind             string `json:"kind"`
 		Proxy            string `json:"proxy"`
 		UploadDriveID    string `json:"uploadDriveId"`
+		TeaserEnabled    bool   `json:"teaserEnabled"`
 		LastCrawlAt      int64  `json:"lastCrawlAt"`
 		TotalCrawled     int    `json:"totalCrawledCount"`
 		LocalVideos      int    `json:"localVideoCount"`
@@ -1249,11 +1276,12 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	byID := map[string]struct {
+	type crawlerListRow struct {
 		Name             string
 		Kind             string
 		Proxy            string
 		UploadDriveID    string
+		TeaserEnabled    bool
 		LastCrawlAt      int64
 		TotalCrawled     int
 		LocalVideos      int
@@ -1261,25 +1289,15 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 		ThumbnailReady   int
 		TeaserReady      int
 		FingerprintReady int
-	}{}
+	}
+	byID := map[string]crawlerListRow{}
 	for _, d := range got {
-		byID[d.ID] = struct {
-			Name             string
-			Kind             string
-			Proxy            string
-			UploadDriveID    string
-			LastCrawlAt      int64
-			TotalCrawled     int
-			LocalVideos      int
-			MigratedVideo    int
-			ThumbnailReady   int
-			TeaserReady      int
-			FingerprintReady int
-		}{
+		byID[d.ID] = crawlerListRow{
 			Name:             d.Name,
 			Kind:             d.Kind,
 			Proxy:            d.Proxy,
 			UploadDriveID:    d.UploadDriveID,
+			TeaserEnabled:    d.TeaserEnabled,
 			LastCrawlAt:      d.LastCrawlAt,
 			TotalCrawled:     d.TotalCrawled,
 			LocalVideos:      d.LocalVideos,
@@ -1306,6 +1324,9 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 	}
 	if byID["crawler-spider91"].UploadDriveID != "p115-target" {
 		t.Fatalf("uploadDriveId = %q, want p115-target", byID["crawler-spider91"].UploadDriveID)
+	}
+	if byID["crawler-spider91"].TeaserEnabled {
+		t.Fatal("teaserEnabled = true, want false from crawler drive")
 	}
 	if byID["crawler-spider91"].LastCrawlAt != 1800000000 {
 		t.Fatalf("lastCrawlAt = %d, want 1800000000", byID["crawler-spider91"].LastCrawlAt)
@@ -1378,11 +1399,12 @@ func TestHandleUpsertCrawlerRequiresScriptPath(t *testing.T) {
 	}
 
 	// 带脚本路径时正常保存，且请求中的 builtin 字段被忽略，不会写入凭证。
-	req = httptest.NewRequest(http.MethodPost, "/admin/api/crawlers", jsonBody(t, map[string]string{
-		"id":         "spider91-main",
-		"builtin":    "spider91",
-		"scriptPath": scriptPath,
-		"targetNew":  "15",
+	req = httptest.NewRequest(http.MethodPost, "/admin/api/crawlers", jsonBody(t, map[string]any{
+		"id":            "spider91-main",
+		"builtin":       "spider91",
+		"scriptPath":    scriptPath,
+		"targetNew":     "15",
+		"teaserEnabled": false,
 	}))
 	rr = httptest.NewRecorder()
 	srv.handleUpsertCrawler(rr, req)
@@ -1405,6 +1427,9 @@ func TestHandleUpsertCrawlerRequiresScriptPath(t *testing.T) {
 	}
 	if got.Credentials["script_path"] != scriptPath {
 		t.Fatalf("script_path = %q, want %q", got.Credentials["script_path"], scriptPath)
+	}
+	if got.TeaserEnabled {
+		t.Fatal("teaserEnabled = true, want false from request")
 	}
 }
 
@@ -1482,18 +1507,28 @@ func TestHandleUpsertCrawlerPersistsAndValidatesUploadDrive(t *testing.T) {
 	for _, d := range []*catalog.Drive{
 		{ID: "p115-target", Kind: "p115", Name: "115", RootID: "0", Credentials: map[string]string{"cookie": "x"}},
 		{ID: "wopan-target", Kind: "wopan", Name: "沃盘", RootID: "0", Credentials: map[string]string{"access_token": "a", "refresh_token": "r"}},
+		{ID: "guangyapan-target", Kind: "guangyapan", Name: "光鸭", RootID: "", Credentials: map[string]string{"access_token": "a", "refresh_token": "r"}},
 		{ID: "local-target", Kind: "localstorage", Name: "Local", RootID: "/", Credentials: map[string]string{"path": tmp}},
 	} {
 		if err := cat.UpsertDrive(ctx, d); err != nil {
 			t.Fatalf("seed drive %s: %v", d.ID, err)
 		}
 	}
-	srv := &AdminServer{Catalog: cat}
+	var teaserCallbackID string
+	var teaserCallbackEnabled bool
+	srv := &AdminServer{
+		Catalog: cat,
+		OnTeaserEnabledChanged: func(id string, enabled bool) {
+			teaserCallbackID = id
+			teaserCallbackEnabled = enabled
+		},
+	}
 
-	req := httptest.NewRequest(http.MethodPost, "/admin/api/crawlers", jsonBody(t, map[string]string{
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/crawlers", jsonBody(t, map[string]any{
 		"id":            "crawler-upload",
 		"scriptPath":    scriptPath,
 		"uploadDriveId": "p115-target",
+		"teaserEnabled": false,
 	}))
 	rr := httptest.NewRecorder()
 	srv.handleUpsertCrawler(rr, req)
@@ -1506,6 +1541,12 @@ func TestHandleUpsertCrawlerPersistsAndValidatesUploadDrive(t *testing.T) {
 	}
 	if got.Credentials["upload_drive_id"] != "p115-target" {
 		t.Fatalf("upload_drive_id = %q, want p115-target", got.Credentials["upload_drive_id"])
+	}
+	if got.TeaserEnabled {
+		t.Fatal("teaserEnabled = true, want false")
+	}
+	if teaserCallbackID != "" {
+		t.Fatalf("teaser callback on create = %q, want none", teaserCallbackID)
 	}
 
 	req = httptest.NewRequest(http.MethodPost, "/admin/api/crawlers", jsonBody(t, map[string]string{
@@ -1524,6 +1565,52 @@ func TestHandleUpsertCrawlerPersistsAndValidatesUploadDrive(t *testing.T) {
 	}
 	if got.Credentials["upload_drive_id"] != "wopan-target" {
 		t.Fatalf("upload_drive_id = %q, want wopan-target", got.Credentials["upload_drive_id"])
+	}
+	if got.TeaserEnabled {
+		t.Fatal("teaserEnabled after edit without field = true, want preserved false")
+	}
+	if teaserCallbackID != "" {
+		t.Fatalf("teaser callback after preserved edit = %q, want none", teaserCallbackID)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/admin/api/crawlers", jsonBody(t, map[string]any{
+		"id":            "crawler-upload",
+		"scriptPath":    scriptPath,
+		"uploadDriveId": "guangyapan-target",
+	}))
+	rr = httptest.NewRecorder()
+	srv.handleUpsertCrawler(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("guangyapan target status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err = cat.GetDrive(ctx, "crawler-upload")
+	if err != nil {
+		t.Fatalf("get crawler after guangyapan target: %v", err)
+	}
+	if got.Credentials["upload_drive_id"] != "guangyapan-target" {
+		t.Fatalf("upload_drive_id = %q, want guangyapan-target", got.Credentials["upload_drive_id"])
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/admin/api/crawlers", jsonBody(t, map[string]any{
+		"id":            "crawler-upload",
+		"scriptPath":    scriptPath,
+		"uploadDriveId": "wopan-target",
+		"teaserEnabled": true,
+	}))
+	rr = httptest.NewRecorder()
+	srv.handleUpsertCrawler(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("enable teaser status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err = cat.GetDrive(ctx, "crawler-upload")
+	if err != nil {
+		t.Fatalf("get crawler after teaser enable: %v", err)
+	}
+	if !got.TeaserEnabled {
+		t.Fatal("teaserEnabled after explicit enable = false, want true")
+	}
+	if teaserCallbackID != "crawler-upload" || !teaserCallbackEnabled {
+		t.Fatalf("teaser callback = %q/%v, want crawler-upload/true", teaserCallbackID, teaserCallbackEnabled)
 	}
 
 	req = httptest.NewRequest(http.MethodPost, "/admin/api/crawlers", jsonBody(t, map[string]string{
@@ -1915,6 +2002,94 @@ func TestHandleWopanQRStatus(t *testing.T) {
 	}
 }
 
+func TestHandleGuangYaPanQRStart(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/v1/auth/device/code" {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		if body["scope"] != "user" {
+			t.Fatalf("scope = %#v, want user", body["scope"])
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"device_code":               "device-1",
+			"verification_uri_complete": "https://account.guangyapan.example/device?code=abc",
+			"interval":                  5,
+			"expires_in":                300,
+		})
+	}))
+	t.Cleanup(upstream.Close)
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives/guangyapan/qr", nil)
+	rr := httptest.NewRecorder()
+	(&AdminServer{GuangYaPanAccountBaseURL: upstream.URL}).handleGuangYaPanQRStart(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		DeviceCode     string `json:"deviceCode"`
+		QRCodeURL      string `json:"qrCodeUrl"`
+		QRImageDataURL string `json:"qrImageDataUrl"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.DeviceCode != "device-1" || got.QRCodeURL != "https://account.guangyapan.example/device?code=abc" {
+		t.Fatalf("response = %#v", got)
+	}
+	if !strings.HasPrefix(got.QRImageDataURL, "data:image/png;base64,") {
+		t.Fatalf("qr image = %q", got.QRImageDataURL)
+	}
+}
+
+func TestHandleGuangYaPanQRStatus(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/v1/auth/token" {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		if body["device_code"] != "device-1" {
+			t.Fatalf("device_code = %#v, want device-1", body["device_code"])
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "access-1",
+			"refresh_token": "refresh-1",
+			"token_type":    "Bearer",
+		})
+	}))
+	t.Cleanup(upstream.Close)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/drives/guangyapan/qr/status?deviceCode=device-1", nil)
+	rr := httptest.NewRecorder()
+	(&AdminServer{GuangYaPanAccountBaseURL: upstream.URL}).handleGuangYaPanQRStatus(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		State        string `json:"state"`
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.State != "success" || got.AccessToken != "access-1" || got.RefreshToken != "refresh-1" {
+		t.Fatalf("response = %#v", got)
+	}
+}
+
 func TestHandleTestCrawlerScriptRunsImportedScript(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 is required for crawler script dry-run")
@@ -2009,7 +2184,8 @@ func TestHandleListDrivesIncludesGoogleDriveOnlineAPIMode(t *testing.T) {
 			Name:   "Google Legacy",
 			RootID: "root",
 			Credentials: map[string]string{
-				"refresh_token": "legacy-refresh",
+				"refresh_token":   "legacy-refresh",
+				"api_url_address": "https://openlist-api.example/googleui/renewapi",
 			},
 			Status: "ok",
 		},
@@ -2040,21 +2216,27 @@ func TestHandleListDrivesIncludesGoogleDriveOnlineAPIMode(t *testing.T) {
 	}
 
 	var got []struct {
-		ID                      string `json:"id"`
-		GoogleDriveUseOnlineAPI bool   `json:"googleDriveUseOnlineAPI"`
+		ID                        string `json:"id"`
+		GoogleDriveUseOnlineAPI   bool   `json:"googleDriveUseOnlineAPI"`
+		GoogleDriveOpenListAPIURL string `json:"googleDriveOpenListApiUrl"`
 	}
 	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	byID := map[string]bool{}
+	byAPIURL := map[string]string{}
 	for _, d := range got {
 		byID[d.ID] = d.GoogleDriveUseOnlineAPI
+		byAPIURL[d.ID] = d.GoogleDriveOpenListAPIURL
 	}
 	if !byID["google-legacy"] {
 		t.Fatalf("legacy google drive use_online_api = false, want true")
 	}
 	if byID["google-oauth"] {
 		t.Fatalf("oauth google drive use_online_api = true, want false")
+	}
+	if byAPIURL["google-legacy"] != "https://openlist-api.example/googleui/renewapi" {
+		t.Fatalf("legacy google drive openlist api url = %q, want custom URL", byAPIURL["google-legacy"])
 	}
 }
 
@@ -2581,6 +2763,80 @@ func TestHandleAdminListVideosPaginates(t *testing.T) {
 	}
 	if len(got.Items) != 1 || got.Items[0].ID != "third" {
 		t.Fatalf("items = %#v, want only third", got.Items)
+	}
+}
+
+func TestHandleAdminListVideosMarksActivePreviewGeneration(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	for _, v := range []*catalog.Video{
+		{
+			ID:            "active-video",
+			DriveID:       "OneDrive",
+			FileID:        "active-file",
+			Title:         "Active video",
+			PreviewStatus: "ready",
+			PublishedAt:   now,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+		{
+			ID:            "idle-video",
+			DriveID:       "OneDrive",
+			FileID:        "idle-file",
+			Title:         "Idle video",
+			PreviewStatus: "ready",
+			PublishedAt:   now.Add(-time.Hour),
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+	} {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed video %s: %v", v.ID, err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/videos?driveId=OneDrive", nil)
+	rr := httptest.NewRecorder()
+	(&AdminServer{
+		Catalog: cat,
+		GetPreviewGenerationVideoIDs: func() map[string]bool {
+			return map[string]bool{"active-video": true}
+		},
+	}).handleAdminListVideos(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Items []catalog.Video `json:"items"`
+		Total int             `json:"total"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Total != 2 || len(got.Items) != 2 {
+		t.Fatalf("response total/items = %d/%d, want 2/2", got.Total, len(got.Items))
+	}
+	statusByID := map[string]string{}
+	for _, item := range got.Items {
+		statusByID[item.ID] = item.PreviewStatus
+	}
+	if statusByID["active-video"] != "generating" {
+		t.Fatalf("active status = %q, want generating", statusByID["active-video"])
+	}
+	if statusByID["idle-video"] != "ready" {
+		t.Fatalf("idle status = %q, want ready", statusByID["idle-video"])
 	}
 }
 

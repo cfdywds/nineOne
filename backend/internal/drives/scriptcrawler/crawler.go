@@ -50,6 +50,7 @@ type CrawlerConfig struct {
 	CommonThumbDir  string
 	ProxyURL        string
 	ConfigJSON      string
+	DisablePreview  bool
 	HTTPClient      *http.Client
 	DownloadTimeout time.Duration
 	OnProgress      func(CrawlProgress)
@@ -562,6 +563,10 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 	if quality == "" {
 		quality = "HD"
 	}
+	previewStatus := "pending"
+	if c.previewDisabled(ctx) {
+		previewStatus = "disabled"
+	}
 	v := &catalog.Video{
 		ID:              videoID,
 		DriveID:         c.cfg.Driver.ID(),
@@ -576,7 +581,7 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 		Quality:         quality,
 		Category:        strings.TrimSpace(item.Category),
 		Description:     strings.TrimSpace(item.Description),
-		PreviewStatus:   "pending",
+		PreviewStatus:   previewStatus,
 		PublishedAt:     publishedAt,
 		CreatedAt:       now,
 		UpdatedAt:       now,
@@ -630,6 +635,18 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 	}
 	log.Printf("[scriptcrawler] drive=%s source_id=%s ok title=%q size=%d", c.cfg.Driver.ID(), sourceID, title, size)
 	return true, nil
+}
+
+func (c *Crawler) previewDisabled(ctx context.Context) bool {
+	if c == nil {
+		return false
+	}
+	if c.cfg.Catalog != nil && c.cfg.Driver != nil {
+		if d, err := c.cfg.Catalog.GetDrive(ctx, c.cfg.Driver.ID()); err == nil && d != nil {
+			return !d.TeaserEnabled
+		}
+	}
+	return c.cfg.DisablePreview
 }
 
 func (c *Crawler) materializeMedia(ctx context.Context, ref MediaRef, dst, referer string, required bool) (int64, error) {
@@ -783,6 +800,10 @@ func (c *Crawler) downloadHLSAtomic(ctx context.Context, ref MediaRef, dst, refe
 		args = append(args, "-headers", h)
 	}
 	args = append(args,
+		"-protocol_whitelist", "http,https,tcp,tls,crypto",
+		"-allowed_extensions", "ALL",
+		"-allowed_segment_extensions", "ALL",
+		"-extension_picky", "0",
 		"-i", src,
 		"-c", "copy",
 		"-bsf:a", "aac_adtstoasc",

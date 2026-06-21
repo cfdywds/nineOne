@@ -430,8 +430,16 @@ func seedScriptCrawlerDrive(t *testing.T, cat *catalog.Catalog, d *scriptcrawler
 			"script_path":     "/tmp/crawler.py",
 			"upload_drive_id": uploadDriveID,
 		},
+		TeaserEnabled: true,
 	}); err != nil {
 		t.Fatalf("seed scriptcrawler drive: %v", err)
+	}
+}
+
+func setScriptCrawlerTeaserEnabled(t *testing.T, cat *catalog.Catalog, driveID string, enabled bool) {
+	t.Helper()
+	if err := cat.SetDriveTeaserEnabled(context.Background(), driveID, enabled); err != nil {
+		t.Fatalf("set scriptcrawler teaser enabled: %v", err)
 	}
 }
 
@@ -710,6 +718,47 @@ func TestRunOnceSkipsScriptCrawlerVideoUntilPreviewAndFingerprintReady(t *testin
 	videoPath, _ := src.VideoPath("pending-assets.mp4")
 	if _, err := os.Stat(videoPath); err != nil {
 		t.Fatalf("local video should remain while assets pending: %v", err)
+	}
+}
+
+func TestRunOnceMigratesScriptCrawlerVideoWithoutPreviewWhenTeaserDisabled(t *testing.T) {
+	cat := setupCatalog(t)
+	src := setupScriptCrawler(t, "crawler-no-preview")
+	pp := newFakePikPak("pikpak-target", "pikpak-root-id")
+	seedScriptCrawlerDrive(t, cat, src, pp.ID())
+	setScriptCrawlerTeaserEnabled(t, cat, src.ID(), false)
+
+	reg := newFakeRegistry()
+	reg.Add(src)
+	reg.Add(pp)
+
+	id := writeScriptCrawlerVideo(t, cat, src, "fingerprint-ready", ".mp4", []byte("script video bytes"), false)
+	if err := cat.UpdateVideoFingerprint(context.Background(), id, "sampled-fingerprint-ready", "ready", ""); err != nil {
+		t.Fatalf("mark fingerprint ready: %v", err)
+	}
+	if err := cat.UpdatePreview(context.Background(), id, "", "disabled"); err != nil {
+		t.Fatalf("mark preview disabled: %v", err)
+	}
+
+	m := New(Config{Catalog: cat, Registry: reg})
+	m.runOnce(context.Background())
+
+	if pp.uploadCalls != 1 {
+		t.Fatalf("upload calls = %d, want 1 when preview generation is disabled", pp.uploadCalls)
+	}
+	got, err := cat.GetVideo(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get migrated video: %v", err)
+	}
+	if got.DriveID != pp.ID() {
+		t.Fatalf("drive_id = %q, want %q", got.DriveID, pp.ID())
+	}
+	if got.PreviewStatus != "disabled" || got.FingerprintStatus != "ready" || got.SampledSHA256 == "" {
+		t.Fatalf("asset status after migration = preview %q fingerprint %q sampled %q, want disabled/ready/non-empty", got.PreviewStatus, got.FingerprintStatus, got.SampledSHA256)
+	}
+	videoPath, _ := src.VideoPath("fingerprint-ready.mp4")
+	if _, err := os.Stat(videoPath); !os.IsNotExist(err) {
+		t.Fatalf("local scriptcrawler video still exists or stat error %v", err)
 	}
 }
 
@@ -1590,7 +1639,7 @@ func TestAdaptUploadTargetSupportsWopanDriver(t *testing.T) {
 	}
 }
 
-// TestResolveTargetRejectsUnsupportedKind 验证当目标 drive 既不是 PikPak、115、123、OneDrive、Google Drive 也不是联通网盘时，
+// TestResolveTargetRejectsUnsupportedKind 验证当目标 drive 既不是 PikPak、115、123、OneDrive、Google Drive、联通网盘也不是光鸭网盘时，
 // resolveTarget 拒绝并返回 error，让 runOnce 静默跳过（不会做破坏性变更）。
 func TestResolveTargetRejectsUnsupportedKind(t *testing.T) {
 	cat := setupCatalog(t)

@@ -1539,6 +1539,70 @@ func TestReconcileThumbnailStatusOnce(t *testing.T) {
 	}
 }
 
+func TestRequeueSkippedPreviews(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { cat.Close() })
+
+	now := time.Now()
+	cases := []struct {
+		id         string
+		status     string
+		local      string
+		fileID     string
+		wantStatus string
+		wantLocal  string
+		wantFileID string
+	}{
+		{"preview-skipped", "skipped", "/tmp/old-preview.mp4", "old-preview-file", "pending", "", ""},
+		{"preview-ready", "ready", "/tmp/ready-preview.mp4", "ready-preview-file", "ready", "/tmp/ready-preview.mp4", "ready-preview-file"},
+		{"preview-failed", "failed", "/tmp/failed-preview.mp4", "failed-preview-file", "failed", "/tmp/failed-preview.mp4", "failed-preview-file"},
+	}
+	for _, c := range cases {
+		if err := cat.UpsertVideo(ctx, &Video{
+			ID: c.id, DriveID: "d", FileID: "source-" + c.id, Title: c.id,
+			PreviewStatus: c.status, PreviewLocal: c.local, PreviewFileID: c.fileID,
+			PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", c.id, err)
+		}
+	}
+
+	if err := cat.requeueSkippedPreviews(ctx); err != nil {
+		t.Fatalf("requeue skipped previews: %v", err)
+	}
+	if err := cat.requeueSkippedPreviews(ctx); err != nil {
+		t.Fatalf("second requeue skipped previews: %v", err)
+	}
+
+	for _, c := range cases {
+		got, err := cat.GetVideo(ctx, c.id)
+		if err != nil {
+			t.Fatalf("get %s: %v", c.id, err)
+		}
+		if got.PreviewStatus != c.wantStatus {
+			t.Errorf("%s: preview status = %q, want %q", c.id, got.PreviewStatus, c.wantStatus)
+		}
+		if got.PreviewLocal != c.wantLocal {
+			t.Errorf("%s: preview local = %q, want %q", c.id, got.PreviewLocal, c.wantLocal)
+		}
+		if got.PreviewFileID != c.wantFileID {
+			t.Errorf("%s: preview file id = %q, want %q", c.id, got.PreviewFileID, c.wantFileID)
+		}
+	}
+
+	pending, err := cat.ListVideosByPreviewStatus(ctx, "d", "pending", 0)
+	if err != nil {
+		t.Fatalf("list pending previews: %v", err)
+	}
+	if len(pending) != 1 || pending[0].ID != "preview-skipped" {
+		t.Fatalf("pending previews = %#v, want only preview-skipped", pending)
+	}
+}
+
 // TestUpsertVideoSyncsThumbnailStatus 验证 scanner 创建/补回视频时
 // thumbnail_status 跟随 thumbnail_url 自动设。这是历史 bug 的修复回归测试 ——
 // 之前 UpsertVideo 的 SQL 不带 thumbnail_status 列，所有新视频都依赖

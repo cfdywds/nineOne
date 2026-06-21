@@ -1,12 +1,12 @@
 import { useEffect, useState } from "react";
-import { Check, Loader2, Moon, Sparkles } from "lucide-react";
+import { Check, Loader2, Moon, Sparkles, Star } from "lucide-react";
 import * as api from "./api";
 import type { Theme } from "./api";
 import { useToast } from "./ToastContext";
 import { applyTheme, getCurrentTheme } from "@/lib/theme";
 
 function isTheme(value: unknown): value is Theme {
-  return value === "dark" || value === "pink";
+  return value === "dark" || value === "pink" || value === "sky";
 }
 
 type Option = {
@@ -31,6 +31,13 @@ const OPTIONS: Option[] = [
     subtitle: "Sakura Cream",
     description: "柔和奶白底 + 樱花粉主色，清爽温柔，日间使用更舒适。",
     icon: Sparkles,
+  },
+  {
+    id: "sky",
+    title: "星空蓝 + 暖星黄",
+    subtitle: "Starry Sky",
+    description: "浅天空蓝底 + 暖星黄主色，配上淡淡的网格与点点星光，顶级美感。",
+    icon: Star,
   },
 ];
 

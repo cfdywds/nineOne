@@ -372,37 +372,10 @@ func remoteRangeResponseLooksRateLimited(rawURL string, status int, body []byte)
 		status == 509) {
 		return true
 	}
-	text := strings.ToLower(strings.TrimSpace(string(body)))
-	compact := compactRemoteRangeErrorText(text)
-	if strings.Contains(text, "too many request") ||
-		strings.Contains(text, "too many requests") ||
-		strings.Contains(text, "rate limit") ||
-		strings.Contains(text, "quota exceeded") ||
-		strings.Contains(text, "操作频繁") ||
-		strings.Contains(text, "请求频繁") ||
-		strings.Contains(text, "请求太频繁") ||
-		strings.Contains(text, "请求过于频繁") ||
-		strings.Contains(text, "频率限制") ||
-		strings.Contains(text, "请求次数过多") ||
-		strings.Contains(text, "系统繁忙") ||
-		strings.Contains(text, "服务繁忙") ||
-		strings.Contains(text, "稍后再试") ||
-		strings.Contains(text, "稍后重试") ||
-		strings.Contains(text, "访问被阻断") ||
-		strings.Contains(text, "风控") ||
-		strings.Contains(text, "download quota") ||
-		strings.Contains(text, "sharing rate") ||
-		strings.Contains(text, "daily limit") ||
-		strings.Contains(text, "user rate") ||
-		strings.Contains(text, "usage limit") ||
-		strings.Contains(compact, "ratelimitexceeded") ||
-		strings.Contains(compact, "userratelimitexceeded") ||
-		strings.Contains(compact, "dailylimitexceeded") ||
-		strings.Contains(compact, "downloadquotaexceeded") ||
-		strings.Contains(compact, "sharingratelimitexceeded") ||
-		strings.Contains(compact, "quotaexceeded") ||
-		strings.Contains(compact, "toomanyrequests") ||
-		strings.Contains(compact, "usagelimits") {
+	if isGuangYaPanMediaURL(rawURL) && (status == http.StatusForbidden || status == http.StatusTooManyRequests ||
+		status == http.StatusInternalServerError || status == http.StatusBadGateway ||
+		status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout ||
+		status == 509) {
 		return true
 	}
 	if status == http.StatusForbidden && isGoogleDriveMediaURL(rawURL) {
@@ -424,6 +397,16 @@ func isWopanMediaURL(rawURL string) bool {
 		strings.Contains(path, "/openapi/download")
 }
 
+func isGuangYaPanMediaURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return strings.HasSuffix(host, "guangyacdn.com") ||
+		strings.HasSuffix(host, "guangyapan.com")
+}
+
 func isGoogleDriveMediaURL(rawURL string) bool {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -432,11 +415,6 @@ func isGoogleDriveMediaURL(rawURL string) bool {
 	host := strings.ToLower(u.Host)
 	path := strings.ToLower(u.Path)
 	return strings.Contains(host, "googleapis.com") && strings.Contains(path, "/drive/")
-}
-
-func compactRemoteRangeErrorText(text string) string {
-	replacer := strings.NewReplacer("_", "", "-", "", " ", "", ".", "", ":", "")
-	return replacer.Replace(strings.ToLower(strings.TrimSpace(text)))
 }
 
 func parseRetryAfter(raw string) time.Duration {

@@ -9,35 +9,125 @@ import {
 } from "react";
 
 type ToastKind = "info" | "success" | "error";
-type Toast = { id: number; kind: ToastKind; text: string };
+type Toast = { id: number; kind: ToastKind; text: string; copyable: boolean };
 
 type Ctx = {
   show: (text: string, kind?: ToastKind) => void;
 };
 
 const ToastCtx = createContext<Ctx | null>(null);
+const TOAST_DISMISS_MS = 2500;
+const TOAST_COPY_SUCCESS_TEXT = "已复制到剪贴板";
+const TOAST_COPY_ERROR_TEXT = "复制失败，请手动复制";
+
+async function copyTextToClipboard(text: string) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+  } catch {
+    // Fall back to the legacy copy command below.
+  }
+  if (!fallbackCopyText(text)) {
+    throw new Error("copy failed");
+  }
+}
+
+function fallbackCopyText(text: string) {
+  if (!document.body) return false;
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  try {
+    return document.execCommand("copy");
+  } finally {
+    document.body.removeChild(textarea);
+  }
+}
 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<Toast[]>([]);
-  const timers = useRef<Record<string, ReturnType<typeof window.setTimeout>>>({});
+  const timers = useRef(new Map<number, ReturnType<typeof window.setTimeout>>());
+  const idsByText = useRef(new Map<string, number>());
+
+  const clearDismissTimer = useCallback((id: number) => {
+    const timer = timers.current.get(id);
+    if (!timer) return;
+    window.clearTimeout(timer);
+    timers.current.delete(id);
+  }, []);
+
+  const removeToast = useCallback(
+    (id: number, text: string) => {
+      clearDismissTimer(id);
+      if (idsByText.current.get(text) === id) {
+        idsByText.current.delete(text);
+      }
+      setItems((list) => list.filter((t) => t.id !== id));
+    },
+    [clearDismissTimer]
+  );
+
+  const scheduleDismiss = useCallback(
+    (id: number, text: string) => {
+      clearDismissTimer(id);
+      timers.current.set(
+        id,
+        window.setTimeout(() => removeToast(id, text), TOAST_DISMISS_MS)
+      );
+    },
+    [clearDismissTimer, removeToast]
+  );
+
+  const addToast = useCallback(
+    (text: string, kind: ToastKind = "info", copyable = true) => {
+      const existingID = idsByText.current.get(text);
+      if (existingID !== undefined) {
+        setItems((list) =>
+          list.map((t) => (t.id === existingID ? { ...t, kind, copyable } : t))
+        );
+        scheduleDismiss(existingID, text);
+        return;
+      }
+      const id = Date.now() + Math.random();
+      idsByText.current.set(text, id);
+      setItems((list) => [...list, { id, kind, text, copyable }]);
+      scheduleDismiss(id, text);
+    },
+    [scheduleDismiss]
+  );
 
   // Deduplicate: same text won't stack, just resets the dismiss timer
-  const show = useCallback((text: string, kind: ToastKind = "info") => {
-    // Reset timer if duplicate
-    if (timers.current[text]) {
-      window.clearTimeout(timers.current[text]);
-      timers.current[text] = window.setTimeout(() => {
-        setItems((list) => list.filter((t) => t.text !== text));
-        delete timers.current[text];
-      }, 2600);
-      return;
-    }
-    const id = Date.now() + Math.random();
-    timers.current[text] = window.setTimeout(() => {
-      setItems((list) => list.filter((t) => t.id !== id));
-      delete timers.current[text];
-    }, 2600);
-    setItems((list) => [...list, { id, kind, text }]);
+  const show = useCallback(
+    (text: string, kind: ToastKind = "info") => {
+      addToast(text, kind, true);
+    },
+    [addToast]
+  );
+
+  const copyToastText = useCallback(
+    (text: string) => {
+      void copyTextToClipboard(text)
+        .then(() => addToast(TOAST_COPY_SUCCESS_TEXT, "success", false))
+        .catch(() => addToast(TOAST_COPY_ERROR_TEXT, "error", false));
+    },
+    [addToast]
+  );
+
+  useEffect(() => {
+    return () => {
+      for (const timer of timers.current.values()) {
+        window.clearTimeout(timer);
+      }
+      timers.current.clear();
+      idsByText.current.clear();
+    };
   }, []);
 
   return (
@@ -45,8 +135,26 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       {children}
       <div className="admin-toast-stack" role="status" aria-live="polite">
         {items.map((t) => (
-          <div key={t.id} className={`admin-toast is-${t.kind}`}>
-            {t.text}
+          <div
+            key={t.id}
+            className={`admin-toast is-${t.kind}${
+              t.copyable ? " is-copyable" : ""
+            }`}
+            role={t.copyable ? "button" : undefined}
+            tabIndex={t.copyable ? 0 : undefined}
+            aria-label={t.copyable ? `复制提示：${t.text}` : undefined}
+            onClick={t.copyable ? () => copyToastText(t.text) : undefined}
+            onKeyDown={
+              t.copyable
+                ? (event) => {
+                    if (event.key !== "Enter" && event.key !== " ") return;
+                    event.preventDefault();
+                    copyToastText(t.text);
+                  }
+                : undefined
+            }
+          >
+            <span className="admin-toast__text">{t.text}</span>
           </div>
         ))}
       </div>

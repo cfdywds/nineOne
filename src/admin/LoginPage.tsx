@@ -79,9 +79,11 @@ export function LoginPage() {
   return (
     <div className="admin-login">
       <form className="admin-login__card" onSubmit={handleSubmit}>
-        <h1 className="admin-login__title">
-          <Play size={18} fill="currentColor" /> {setupRequired ? "首次设置管理员" : "登录"}
-        </h1>
+        {setupRequired && (
+          <h1 className="admin-login__title">
+            <Play size={18} fill="currentColor" /> 首次设置管理员
+          </h1>
+        )}
         <div className="admin-form">
           <div className="admin-form__row">
             <label htmlFor="admin-login-username">用户名</label>

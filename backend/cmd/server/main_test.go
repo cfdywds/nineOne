@@ -272,6 +272,53 @@ func TestRegisterPreviewWorkersBackfillsHistoricalFingerprints(t *testing.T) {
 	t.Fatalf("fingerprint status=%q sampled=%q, want ready with hash", got.FingerprintStatus, got.SampledSHA256)
 }
 
+func TestUpdateScriptCrawlerRunStatePreservesCurrentTeaserSwitch(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:     "crawler-id",
+		Kind:   scriptcrawler.Kind,
+		Name:   "Crawler",
+		RootID: "/",
+		Credentials: map[string]string{
+			"script_path": "/tmp/crawler.py",
+			"target_new":  "10",
+		},
+		TeaserEnabled: false,
+	}); err != nil {
+		t.Fatalf("seed crawler drive: %v", err)
+	}
+	if err := cat.SetDriveTeaserEnabled(ctx, "crawler-id", true); err != nil {
+		t.Fatalf("toggle teaser: %v", err)
+	}
+
+	app := &App{cat: cat}
+	if err := app.updateScriptCrawlerRunState(ctx, "crawler-id", nil); err != nil {
+		t.Fatalf("update run state: %v", err)
+	}
+	got, err := cat.GetDrive(ctx, "crawler-id")
+	if err != nil {
+		t.Fatalf("get crawler drive: %v", err)
+	}
+	if !got.TeaserEnabled {
+		t.Fatal("teaserEnabled = false after run state update, want preserved true")
+	}
+	if got.Status != "ok" || got.LastError != "" {
+		t.Fatalf("status=%q lastError=%q, want ok with no error", got.Status, got.LastError)
+	}
+	if got.Credentials["last_crawl_at"] == "" || got.Credentials["target_new"] != "10" {
+		t.Fatalf("credentials after run state update = %#v", got.Credentials)
+	}
+}
+
 func TestStopDriveTasksCancelsQueuedTasksAndReplacesWorkers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -436,6 +483,37 @@ func TestDriveGenerationStatusIncludesScanState(t *testing.T) {
 	}
 }
 
+func TestDriveGenerationStatusIncludesScanCooldown(t *testing.T) {
+	until := time.Now().Add(time.Hour).Round(time.Second)
+	app := &App{
+		scanQueued: map[string]bool{"drive-id": true},
+		scanProgress: map[string]driveScanProgress{
+			"drive-id": {Scanned: 12, Added: 3, CooldownUntil: until},
+		},
+	}
+
+	status := app.driveGenerationStatuses()["drive-id"].Scan
+	if status.State != "cooling" {
+		t.Fatalf("scan status = %#v, want cooling", status)
+	}
+	if status.CooldownUntil != until.Format(time.RFC3339) {
+		t.Fatalf("cooldown until = %q, want %q", status.CooldownUntil, until.Format(time.RFC3339))
+	}
+}
+
+func TestGuangYaPanGenerationCooldowns(t *testing.T) {
+	drv := &serverFakeKindDrive{id: "gy", kind: "guangyapan"}
+	if got := generationCooldownForDrive(drv); got != 10*time.Minute {
+		t.Fatalf("generation cooldown = %s, want 10m", got)
+	}
+	if got := fingerprintConfigForDrive(drv).RateLimitCooldown; got != 10*time.Minute {
+		t.Fatalf("fingerprint cooldown = %s, want 10m", got)
+	}
+	if got := scanCooldownForDrive(drv); got != 10*time.Minute {
+		t.Fatalf("scan cooldown = %s, want 10m", got)
+	}
+}
+
 func TestRunSpider91MigrationAfterManualCrawlRequiresConfiguredUploadTarget(t *testing.T) {
 	ctx := context.Background()
 	registry := proxy.NewRegistry()
@@ -539,6 +617,128 @@ func TestScheduleCrawlerUploadMigrationSkipsWithoutUploadTarget(t *testing.T) {
 
 	if app.scheduleCrawlerUploadMigration(ctx, "crawler-local") {
 		t.Fatal("scheduleCrawlerUploadMigration returned true without upload target")
+	}
+	if migrator.called != 0 {
+		t.Fatalf("migration calls = %d, want 0", migrator.called)
+	}
+}
+
+func TestScheduleManualCrawlerUploadMigrationRunsWhenAssetsReady(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:            "crawler-ready",
+		Kind:          scriptcrawler.Kind,
+		Name:          "Ready Crawler",
+		RootID:        "/",
+		TeaserEnabled: true,
+		Credentials: map[string]string{
+			"script_path":     "/tmp/ready.py",
+			"upload_drive_id": "pikpak-target",
+		},
+	}); err != nil {
+		t.Fatalf("seed crawler: %v", err)
+	}
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:                scriptcrawler.BuildVideoID("crawler-ready", "source-1"),
+		DriveID:           "crawler-ready",
+		FileID:            "source-1.mp4",
+		FileName:          "source-1.mp4",
+		Title:             "Source 1",
+		Size:              123,
+		Ext:               "mp4",
+		SampledSHA256:     "sampled-source-1",
+		FingerprintStatus: "ready",
+		PreviewStatus:     "ready",
+		PublishedAt:       time.Now(),
+		CreatedAt:         time.Now(),
+		UpdatedAt:         time.Now(),
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	registry := proxy.NewRegistry()
+	registry.Set("crawler-ready", &serverFakeKindDrive{id: "crawler-ready", kind: scriptcrawler.Kind})
+	registry.Set("pikpak-target", &serverFakeKindDrive{id: "pikpak-target", kind: "pikpak"})
+	migrator := &serverFakeSpider91MigrationRunner{}
+	app := &App{
+		cat:                cat,
+		registry:           registry,
+		spider91Migrator:   migrator,
+		workers:            map[string]*preview.Worker{},
+		thumbWorkers:       map[string]*preview.ThumbWorker{},
+		fingerprintWorkers: map[string]*fingerprint.Worker{},
+	}
+
+	accepted, message := app.scheduleManualCrawlerUploadMigration(ctx, "crawler-ready")
+	if !accepted {
+		t.Fatalf("accepted = false, message = %q", message)
+	}
+	deadline := time.After(time.Second)
+	for migrator.called == 0 {
+		select {
+		case <-deadline:
+			t.Fatalf("migration calls = %d, want 1", migrator.called)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestScheduleManualCrawlerUploadMigrationRejectsPendingFingerprint(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:            "crawler-pending",
+		Kind:          scriptcrawler.Kind,
+		Name:          "Pending Crawler",
+		RootID:        "/",
+		TeaserEnabled: true,
+		Credentials: map[string]string{
+			"script_path":     "/tmp/pending.py",
+			"upload_drive_id": "pikpak-target",
+		},
+	}); err != nil {
+		t.Fatalf("seed crawler: %v", err)
+	}
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:            scriptcrawler.BuildVideoID("crawler-pending", "source-1"),
+		DriveID:       "crawler-pending",
+		FileID:        "source-1.mp4",
+		FileName:      "source-1.mp4",
+		Title:         "Source 1",
+		Size:          123,
+		Ext:           "mp4",
+		PreviewStatus: "ready",
+		PublishedAt:   time.Now(),
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	migrator := &serverFakeSpider91MigrationRunner{}
+	app := &App{cat: cat, registry: proxy.NewRegistry(), spider91Migrator: migrator}
+
+	accepted, message := app.scheduleManualCrawlerUploadMigration(ctx, "crawler-pending")
+	if accepted {
+		t.Fatal("accepted = true, want false")
+	}
+	if !strings.Contains(message, "指纹") {
+		t.Fatalf("message = %q, want fingerprint reason", message)
 	}
 	if migrator.called != 0 {
 		t.Fatalf("migration calls = %d, want 0", migrator.called)

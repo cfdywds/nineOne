@@ -27,6 +27,7 @@ import (
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/drives"
 	"github.com/video-site/backend/internal/drives/googledrive"
+	"github.com/video-site/backend/internal/drives/guangyapan"
 	"github.com/video-site/backend/internal/drives/localstorage"
 	"github.com/video-site/backend/internal/drives/localupload"
 	"github.com/video-site/backend/internal/drives/onedrive"
@@ -223,6 +224,9 @@ func main() {
 			}
 			return app.scheduleScan(ctx, driveID)
 		},
+		OnCrawlerUploadRequested: func(driveID string) (bool, string) {
+			return app.scheduleManualCrawlerUploadMigration(ctx, driveID)
+		},
 		OnStopDriveTasks: func(driveID string) bool {
 			return app.stopDriveTasks(ctx, driveID)
 		},
@@ -258,6 +262,9 @@ func main() {
 		},
 		GetDriveCrawlStatus: func(driveID string) api.CrawlStatus {
 			return app.driveCrawlStatus(driveID)
+		},
+		GetPreviewGenerationVideoIDs: func() map[string]bool {
+			return app.previewGenerationVideoIDs()
 		},
 		OnTeaserEnabledChanged: func(driveID string, enabled bool) {
 			// 从关到开时立刻补扫该盘 pending 预览视频，行为对齐旧的"全局开关从关到开"。
@@ -369,13 +376,13 @@ type App struct {
 	// 串行化可以避免启动后台挂载和手动扫盘按需挂载同一个 drive 时重复创建 worker。
 	driveAttachMu sync.Mutex
 
-	// 全站主题（"dark" | "pink"），从 DB 读
+	// 全站主题（"dark" | "pink" | "sky"），从 DB 读
 	theme string
 	// 显式指定的 spider91 上传目标 drive ID。
-	// 空字符串表示本地保存不上传，不再自动挑选 pikpak/p115/p123/onedrive/wopan drive。
+	// 空字符串表示本地保存不上传，不再自动挑选 pikpak/p115/p123/onedrive/wopan/guangyapan drive。
 	spider91UploadDriveID string
 
-	// spider91Migrator 把 spider91 视频上传到目标 drive（PikPak、115、123、OneDrive、Google Drive 或联通网盘）。
+	// spider91Migrator 把 spider91 视频上传到目标 drive（PikPak、115、123、OneDrive、Google Drive、联通网盘或光鸭网盘）。
 	spider91Migrator spider91MigrationRunner
 
 	// nightlyRunner 是凌晨流水线调度器：每天 cron_hour 串行跑扫盘 → 91 爬虫 → 迁移。
@@ -421,8 +428,9 @@ type App struct {
 }
 
 type driveScanProgress struct {
-	Scanned int
-	Added   int
+	Scanned       int
+	Added         int
+	CooldownUntil time.Time
 }
 
 type driveUploadProgress struct {
@@ -471,7 +479,7 @@ func (a *App) Theme() string {
 
 // SetTheme 切换并持久化主题；未知值会返回错误。
 func (a *App) SetTheme(ctx context.Context, theme string) error {
-	if theme != "dark" && theme != "pink" {
+	if theme != "dark" && theme != "pink" && theme != "sky" {
 		return fmt.Errorf("unsupported theme %q", theme)
 	}
 	a.mu.Lock()
@@ -490,7 +498,7 @@ func (a *App) loadTheme(ctx context.Context) {
 		a.mu.Unlock()
 		return
 	}
-	if v != "pink" && v != "dark" {
+	if v != "pink" && v != "dark" && v != "sky" {
 		v = "dark"
 	}
 	a.mu.Lock()
@@ -499,7 +507,7 @@ func (a *App) loadTheme(ctx context.Context) {
 }
 
 // Spider91UploadDriveID 返回当前配置的 spider91 上传目标 drive ID。
-// 空字符串表示本地保存不上传；只有管理员显式选择 pikpak/p115/p123/onedrive/googledrive/wopan drive 时才迁移上传。
+// 空字符串表示本地保存不上传；只有管理员显式选择 pikpak/p115/p123/onedrive/googledrive/wopan/guangyapan drive 时才迁移上传。
 func (a *App) Spider91UploadDriveID() string {
 	a.mu.Lock()
 	explicit := a.spider91UploadDriveID
@@ -516,7 +524,7 @@ func (a *App) Spider91UploadDriveID() string {
 
 // SetSpider91UploadDriveID 设置 spider91 上传目标 drive ID 并持久化。
 // 接受空字符串（本地保存不上传）。
-// 设置一个不存在或 kind 不是 pikpak / p115 / p123 / onedrive / googledrive / wopan 的 drive 会返回错误。
+// 设置一个不存在或 kind 不是 pikpak / p115 / p123 / onedrive / googledrive / wopan / guangyapan 的 drive 会返回错误。
 func (a *App) SetSpider91UploadDriveID(ctx context.Context, driveID string) error {
 	driveID = strings.TrimSpace(driveID)
 	if driveID != "" {
@@ -525,7 +533,7 @@ func (a *App) SetSpider91UploadDriveID(ctx context.Context, driveID string) erro
 			return fmt.Errorf("drive %q not found", driveID)
 		}
 		if !isSpider91UploadKind(d.Kind()) {
-			return fmt.Errorf("drive %q kind=%s, only pikpak, p115, p123, onedrive, googledrive or wopan can be spider91 upload target", driveID, d.Kind())
+			return fmt.Errorf("drive %q kind=%s, only pikpak, p115, p123, onedrive, googledrive, wopan or guangyapan can be spider91 upload target", driveID, d.Kind())
 		}
 	}
 	a.mu.Lock()
@@ -558,7 +566,7 @@ func formatOptionalRFC3339(t time.Time) string {
 // isSpider91UploadKind 是 spider91 迁移目标盘的 allowlist。
 // 与 spider91migrate.adaptUploadTarget 的支持范围保持一致。
 func isSpider91UploadKind(kind string) bool {
-	return kind == "pikpak" || kind == "p115" || kind == "p123" || kind == "onedrive" || kind == "googledrive" || kind == "wopan"
+	return kind == "pikpak" || kind == "p115" || kind == "p123" || kind == "onedrive" || kind == "googledrive" || kind == "wopan" || kind == guangyapan.Kind
 }
 
 // loadSpider91UploadDriveID 从 DB 读上传目标 drive ID 设置；不存在时使用空串。
@@ -615,16 +623,24 @@ func (a *App) driveGenerationStatuses() map[string]api.DriveGenerationStatuses {
 	a.transcodeMu.Unlock()
 
 	out := make(map[string]api.DriveGenerationStatuses, len(scanningDrives)+len(previewWorkers)+len(thumbWorkers)+len(fingerprintWorkers)+len(uploadProgresses)+len(transcodeWorkers))
+	now := time.Now()
 	for id, running := range scanningDrives {
 		if !running {
 			continue
 		}
 		progress := scanProgresses[id]
+		state := "scanning"
+		if progress.CooldownUntil.After(now) {
+			state = "cooling"
+		}
 		status := out[id]
 		status.Scan = api.GenerationStatus{
-			State:        "scanning",
+			State:        state,
 			ScannedCount: progress.Scanned,
 			AddedCount:   progress.Added,
+		}
+		if !progress.CooldownUntil.IsZero() {
+			status.Scan.CooldownUntil = progress.CooldownUntil.Format(time.RFC3339)
 		}
 		out[id] = status
 	}
@@ -757,6 +773,23 @@ func formatCrawlTime(t time.Time) string {
 		return ""
 	}
 	return t.UTC().Format(time.RFC3339)
+}
+
+func (a *App) previewGenerationVideoIDs() map[string]bool {
+	a.mu.Lock()
+	previewWorkers := make([]*preview.Worker, 0, len(a.workers))
+	for _, worker := range a.workers {
+		previewWorkers = append(previewWorkers, worker)
+	}
+	a.mu.Unlock()
+
+	out := make(map[string]bool)
+	for _, worker := range previewWorkers {
+		for _, id := range worker.ActiveVideoIDs() {
+			out[id] = true
+		}
+	}
+	return out
 }
 
 func (a *App) updateCrawlerUploadProgress(progress spider91migrate.UploadProgress) {
@@ -1021,18 +1054,20 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 		})
 	case "p115":
 		drv = p115.New(p115.Config{
-			ID:     d.ID,
-			Cookie: d.Credentials["cookie"],
-			RootID: d.RootID,
+			ID:            d.ID,
+			Cookie:        d.Credentials["cookie"],
+			RootID:        d.RootID,
+			UploadTempDir: a.uploadWorkDir("p115"),
 		})
 	case p123.Kind:
 		drv = p123.New(p123.Config{
-			ID:          d.ID,
-			Username:    d.Credentials["username"],
-			Password:    d.Credentials["password"],
-			AccessToken: d.Credentials["access_token"],
-			Platform:    d.Credentials["platform"],
-			RootID:      d.RootID,
+			ID:            d.ID,
+			Username:      d.Credentials["username"],
+			Password:      d.Credentials["password"],
+			AccessToken:   d.Credentials["access_token"],
+			Platform:      d.Credentials["platform"],
+			RootID:        d.RootID,
+			UploadTempDir: a.uploadWorkDir(p123.Kind),
 			OnTokenUpdate: func(access string) {
 				if d.Credentials == nil {
 					d.Credentials = make(map[string]string)
@@ -1053,6 +1088,7 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			DeviceID:         d.Credentials["device_id"],
 			RootID:           d.RootID,
 			DisableMediaLink: pikpak.ParseBoolDefault(d.Credentials["disable_media_link"], true),
+			UploadTempDir:    a.uploadWorkDir("pikpak"),
 			OnTokenUpdate: func(access, refresh, captcha, deviceID string) {
 				d.Credentials["access_token"] = access
 				d.Credentials["refresh_token"] = refresh
@@ -1063,14 +1099,42 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 		})
 	case "wopan":
 		drv = wopan.New(wopan.Config{
-			ID:           d.ID,
-			AccessToken:  d.Credentials["access_token"],
-			RefreshToken: d.Credentials["refresh_token"],
-			FamilyID:     d.Credentials["family_id"],
-			RootID:       d.RootID,
+			ID:            d.ID,
+			AccessToken:   d.Credentials["access_token"],
+			RefreshToken:  d.Credentials["refresh_token"],
+			FamilyID:      d.Credentials["family_id"],
+			RootID:        d.RootID,
+			UploadTempDir: a.uploadWorkDir("wopan"),
 			OnTokenUpdate: func(access, refresh string) {
 				d.Credentials["access_token"] = access
 				d.Credentials["refresh_token"] = refresh
+				_ = a.cat.UpsertDrive(ctx, d)
+			},
+		})
+	case guangyapan.Kind:
+		drv = guangyapan.New(guangyapan.Config{
+			ID:             d.ID,
+			RootID:         d.RootID,
+			RootPath:       d.Credentials["root_path"],
+			PhoneNumber:    d.Credentials["phone_number"],
+			CaptchaToken:   d.Credentials["captcha_token"],
+			SendCode:       parseBoolDefault(strings.TrimSpace(d.Credentials["send_code"]), false),
+			VerifyCode:     d.Credentials["verify_code"],
+			VerificationID: d.Credentials["verification_id"],
+			AccessToken:    d.Credentials["access_token"],
+			RefreshToken:   d.Credentials["refresh_token"],
+			ClientID:       d.Credentials["client_id"],
+			DeviceID:       d.Credentials["device_id"],
+			PageSize:       parseIntDefault(strings.TrimSpace(d.Credentials["page_size"]), 100),
+			OrderBy:        parseIntDefault(strings.TrimSpace(d.Credentials["order_by"]), 3),
+			SortType:       parseIntDefault(strings.TrimSpace(d.Credentials["sort_type"]), 1),
+			OnCredentialsUpdate: func(updated map[string]string) {
+				if d.Credentials == nil {
+					d.Credentials = make(map[string]string)
+				}
+				for k, v := range updated {
+					d.Credentials[k] = v
+				}
 				_ = a.cat.UpsertDrive(ctx, d)
 			},
 		})
@@ -1202,7 +1266,7 @@ func generationCooldownForDrive(drv drives.Drive) time.Duration {
 		return 0
 	}
 	switch strings.ToLower(drv.Kind()) {
-	case "wopan":
+	case "wopan", "guangyapan":
 		return 10 * time.Minute
 	}
 	return 0
@@ -1222,13 +1286,24 @@ func (a *App) localUploadDir() string {
 	return filepath.Join(filepath.Dir(a.cfg.Storage.LocalPreviewDir), "uploads")
 }
 
+func (a *App) uploadWorkDir(kind string) string {
+	if a == nil || a.cfg == nil || strings.TrimSpace(a.cfg.Storage.LocalPreviewDir) == "" {
+		return ""
+	}
+	kind = strings.Trim(strings.ToLower(strings.TrimSpace(kind)), string(filepath.Separator))
+	if kind == "" {
+		kind = "generic"
+	}
+	return filepath.Join(filepath.Dir(a.cfg.Storage.LocalPreviewDir), "upload-tmp", kind)
+}
+
 func fingerprintConfigForDrive(drv drives.Drive) fingerprint.Config {
 	cfg := fingerprint.Config{RateLimitCooldown: 5 * time.Minute}
 	if drv == nil {
 		return cfg
 	}
 	switch strings.ToLower(drv.Kind()) {
-	case "p115", "p123", "onedrive", "wopan":
+	case "p115", "p123", "onedrive", "wopan", "guangyapan":
 		cfg.RateLimitCooldown = 10 * time.Minute
 	case "pikpak":
 		cfg.RateLimitCooldown = 5 * time.Minute
@@ -1326,6 +1401,7 @@ func (a *App) attachScriptCrawler(d *catalog.Drive, drv *scriptcrawler.Driver) {
 		CommonThumbDir: a.commonThumbsDir(),
 		ProxyURL:       proxyURL,
 		ConfigJSON:     configJSON,
+		DisablePreview: !d.TeaserEnabled,
 		OnProgress: func(progress scriptcrawler.CrawlProgress) {
 			scanned := progress.Checked
 			if scanned < progress.TotalEntries {
@@ -1654,9 +1730,75 @@ func (a *App) updateDriveScanProgress(driveID string, scanned, added int) {
 		if a.scanProgress == nil {
 			a.scanProgress = make(map[string]driveScanProgress)
 		}
-		a.scanProgress[driveID] = driveScanProgress{Scanned: scanned, Added: added}
+		progress := a.scanProgress[driveID]
+		progress.Scanned = scanned
+		progress.Added = added
+		a.scanProgress[driveID] = progress
 	}
 	a.scanQueueMu.Unlock()
+}
+
+func (a *App) updateDriveScanCooldown(driveID string, until time.Time) {
+	driveID = strings.TrimSpace(driveID)
+	if driveID == "" {
+		return
+	}
+	a.scanQueueMu.Lock()
+	if a.scanQueued[driveID] {
+		if a.scanProgress == nil {
+			a.scanProgress = make(map[string]driveScanProgress)
+		}
+		progress := a.scanProgress[driveID]
+		progress.CooldownUntil = until
+		a.scanProgress[driveID] = progress
+	}
+	a.scanQueueMu.Unlock()
+}
+
+func (a *App) pauseDriveScanForRateLimit(ctx context.Context, driveID string, drv drives.Drive, err error) bool {
+	wait, ok := drives.RateLimitRetryAfter(err)
+	if !ok {
+		return false
+	}
+	if wait <= 0 {
+		wait = scanCooldownForDrive(drv)
+	}
+	if wait <= 0 {
+		wait = 5 * time.Minute
+	}
+	until := time.Now().Add(wait)
+	a.updateDriveScanCooldown(driveID, until)
+	log.Printf("[scan] drive=%s rate limited; cooling until=%s wait=%s: %v", driveID, until.Format(time.RFC3339), wait, err)
+	if !sleepDriveScanCooldown(ctx, wait) {
+		log.Printf("[scan] drive=%s cooldown canceled: %v", driveID, ctx.Err())
+	}
+	return true
+}
+
+func scanCooldownForDrive(drv drives.Drive) time.Duration {
+	if drv == nil {
+		return 5 * time.Minute
+	}
+	switch strings.ToLower(drv.Kind()) {
+	case "guangyapan":
+		return 10 * time.Minute
+	default:
+		return 5 * time.Minute
+	}
+}
+
+func sleepDriveScanCooldown(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func (a *App) driveHasActiveWork(driveID string) bool {
@@ -2124,6 +2266,8 @@ func (a *App) runScanWithTaskContext(ctx context.Context, driveID string) {
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			log.Printf("[scan] drive=%s canceled: %v", driveID, err)
+		} else if a.pauseDriveScanForRateLimit(ctx, driveID, drv, err) {
+			return
 		} else {
 			log.Printf("[scan] drive=%s error: %v", driveID, err)
 		}
@@ -3273,18 +3417,7 @@ func (a *App) runScriptCrawlerCrawlWithTaskContext(ctx context.Context, driveID 
 			driveID, res.TargetNew, res.CandidateBudget, res.TotalEntries, res.NewVideos, res.Skipped, res.Failed, res.SeenSnapshot)
 	}
 
-	if d.Credentials == nil {
-		d.Credentials = make(map[string]string)
-	}
-	d.Credentials["last_crawl_at"] = strconv.FormatInt(time.Now().Unix(), 10)
-	if runErr != nil {
-		d.Status = "error"
-		d.LastError = runErr.Error()
-	} else {
-		d.Status = "ok"
-		d.LastError = ""
-	}
-	if err := a.cat.UpsertDrive(ctx, d); err != nil {
+	if err := a.updateScriptCrawlerRunState(ctx, driveID, runErr); err != nil {
 		log.Printf("[scriptcrawler] drive=%s update last_crawl_at: %v", driveID, err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -3300,6 +3433,25 @@ func (a *App) runScriptCrawlerCrawlWithTaskContext(ctx context.Context, driveID 
 	a.scheduleFingerprintBackfill(ctx, driveID, fingerprintWorker)
 	a.enqueueDriveGeneration(ctx, driveID, worker, thumbWorker)
 	return runErr == nil
+}
+
+func (a *App) updateScriptCrawlerRunState(ctx context.Context, driveID string, runErr error) error {
+	d, err := a.cat.GetDrive(ctx, driveID)
+	if err != nil {
+		return err
+	}
+	if d.Credentials == nil {
+		d.Credentials = make(map[string]string)
+	}
+	d.Credentials["last_crawl_at"] = strconv.FormatInt(time.Now().Unix(), 10)
+	if runErr != nil {
+		d.Status = "error"
+		d.LastError = runErr.Error()
+	} else {
+		d.Status = "ok"
+		d.LastError = ""
+	}
+	return a.cat.UpsertDrive(ctx, d)
 }
 
 func (a *App) runSpider91MigrationAfterManualCrawl(ctx context.Context, driveID string) {
@@ -3383,6 +3535,108 @@ func (a *App) runCrawlerUploadMigrationAfterSave(ctx context.Context, driveID st
 	}
 	if err := a.spider91Migrator.RunOnce(ctx); err != nil {
 		log.Printf("[scriptcrawler] drive=%s saved upload migration: %v", driveID, err)
+	}
+}
+
+func (a *App) scheduleManualCrawlerUploadMigration(ctx context.Context, driveID string) (bool, string) {
+	driveID = strings.TrimSpace(driveID)
+	if driveID == "" || a == nil || a.cat == nil {
+		return false, "爬虫不存在"
+	}
+	if a.spider91Migrator == nil {
+		return false, "上传迁移器未初始化"
+	}
+	if a.driveHasActiveWork(driveID) {
+		return false, "当前爬虫有正在进行的任务，请稍后重试"
+	}
+	d, err := a.cat.GetDrive(ctx, driveID)
+	if err != nil || d == nil || d.Kind != scriptcrawler.Kind {
+		return false, "爬虫不存在"
+	}
+	targetDriveID := strings.TrimSpace(d.Credentials["upload_drive_id"])
+	if targetDriveID == "" {
+		return false, "请先配置上传网盘"
+	}
+	assets, err := a.cat.CountCrawlerAssets(ctx, driveID, crawlerCatalogVideoIDPrefixes(d))
+	if err != nil {
+		log.Printf("[scriptcrawler] drive=%s manual upload count assets: %v", driveID, err)
+		return false, "读取待上传视频失败"
+	}
+	if reason := crawlerUploadAssetBlockReason(d, assets); reason != "" {
+		return false, reason
+	}
+	if err := a.ensureDriveAttached(ctx, driveID); err != nil {
+		log.Printf("[scriptcrawler] drive=%s manual upload source attach: %v", driveID, err)
+		return false, "爬虫本地存储不可用"
+	}
+	if err := a.ensureDriveAttached(ctx, targetDriveID); err != nil {
+		log.Printf("[scriptcrawler] drive=%s manual upload target=%s attach: %v", driveID, targetDriveID, err)
+		return false, "上传网盘不可用：" + err.Error()
+	}
+
+	a.crawlerUploadMu.Lock()
+	if a.crawlerUploadRunning == nil {
+		a.crawlerUploadRunning = make(map[string]bool)
+	}
+	if a.crawlerUploadRunning[driveID] {
+		a.crawlerUploadMu.Unlock()
+		return false, "当前爬虫已有上传任务正在运行"
+	}
+	a.crawlerUploadRunning[driveID] = true
+	a.crawlerUploadMu.Unlock()
+
+	taskCtx, done := a.registerDriveTaskContext(ctx, driveID)
+	go func() {
+		defer func() {
+			done()
+			a.crawlerUploadMu.Lock()
+			delete(a.crawlerUploadRunning, driveID)
+			a.crawlerUploadMu.Unlock()
+		}()
+		a.runManualCrawlerUploadMigration(taskCtx, driveID, targetDriveID)
+	}()
+	return true, ""
+}
+
+func crawlerUploadAssetBlockReason(d *catalog.Drive, assets catalog.CrawlerAssetCounts) string {
+	if assets.Local <= 0 {
+		return "没有待上传的本地视频"
+	}
+	if assets.Fingerprint.Pending > 0 {
+		return "还有待生成的视频指纹"
+	}
+	if assets.Fingerprint.Failed > 0 {
+		return "存在指纹生成失败的视频，请先重试或处理失败项"
+	}
+	if d != nil && d.TeaserEnabled {
+		if assets.Teaser.Pending > 0 {
+			return "还有待生成的预览视频"
+		}
+		if assets.Teaser.Failed > 0 {
+			return "存在预览视频生成失败的视频，请先重试或处理失败项"
+		}
+	}
+	return ""
+}
+
+func crawlerCatalogVideoIDPrefixes(d *catalog.Drive) []string {
+	if d == nil {
+		return nil
+	}
+	return []string{
+		scriptcrawler.Kind + "-" + d.ID + "-",
+		spider91.Kind + "-" + d.ID + "-",
+	}
+}
+
+func (a *App) runManualCrawlerUploadMigration(ctx context.Context, driveID, targetDriveID string) {
+	if err := ctx.Err(); err != nil {
+		log.Printf("[scriptcrawler] drive=%s skip manual upload migration: %v", driveID, err)
+		return
+	}
+	log.Printf("[scriptcrawler] drive=%s running manual upload migration target=%s", driveID, targetDriveID)
+	if err := a.spider91Migrator.RunOnce(ctx); err != nil {
+		log.Printf("[scriptcrawler] drive=%s manual upload migration: %v", driveID, err)
 	}
 }
 
@@ -3760,6 +4014,17 @@ func parseBoolDefault(raw string, def bool) bool {
 		return def
 	}
 	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return def
+	}
+	return v
+}
+
+func parseIntDefault(raw string, def int) int {
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
 	if err != nil {
 		return def
 	}

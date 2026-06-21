@@ -3,7 +3,6 @@ import { NavLink } from "react-router-dom";
 import {
   Film,
   Menu,
-  Play,
   Settings,
   Sparkles,
   Upload,
@@ -25,9 +24,8 @@ export function MainNav() {
       <div className="container main-nav__inner">
         <NavLink to="/" className="main-nav__logo">
           <span className="main-nav__logo-mark">
-            <Play size={16} fill="#000" />
+            <img src="/icon.png" alt="" className="main-nav__logo-img" />
           </span>
-          <span className="main-nav__logo-text">91</span>
         </NavLink>
 
         <ul className="main-nav__list" role="menubar">

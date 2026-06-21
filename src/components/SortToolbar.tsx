@@ -13,10 +13,7 @@ type Props = {
 const sortOptions: { key: SortKey; label: string }[] = [
   { key: "latest", label: "最新" },
   { key: "hot", label: "最热" },
-  { key: "week", label: "本周" },
-  { key: "long", label: "最长" },
-  { key: "hd", label: "高清" },
-  { key: "featured", label: "精选" },
+  { key: "recent", label: "最近观看" },
 ];
 
 export function SortToolbar({ sort, view, onSortChange, onViewChange }: Props) {

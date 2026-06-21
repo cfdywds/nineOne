@@ -4,6 +4,7 @@ export type Kind =
   | "p123"
   | "pikpak"
   | "wopan"
+  | "guangyapan"
   | "onedrive"
   | "googledrive"
   | "localstorage"
@@ -16,6 +17,7 @@ export const kindAbbr: Record<string, string> = {
   p123: "123",
   pikpak: "Pk",
   wopan: "Wo",
+  guangyapan: "GY",
   onedrive: "OD",
   googledrive: "GD",
   localstorage: "Lo",
@@ -39,6 +41,7 @@ export const kindLabel: Record<string, string> = {
   p123: "123网盘",
   pikpak: "PikPak",
   wopan: "联通网盘",
+  guangyapan: "光鸭网盘",
   onedrive: "OneDrive",
   googledrive: "Google Drive",
   localstorage: "本地存储",
@@ -142,6 +145,7 @@ export function formatClock(value: string): string {
 
 export function defaultRootId(kind: Kind): string {
   if (kind === "pikpak") return "";
+  if (kind === "guangyapan") return "";
   if (kind === "onedrive") return "root";
   if (kind === "googledrive") return "root";
   if (kind === "localstorage") return "/";
@@ -171,6 +175,8 @@ export function credentialHelp(kind: Kind, isEdit: boolean): string {
       return `填写 PikPak 账号和密码即可。平台、设备 ID、验证码 token 和 refresh token 会由服务端自动处理并保存。${note}`;
     case "wopan":
       return `推荐使用扫码登录自动获取 access_token 和 refresh_token；也可以手工粘贴已有凭证。${note}`;
+    case "guangyapan":
+      return `推荐使用扫码登录自动获取 access_token 和 refresh_token；也可以手工粘贴已有 token。${note}`;
     case "onedrive":
       return `按 OpenList 默认应用在线挂载，只需要 refresh_token；保存时会自动刷新并保存 token。${note}`;
     case "googledrive":
@@ -290,6 +296,29 @@ export function credentialFields(kind: Kind, creds: Record<string, string> = {})
           placeholder: "留空走个人空间",
         },
       ];
+    case "guangyapan":
+      return [
+        {
+          key: "root_path",
+          label: "根目录路径（可选）",
+          placeholder: "例如：影视/电影；留空使用上方根目录 ID",
+          help: "如果填写 root_path，服务端会按路径解析光鸭目录，并优先作为扫描根目录。",
+        },
+        {
+          key: "refresh_token",
+          label: "refresh_token",
+          placeholder: "推荐填写，服务端会自动刷新 access_token",
+          multiline: true,
+          help: "扫码成功后会自动填入该字段。",
+        },
+        {
+          key: "access_token",
+          label: "access_token",
+          placeholder: "Bearer eyJ... 或直接粘贴 token",
+          multiline: true,
+          help: "扫码成功后会自动填入该字段；如果 token 过期，重新扫码后保存即可。",
+        },
+      ];
     case "onedrive":
       return [
         {
@@ -313,15 +342,15 @@ export function credentialFields(kind: Kind, creds: Record<string, string> = {})
             { value: "false", label: "自建 Google OAuth 客户端" },
           ],
         },
-        {
-          key: "refresh_token",
-          label: "refresh_token",
-          placeholder: "OpenList Google Drive refresh_token",
-          multiline: true,
-          required: true,
-        },
         ...(googleDriveUsesOnlineAPI(creds)
-          ? []
+          ? [
+              {
+                key: "api_url_address",
+                label: "OpenList 在线 API URL",
+                placeholder: "默认：https://api.oplist.org/googleui/renewapi",
+                help: "留空时使用 OpenList 官方在线 API，填写后会使用自定义续期 API。",
+              },
+            ]
           : [
               {
                 key: "client_id",
@@ -338,6 +367,13 @@ export function credentialFields(kind: Kind, creds: Record<string, string> = {})
                 help: "Google Cloud Console 中同一个 OAuth 客户端的 Client Secret",
               },
             ]),
+        {
+          key: "refresh_token",
+          label: "refresh_token",
+          placeholder: "OpenList Google Drive refresh_token",
+          multiline: true,
+          required: true,
+        },
       ];
     case "localstorage":
       return [

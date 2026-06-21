@@ -7,11 +7,8 @@ import {
   Minimize,
   Volume2,
   VolumeX,
-  Play,
-  Pause,
   EyeOff,
   Info,
-  Loader2,
   Sparkles,
   AlertCircle,
 } from "lucide-react";
@@ -89,16 +86,34 @@ export default function ShortsPage() {
     }, 1500);
   }, []);
 
+  const stopHeaderControlPropagation = useCallback((e: React.SyntheticEvent) => {
+    e.stopPropagation();
+  }, []);
+
   const handleVolumeButtonClick = useCallback(() => {
+    const activeVideo = videoRefs.current.get(activeIndex);
+    const canResumeActiveVideo = () =>
+      Boolean(activeVideo) &&
+      videoRefs.current.get(activeIndexRef.current) === activeVideo &&
+      userPausedIndexRef.current !== activeIndexRef.current;
+    const wasPlaying = Boolean(activeVideo) && canResumeActiveVideo() && !activeVideo?.paused;
     setMuted((v) => {
       const next = !v;
+      if (activeVideo) {
+        normalizeVideoPlaybackRate(activeVideo);
+        applyVideoAudioState(activeVideo, next, volume);
+        stabilizeVideoAfterAudioToggle(
+          activeVideo,
+          () => wasPlaying && canResumeActiveVideo()
+        );
+      }
       showHud(
         next ? "已静音" : "音量已开启",
         next ? <VolumeX size={16} /> : <Volume2 size={16} />
       );
       return next;
     });
-  }, [showHud]);
+  }, [activeIndex, showHud, volume]);
 
   const handleVolumeSliderChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const val = parseFloat(e.target.value);
@@ -111,8 +126,19 @@ export default function ShortsPage() {
     // Update active video volume directly
     const activeVideo = videoRefs.current.get(activeIndex);
     if (activeVideo) {
-      activeVideo.volume = val;
-      activeVideo.muted = val === 0;
+      normalizeVideoPlaybackRate(activeVideo);
+      applyVideoAudioState(activeVideo, val === 0, val);
+      const wasPlaying =
+        videoRefs.current.get(activeIndexRef.current) === activeVideo &&
+        userPausedIndexRef.current !== activeIndexRef.current &&
+        !activeVideo.paused;
+      stabilizeVideoAfterAudioToggle(
+        activeVideo,
+        () =>
+          wasPlaying &&
+          videoRefs.current.get(activeIndexRef.current) === activeVideo &&
+          userPausedIndexRef.current !== activeIndexRef.current
+      );
     }
   }, [activeIndex]);
 
@@ -139,20 +165,24 @@ export default function ShortsPage() {
   // index → video element，用来精确控制播放/暂停
   const videoRefs = useRef<Map<number, HTMLVideoElement>>(new Map());
   const activeIndexRef = useRef(0);
+  const userPausedIndexRef = useRef<number | null>(null);
   const ignoreIntersectionUntilRef = useRef(0);
   const fullscreenRestoreTimersRef = useRef<number[]>([]);
+  const fullscreenPointerHandledRef = useRef(false);
   const [activeReadyForPreload, setActiveReadyForPreload] = useState(false);
+  const [userPausedIndex, setUserPausedIndexState] = useState<number | null>(null);
   const [cacheableSourceIds, setCacheableSourceIds] = useState<Set<string>>(
     () => new Set()
   );
   const [cacheWindowHighIndex, setCacheWindowHighIndex] = useState(-1);
 
   // 当前是否处在浏览器全屏（Fullscreen API）状态。
-  // iOS Safari 不支持元素级 Fullscreen API，这里会一直保持 false，
-  // 全屏按钮在那种环境下点了也无效（按钮仍展示"进入全屏"图标）。
+  // iPhone Safari 不支持网页元素级全屏；那种环境下改用页面滚动让浏览器栏随刷动收起。
+  const useDocumentScroll = shouldUseDocumentScrollForShorts();
+  const [canRequestFullscreen, setCanRequestFullscreen] = useState(() =>
+    supportsElementFullscreenAPI()
+  );
   const [isFullscreen, setIsFullscreen] = useState(false);
-  // 自动尝试进入全屏只做一次，避免反复打扰用户
-  const autoFullscreenAttemptedRef = useRef(false);
 
   // 本次会话内已经点过赞的视频 id 集合。
   // 与后端的真实 likes 字段同步——后端是单纯计数器，前端在这里防重避免连发。
@@ -162,6 +192,38 @@ export default function ShortsPage() {
   useEffect(() => {
     activeIndexRef.current = activeIndex;
   }, [activeIndex]);
+
+  useEffect(() => {
+    const page = pageRef.current;
+    if (page && supportsElementFullscreenAPI(page)) {
+      setCanRequestFullscreen(true);
+    }
+  }, []);
+
+  const updateUserPausedIndex = useCallback((index: number | null) => {
+    userPausedIndexRef.current = index;
+    setUserPausedIndexState(index);
+  }, []);
+
+  const setUserPausedForIndex = useCallback(
+    (index: number, isPaused: boolean) => {
+      if (isPaused) {
+        updateUserPausedIndex(index);
+      } else if (userPausedIndexRef.current === index) {
+        updateUserPausedIndex(null);
+      }
+    },
+    [updateUserPausedIndex]
+  );
+
+  const isVideoPausedByUser = useCallback(
+    (index: number) => userPausedIndexRef.current === index,
+    []
+  );
+
+  useEffect(() => {
+    updateUserPausedIndex(null);
+  }, [activeIndex, updateUserPausedIndex]);
 
   const handleActiveReadyForPreload = useCallback((index: number) => {
     if (index === activeIndexRef.current) {
@@ -294,7 +356,8 @@ export default function ShortsPage() {
     }
   }, [activeIndex, items, loading, roundComplete, loadMore]);
 
-  // 用 IntersectionObserver 找出当前进入视口的 item
+  // 用 IntersectionObserver 找出当前进入视口的 item。
+  // root 直接用 viewport：普通模式和 iPhone 页面滚动模式都能正确观测。
   useEffect(() => {
     const root = containerRef.current;
     if (!root) return;
@@ -321,7 +384,7 @@ export default function ShortsPage() {
         }
       },
       {
-        root,
+        root: null,
         threshold: [0.6, 0.85],
       }
     );
@@ -331,20 +394,28 @@ export default function ShortsPage() {
     return () => observer.disconnect();
   }, [items.length]);
 
-  // 控制每个 video 的播放状态与音量：只有 activeIndex 对应的在播
+  // 控制每个 video 的播放状态：只有 activeIndex 对应的在播。
+  // 声音切换不要进入这里，否则移动端切换 muted 时可能额外触发 play/pause。
   useEffect(() => {
     videoRefs.current.forEach((video, idx) => {
       if (idx === activeIndex) {
-        video.muted = muted;
-        video.volume = volume;
-        if (video.paused) {
+        if (userPausedIndex === idx) {
+          if (!video.paused) video.pause();
+        } else if (video.paused) {
           video.play().catch(() => undefined);
         }
       } else {
         if (!video.paused) video.pause();
       }
     });
-  }, [activeIndex, muted, volume, items.length]);
+  }, [activeIndex, items.length, userPausedIndex]);
+
+  // 单独同步音频属性。这里不做 play/pause，避免手机端切换静音时打断播放节奏。
+  useEffect(() => {
+    videoRefs.current.forEach((video) => {
+      applyVideoAudioState(video, muted, volume);
+    });
+  }, [muted, volume, items.length]);
 
   // 键盘快捷键监听
   useEffect(() => {
@@ -376,12 +447,15 @@ export default function ShortsPage() {
         e.preventDefault();
         const activeVideo = videoRefs.current.get(activeIndex);
         if (activeVideo) {
-          if (activeVideo.paused) {
+          const shouldResume =
+            userPausedIndexRef.current === activeIndex ||
+            (activeVideo.paused && activeVideo.readyState >= 3);
+          if (shouldResume) {
+            setUserPausedForIndex(activeIndex, false);
             activeVideo.play().catch(() => undefined);
-            showHud("播放", <Play size={16} fill="currentColor" />);
           } else {
+            setUserPausedForIndex(activeIndex, true);
             activeVideo.pause();
-            showHud("暂停", <Pause size={16} fill="currentColor" />);
           }
         }
       } else if (e.key === "m" || e.key === "M") {
@@ -417,7 +491,7 @@ export default function ShortsPage() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [activeIndex, items, toggleFullscreen, showHud, handleVolumeButtonClick]);
+  }, [activeIndex, items, toggleFullscreen, showHud, handleVolumeButtonClick, setUserPausedForIndex]);
 
   // 页面卸载时暂停所有
   useEffect(() => {
@@ -444,16 +518,21 @@ export default function ShortsPage() {
     document.title = "短视频 · 91";
   }, []);
 
-  // 沉浸式：进入页面后锁住 body 滚动 + 把主题色改黑（Android Chrome 状态栏会变黑）
+  // 沉浸式：默认锁住 body 滚动；iPhone 浏览器里放开根页面滚动，让 Safari 工具栏能随刷动收起。
   useEffect(() => {
     const html = document.documentElement;
     const body = document.body;
     const prevHtmlOverflow = html.style.overflow;
     const prevBodyOverflow = body.style.overflow;
     const prevBodyBg = body.style.background;
-    html.style.overflow = "hidden";
-    body.style.overflow = "hidden";
-    body.style.background = "#000";
+    if (useDocumentScroll) {
+      html.classList.add("shorts-document-scroll");
+      body.classList.add("shorts-document-scroll");
+    } else {
+      html.style.overflow = "hidden";
+      body.style.overflow = "hidden";
+      body.style.background = "#000";
+    }
 
     let prevThemeColor: string | null = null;
     let themeMeta = document.querySelector<HTMLMetaElement>(
@@ -470,6 +549,8 @@ export default function ShortsPage() {
     themeMeta.content = "#000000";
 
     return () => {
+      html.classList.remove("shorts-document-scroll");
+      body.classList.remove("shorts-document-scroll");
       html.style.overflow = prevHtmlOverflow;
       body.style.overflow = prevBodyOverflow;
       body.style.background = prevBodyBg;
@@ -481,7 +562,7 @@ export default function ShortsPage() {
         }
       }
     };
-  }, []);
+  }, [useDocumentScroll]);
 
   function clearFullscreenRestoreTimers() {
     for (const timer of fullscreenRestoreTimersRef.current) {
@@ -543,29 +624,8 @@ export default function ShortsPage() {
     };
   }, []);
 
-  // 进入页面后第一次任意触摸时尝试自动进入全屏。
-  // 浏览器要求 requestFullscreen 必须在用户手势内调用；进页面时直接调
-  // 一定会被拒绝，所以挂在 pointerdown 上利用第一次手势。
-  // iOS Safari 不支持元素级 Fullscreen API，这里 catch 后保持原样，
-  // 退化为已经做的 100svh 沉浸样式。
-  useEffect(() => {
-    const page = pageRef.current;
-    if (!page) return;
-    function onFirstPointer() {
-      if (autoFullscreenAttemptedRef.current) return;
-      autoFullscreenAttemptedRef.current = true;
-      requestPageFullscreen();
-    }
-    page.addEventListener("pointerdown", onFirstPointer, {
-      once: true,
-      passive: true,
-    });
-    return () => {
-      page.removeEventListener("pointerdown", onFirstPointer);
-    };
-  }, []);
-
   function requestPageFullscreen() {
+    if (!canRequestFullscreen) return;
     const page = pageRef.current;
     if (!page) return;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -604,8 +664,33 @@ export default function ShortsPage() {
 
   function toggleFullscreen() {
     scheduleFullscreenActiveRestore();
-    if (isFullscreen) exitPageFullscreen();
-    else requestPageFullscreen();
+    if (canRequestFullscreen) {
+      if (isFullscreen) exitPageFullscreen();
+      else requestPageFullscreen();
+      return;
+    }
+    if (useDocumentScroll) {
+      restoreActiveSlideIntoView();
+    }
+  }
+
+  function handleFullscreenButtonPointerDown(
+    e: React.PointerEvent<HTMLButtonElement>
+  ) {
+    e.preventDefault();
+    e.stopPropagation();
+    fullscreenPointerHandledRef.current = true;
+    toggleFullscreen();
+  }
+
+  function handleFullscreenButtonClick(e: React.MouseEvent<HTMLButtonElement>) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (fullscreenPointerHandledRef.current) {
+      fullscreenPointerHandledRef.current = false;
+      return;
+    }
+    toggleFullscreen();
   }
 
   const handleHideSuccess = useCallback((idx: number) => {
@@ -624,7 +709,10 @@ export default function ShortsPage() {
   const videoWindow = getVideoWindowBounds(cacheWindowHighIndex, items.length);
 
   return (
-    <div className="shorts-page" ref={pageRef}>
+    <div
+      className={`shorts-page${useDocumentScroll ? " is-document-scroll" : ""}`}
+      ref={pageRef}
+    >
       <header className="shorts-header">
         <Link to="/" className="shorts-header__back" aria-label="返回首页">
           <ChevronLeft size={22} />
@@ -634,7 +722,8 @@ export default function ShortsPage() {
             type="button"
             className="shorts-header__icon-btn"
             aria-label={isFullscreen ? "退出全屏" : "进入全屏"}
-            onClick={toggleFullscreen}
+            onPointerDown={handleFullscreenButtonPointerDown}
+            onClick={handleFullscreenButtonClick}
           >
             {isFullscreen ? <Minimize size={20} /> : <Maximize size={20} />}
           </button>
@@ -656,7 +745,16 @@ export default function ShortsPage() {
               type="button"
               className="shorts-header__icon-btn"
               aria-label={muted ? "取消静音" : "静音"}
-              onClick={handleVolumeButtonClick}
+              onPointerDownCapture={stopHeaderControlPropagation}
+              onTouchStartCapture={stopHeaderControlPropagation}
+              onMouseDownCapture={stopHeaderControlPropagation}
+              onPointerDown={stopHeaderControlPropagation}
+              onTouchStart={stopHeaderControlPropagation}
+              onMouseDown={stopHeaderControlPropagation}
+              onClick={(e) => {
+                e.stopPropagation();
+                handleVolumeButtonClick();
+              }}
             >
               {muted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
             </button>
@@ -720,17 +818,12 @@ export default function ShortsPage() {
               onActiveReadyForPreload={handleActiveReadyForPreload}
               onActiveNeedsPriority={handleActiveNeedsPriority}
               onSourceCached={handleSourceCached}
+              onUserPausedChange={setUserPausedForIndex}
+              isVideoPausedByUser={isVideoPausedByUser}
               showHud={showHud}
             />
           );
         })}
-
-        {!empty && items.length > 0 && loading && (
-          <div className="shorts-loading">
-            <Loader2 size={16} className="shorts-slide__buffering-icon" />
-            <span>加载中…</span>
-          </div>
-        )}
       </div>
     </div>
   );
@@ -760,6 +853,8 @@ type SlideProps = {
   onActiveNeedsPriority: (index: number) => void;
   /** 本条视频在浏览器里已有可复用缓冲，之后在视频窗口内保留 src */
   onSourceCached: (videoId: string) => void;
+  onUserPausedChange: (index: number, isPaused: boolean) => void;
+  isVideoPausedByUser: (index: number) => boolean;
   showHud: (text: string, icon?: React.ReactNode) => void;
 };
 
@@ -788,6 +883,8 @@ function ShortsSlide({
   onActiveReadyForPreload,
   onActiveNeedsPriority,
   onSourceCached,
+  onUserPausedChange,
+  isVideoPausedByUser,
   showHud,
 }: SlideProps) {
   const localRef = useRef<HTMLVideoElement | null>(null);
@@ -796,8 +893,6 @@ function ShortsSlide({
 
   // 视频缓冲状态
   const [isBuffering, setIsBuffering] = useState(false);
-  // 单击播放暂停的瞬间 HUD 动效
-  const [playPauseHud, setPlayPauseHud] = useState<{ id: number; type: "play" | "pause" } | null>(null);
   // 是否已经被隐藏/拉黑
   const [isMarkedHidden, setIsMarkedHidden] = useState(false);
 
@@ -865,7 +960,6 @@ function ShortsSlide({
       setScrubbing(false);
       scrubbingRef.current = false;
       setIsBuffering(false);
-      setPlayPauseHud(null);
     }
   }, [isActive]);
 
@@ -873,8 +967,7 @@ function ShortsSlide({
   useEffect(() => {
     const video = localRef.current;
     if (video && isActive) {
-      video.muted = muted;
-      video.volume = volume;
+      applyVideoAudioState(video, muted, volume);
     }
   }, [muted, volume, isActive]);
 
@@ -916,13 +1009,23 @@ function ShortsSlide({
       syncActivePreloadReadiness(video);
     };
     const handleWaiting = () => {
+      if (video.paused || isVideoPausedByUser(index)) {
+        setIsBuffering(false);
+        return;
+      }
       setIsBuffering(true);
       if (isActive) onActiveNeedsPriority(index);
     };
     const handlePlayingOrCanPlay = () => {
-      setIsBuffering(false);
       // 已经能解码播放，说明浏览器里有了值得复用的数据。
       if (shouldLoad) onSourceCached(item.id);
+      if (isActive && isVideoPausedByUser(index)) {
+        video.pause();
+        setPaused(true);
+        setIsBuffering(false);
+        return;
+      }
+      setIsBuffering(false);
       syncActivePreloadReadiness(video);
     };
     const handleProgress = () => {
@@ -943,6 +1046,21 @@ function ShortsSlide({
       if (video.volume !== volume) {
         setVolume(video.volume);
       }
+    };
+    const handlePlay = () => {
+      if (!isActive) return;
+      if (isVideoPausedByUser(index)) {
+        video.pause();
+        setPaused(true);
+        setIsBuffering(false);
+        return;
+      }
+      setPaused(false);
+    };
+    const handlePause = () => {
+      if (!isActive || video.ended) return;
+      setPaused(true);
+      setIsBuffering(false);
     };
 
     function syncActivePreloadReadiness(currentVideo: HTMLVideoElement) {
@@ -966,6 +1084,8 @@ function ShortsSlide({
     video.addEventListener("canplay", handlePlayingOrCanPlay);
     video.addEventListener("progress", handleProgress);
     video.addEventListener("volumechange", handleVolumeChange);
+    video.addEventListener("play", handlePlay);
+    video.addEventListener("pause", handlePause);
 
     // 挂载时如果已经在播放但是状态不到 ready 则置 buffering
     if (video.readyState < 3 && !video.paused) {
@@ -981,8 +1101,10 @@ function ShortsSlide({
       video.removeEventListener("canplay", handlePlayingOrCanPlay);
       video.removeEventListener("progress", handleProgress);
       video.removeEventListener("volumechange", handleVolumeChange);
+      video.removeEventListener("play", handlePlay);
+      video.removeEventListener("pause", handlePause);
     };
-  }, [shouldMount, shouldLoad, item.id, index, isActive, muted, volume, setMuted, setVolume, onActiveReadyForPreload, onActiveNeedsPriority, onSourceCached]);
+  }, [shouldMount, shouldLoad, item.id, index, isActive, muted, volume, setMuted, setVolume, onActiveReadyForPreload, onActiveNeedsPriority, onSourceCached, isVideoPausedByUser]);
 
   // 长按 2 倍速：直接绑原生事件
   useEffect(() => {
@@ -1047,16 +1169,18 @@ function ShortsSlide({
   function togglePlayInternal() {
     const video = localRef.current;
     if (!video) return;
-    if (video.paused) {
+    const shouldResume =
+      isVideoPausedByUser(index) || (video.paused && paused && !isBuffering);
+    if (shouldResume) {
+      onUserPausedChange(index, false);
       video.play().catch(() => undefined);
       setPaused(false);
-      setPlayPauseHud({ id: Date.now(), type: "play" });
-      setTimeout(() => setPlayPauseHud(null), 450);
+      if (video.readyState < 3) setIsBuffering(true);
     } else {
+      onUserPausedChange(index, true);
       video.pause();
       setPaused(true);
-      setPlayPauseHud({ id: Date.now(), type: "pause" });
-      setTimeout(() => setPlayPauseHud(null), 450);
+      setIsBuffering(false);
     }
   }
 
@@ -1311,7 +1435,7 @@ function ShortsSlide({
 
 
 
-      {paused && isActive && !scrubbing && !playPauseHud && (
+      {paused && isActive && !scrubbing && (
         <div className="shorts-slide__paused" aria-hidden="true">
           ▶
         </div>
@@ -1320,14 +1444,7 @@ function ShortsSlide({
       {/* 视频加载/缓冲旋转器 */}
       {isBuffering && isActive && shouldLoad && !isMarkedHidden && (
         <div className="shorts-slide__buffering" aria-hidden="true">
-          <Loader2 size={30} className="shorts-slide__buffering-icon" />
-        </div>
-      )}
-
-      {/* 播放暂停瞬间 HUD 动效 */}
-      {playPauseHud && isActive && (
-        <div key={playPauseHud.id} className="shorts-slide__hud-pulse" aria-hidden="true">
-          {playPauseHud.type === "play" ? <Play size={30} fill="currentColor" /> : <Pause size={30} fill="currentColor" />}
+          <ShortsLoadingSpinner size={30} />
         </div>
       )}
 
@@ -1451,6 +1568,128 @@ function ShortsSlide({
   );
 }
 
+function ShortsLoadingSpinner({ size }: { size: number }) {
+  const ref = useRef<HTMLSpanElement | null>(null);
+
+  useEffect(() => {
+    let frame = 0;
+    const startedAt = performance.now();
+    const tick = (now: number) => {
+      const spinner = ref.current;
+      if (spinner) {
+        const rotation = ((now - startedAt) / 800) * 360;
+        spinner.style.transform = `rotate(${rotation}deg)`;
+      }
+      frame = window.requestAnimationFrame(tick);
+    };
+    frame = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+
+  return (
+    <span
+      ref={ref}
+      className="shorts-slide__loading-spinner"
+      style={{
+        "--shorts-spinner-size": `${size}px`,
+      } as React.CSSProperties}
+      aria-hidden="true"
+    />
+  );
+}
+
+function applyVideoAudioState(
+  video: HTMLVideoElement,
+  nextMuted: boolean,
+  nextVolume: number
+) {
+  const safeVolume = clamp(nextVolume, 0, 1);
+  const syncVolume = () => {
+    try {
+      if (Math.abs(video.volume - safeVolume) > 0.001) {
+        video.volume = safeVolume;
+      }
+    } catch {
+      // Some mobile browsers expose volume as effectively read-only.
+    }
+  };
+
+  if (!nextMuted) syncVolume();
+  try {
+    if (video.muted !== nextMuted) {
+      video.muted = nextMuted;
+    }
+  } catch {
+    // ignore
+  }
+  if (nextMuted) syncVolume();
+}
+
+function normalizeVideoPlaybackRate(video: HTMLVideoElement) {
+  try {
+    if (video.defaultPlaybackRate !== 1) {
+      video.defaultPlaybackRate = 1;
+    }
+    if (video.playbackRate !== 1) {
+      video.playbackRate = 1;
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function stabilizeVideoAfterAudioToggle(
+  video: HTMLVideoElement,
+  shouldResume: () => boolean
+) {
+  const stabilize = () => {
+    normalizeVideoPlaybackRate(video);
+    if (shouldResume() && video.paused && !video.ended) {
+      video.play().catch(() => undefined);
+    }
+  };
+
+  stabilize();
+  for (const delay of [80, 240, 600]) {
+    window.setTimeout(stabilize, delay);
+  }
+}
+
+function shouldUseDocumentScrollForShorts() {
+  return isIPhoneBrowserShell();
+}
+
+function isIPhoneBrowserShell() {
+  if (typeof window === "undefined" || typeof navigator === "undefined") {
+    return false;
+  }
+  const ua = navigator.userAgent || "";
+  return /\biPhone\b|\biPod\b/.test(ua) && !isStandaloneDisplayMode();
+}
+
+function isStandaloneDisplayMode() {
+  if (typeof window === "undefined" || typeof navigator === "undefined") {
+    return false;
+  }
+  const nav = navigator as Navigator & { standalone?: boolean };
+  return (
+    nav.standalone === true ||
+    window.matchMedia?.("(display-mode: standalone)").matches === true ||
+    window.matchMedia?.("(display-mode: fullscreen)").matches === true
+  );
+}
+
+function supportsElementFullscreenAPI(target?: Element | null) {
+  if (typeof document === "undefined") return false;
+  const el = (target ?? document.documentElement) as HTMLElement & {
+    webkitRequestFullscreen?: () => Promise<void> | void;
+  };
+  return (
+    typeof el.requestFullscreen === "function" ||
+    typeof el.webkitRequestFullscreen === "function"
+  );
+}
+
 function clamp(n: number, min: number, max: number) {
   return n < min ? min : n > max ? max : n;
 }
@@ -1532,6 +1771,7 @@ function getDriveShortName(source: string): string {
   if (s.includes("quark") || s.includes("夸克")) return "Quak";
   if (s.includes("onedrive")) return "OneDrive";
   if (s.includes("wopan") || s.includes("沃盘")) return "沃盘";
+  if (s.includes("guangyapan") || s.includes("guangya") || s.includes("光鸭")) return "光鸭";
   if (s.includes("localstorage") || s.includes("本地")) return "本地";
   if (s.includes("spider") || s.includes("爬虫")) return "爬虫";
   return source.substring(0, 4);

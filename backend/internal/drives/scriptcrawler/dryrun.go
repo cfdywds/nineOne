@@ -67,6 +67,55 @@ type DryRunResult struct {
 	DurationMs int64             `json:"durationMs"`
 }
 
+type dryRunLogTail struct {
+	mu      sync.Mutex
+	lines   []string
+	partial string
+}
+
+func newDryRunLogTail() *dryRunLogTail {
+	return &dryRunLogTail{lines: make([]string, 0, dryRunLogTailLines)}
+}
+
+func (t *dryRunLogTail) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	chunk := strings.ReplaceAll(string(p), "\r\n", "\n")
+	parts := strings.Split(t.partial+chunk, "\n")
+	t.partial = parts[len(parts)-1]
+	for _, line := range parts[:len(parts)-1] {
+		t.appendLocked(line)
+	}
+	return len(p), nil
+}
+
+func (t *dryRunLogTail) snapshot() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	lines := append([]string{}, t.lines...)
+	if partial := strings.TrimSpace(t.partial); partial != "" {
+		lines = appendDryRunLogLine(lines, partial)
+	}
+	return lines
+}
+
+func (t *dryRunLogTail) appendLocked(line string) {
+	t.lines = appendDryRunLogLine(t.lines, line)
+}
+
+func appendDryRunLogLine(lines []string, line string) []string {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return lines
+	}
+	if len(lines) >= dryRunLogTailLines {
+		lines = lines[1:]
+	}
+	return append(lines, line)
+}
+
 func DryRun(ctx context.Context, cfg DryRunConfig) *DryRunResult {
 	started := time.Now()
 	result := &DryRunResult{Items: []DryRunItem{}}
@@ -172,40 +221,13 @@ func DryRun(ctx context.Context, cfg DryRunConfig) *DryRunResult {
 		result.Error = fmt.Sprintf("启动脚本失败: %v", err)
 		return result
 	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		_ = stdout.Close()
-		result.Error = fmt.Sprintf("启动脚本失败: %v", err)
-		return result
-	}
+	logTail := newDryRunLogTail()
+	cmd.Stderr = logTail
 	if err := cmd.Start(); err != nil {
 		_ = stdout.Close()
-		_ = stderr.Close()
 		result.Error = fmt.Sprintf("启动脚本失败: %v", err)
 		return result
 	}
-
-	// stderr 是脚本日志，保留尾部若干行用于排错回显。
-	var logMu sync.Mutex
-	logTail := make([]string, 0, dryRunLogTailLines)
-	stderrDone := make(chan struct{})
-	go func() {
-		defer close(stderrDone)
-		scanner := bufio.NewScanner(stderr)
-		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" {
-				continue
-			}
-			logMu.Lock()
-			if len(logTail) >= dryRunLogTailLines {
-				logTail = logTail[1:]
-			}
-			logTail = append(logTail, line)
-			logMu.Unlock()
-		}
-	}()
 
 	items := []DryRunItem{}
 	var firstMediaHeaders map[string]string
@@ -267,11 +289,8 @@ func DryRun(ctx context.Context, cfg DryRunConfig) *DryRunResult {
 		_ = killDryRunProcess(cmd)
 		<-waitDone
 	}
-	<-stderrDone
 
-	logMu.Lock()
-	result.Log = append([]string{}, logTail...)
-	logMu.Unlock()
+	result.Log = logTail.snapshot()
 	result.Items = items
 
 	if len(items) == 0 {

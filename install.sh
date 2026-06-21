@@ -194,7 +194,7 @@ backup_install_files() {
   local backup="$1"
   mkdir -p "$backup"
   cp -a "$INSTALL_PATH/server" "$backup/server"
-  for item in dist config.example.yaml 91VideoSpider config.yaml .version; do
+  for item in dist config.example.yaml config.yaml .version; do
     if [[ -e "$INSTALL_PATH/$item" ]]; then
       cp -a "$INSTALL_PATH/$item" "$backup/$item"
     fi
@@ -205,7 +205,7 @@ restore_install_files() {
   local backup="$1"
   mkdir -p "$INSTALL_PATH"
   cp -a "$backup/server" "$INSTALL_PATH/server"
-  for item in dist config.example.yaml 91VideoSpider config.yaml .version; do
+  for item in dist config.example.yaml config.yaml .version; do
     rm -rf "${INSTALL_PATH:?}/$item"
     if [[ -e "$backup/$item" ]]; then
       cp -a "$backup/$item" "$INSTALL_PATH/$item"
@@ -441,7 +441,6 @@ process_looks_like_app() {
   [[ "$cmd" == *"VIDEO_FRONTEND_DIR=$INSTALL_PATH/dist"* ]] && return 0
   [[ "$cmd" == *"VIDEO_CONFIG=$INSTALL_PATH/config.yaml"* ]] && return 0
   [[ "$cmd" == *"video-site-91"* ]] && return 0
-  [[ "$cmd" == *"91VideoSpider"* ]] && return 0
   return 1
 }
 
@@ -595,10 +594,6 @@ fetch_and_unpack() {
   rm -rf "$INSTALL_PATH/dist"
   cp -R "$root/dist" "$INSTALL_PATH/dist"
   cp "$root/config.example.yaml" "$INSTALL_PATH/config.example.yaml"
-  if [[ -d "$root/91VideoSpider" ]]; then
-    rm -rf "$INSTALL_PATH/91VideoSpider"
-    cp -R "$root/91VideoSpider" "$INSTALL_PATH/91VideoSpider"
-  fi
   chmod +x "$INSTALL_PATH/server"
   rm -rf "$tmp"
 }

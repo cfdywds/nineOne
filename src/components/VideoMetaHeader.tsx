@@ -74,6 +74,8 @@ function sourceKindFromLabel(label: string): string {
   if (value.includes("pikpak")) return "pikpak";
   if (value.includes("沃盘") || value.includes("wopan") || value.includes("联通"))
     return "wopan";
+  if (value.includes("光鸭") || value.includes("guangyapan") || value.includes("guangya"))
+    return "guangyapan";
   if (value.includes("onedrive") || value.includes("one drive")) return "onedrive";
   if (value.includes("本地") || value.includes("localstorage") || value.includes("local storage"))
     return "localstorage";

@@ -2,7 +2,7 @@
 
 视频聚合站的 Go 后端。提供三件事：
 
-1. 多家网盘统一抽象（夸克 / 115 / PikPak / 联通网盘 / OneDrive / Google Drive / 本地存储）
+1. 多家网盘统一抽象（夸克 / 115 / PikPak / 联通网盘 / 光鸭网盘 / OneDrive / Google Drive / 本地存储）
 2. 视频元数据目录（SQLite）+ 扫描 + 预览视频预生成
 3. REST API（前台）+ 管理后台 + 直链代理
 4. 标签池、视频隐藏、按网盘统计和详情页来源网盘类型展示能力
@@ -20,6 +20,7 @@ internal/
     p115/                   115（壳子 + SheltonZhu/115driver）
     pikpak/                 PikPak（自己实现，参考 OpenList pikpak）
     wopan/                  联通网盘（壳子 + OpenListTeam/wopan-sdk-go）
+    guangyapan/             光鸭网盘（参考 AList GuangYaPan）
     onedrive/               OneDrive（OpenList 在线续期 + Microsoft Graph 文件接口）
     googledrive/            Google Drive（OpenList 在线续期 + Google Drive API；播放走后端代理）
     localstorage/           本地目录扫描（服务器已有视频目录）
@@ -108,6 +109,7 @@ go run ./cmd/server 后端 9192
 | p115   | `cookie`（形如 `UID=...; CID=...; SEID=...; KID=...`）         |
 | pikpak | `username`、`password`（token、验证码和设备 ID 由服务端自动处理并保存） |
 | wopan  | `access_token`、`refresh_token`，可选 `family_id`              |
+| guangyapan | 推荐后台扫码登录自动写入 `access_token`、`refresh_token`；也可手工填写 token；可选 `root_path` |
 | onedrive | `refresh_token` |
 | googledrive | 默认只需 `refresh_token`；自建 OAuth 客户端模式还需 `use_online_api=false`、`client_id`、`client_secret` |
 | localstorage | `path`（服务器上的已有视频目录，如 `/mnt/videos`） |

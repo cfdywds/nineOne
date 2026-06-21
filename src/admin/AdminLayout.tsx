@@ -4,7 +4,6 @@ import {
   HardDrive,
   Film,
   LogOut,
-  Play,
   Home,
   Tags,
   Palette,
@@ -71,12 +70,6 @@ export function AdminLayout() {
   return (
     <div className="admin-shell">
       <aside className="admin-sidebar">
-        <div className="admin-sidebar__brand">
-          <span className="admin-sidebar__brand-mark">
-            <Play size={14} fill="#000" />
-          </span>
-          <span className="admin-sidebar__brand-text">91后台</span>
-        </div>
         <nav className="admin-nav">
           <div className="admin-nav__group admin-nav__group--home">
             <span className="admin-nav__group-label">主站</span>

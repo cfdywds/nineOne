@@ -47,6 +47,7 @@ type Driver struct {
 	client          *resty.Client
 	onTokenUpdate   func(access, refresh, captcha, deviceID string)
 	uploadToOSSFunc func(context.Context, *s3Params, io.Reader) error
+	uploadTempDir   string
 
 	// captchaMu serializes captcha-token refreshes triggered by 4002 / 9
 	// recovery in requestOnce. Without it, N concurrent callers all hitting
@@ -77,6 +78,7 @@ type Config struct {
 	DeviceID         string
 	RootID           string
 	DisableMediaLink bool
+	UploadTempDir    string
 	OnTokenUpdate    func(access, refresh, captcha, deviceID string)
 }
 
@@ -109,6 +111,7 @@ func New(c Config) *Driver {
 		deviceID:         deviceID,
 		disableMediaLink: c.DisableMediaLink,
 		onTokenUpdate:    c.OnTokenUpdate,
+		uploadTempDir:    strings.TrimSpace(c.UploadTempDir),
 		client: resty.New().
 			SetTimeout(30*time.Second).
 			SetHeader("Accept", "application/json, text/plain, */*"),
@@ -175,8 +178,8 @@ func (d *Driver) List(ctx context.Context, dirID string) ([]drives.Entry, error)
 
 // pikpakListCooldown 是列目录触发疑似限流错误时的冷却时长。
 //
-// 与 p115 driver 的 listCooldown 同语义：只要错误属 transient
-// （error_code=10 / HTTP 429 / 5xx / 通用 "rate limit" 文本），就持续
+// 与 p115 driver 的 listCooldown 同语义：只要错误属明确限流/临时状态
+// （结构化 error_code=10 / HTTP 429 / 5xx），就持续
 // 等 10 分钟再发一次列目录请求，直到成功或 ctx 取消。这样即使 PikPak
 // 风控持续较长时间，扫描会自然延后到风控结束，不再丢半棵子树。
 const pikpakListCooldown = 10 * time.Minute
@@ -242,7 +245,6 @@ func pikpakSleepContext(ctx context.Context, d time.Duration) error {
 //
 //   - PikPak 业务码 error_code=10 ("操作频繁"，见 OpenList drivers/pikpak/util.go)
 //   - HTTP 429 / 500 / 502 / 503 / 504 / 509（rclone 也把这些归为 retry）
-//   - 通用文本：rate limit / too many requests / blocked / temporarily unavailable
 //
 // 不包含 4122/4121/16（access_token 过期）和 9/4002（captcha 过期）—— 这些
 // 由 requestOnce 内部已经做过一次自动恢复重试；如果恢复后仍然报这类错误，
@@ -259,22 +261,14 @@ func isTransientPikPakListError(err error) bool {
 			return true
 		}
 	}
-	text := strings.ToLower(err.Error())
-	return strings.Contains(text, "error_code=10") ||
-		strings.Contains(text, "429") ||
-		strings.Contains(text, "http 500") ||
-		strings.Contains(text, "http 502") ||
-		strings.Contains(text, "http 503") ||
-		strings.Contains(text, "http 504") ||
-		strings.Contains(text, "http 509") ||
-		strings.Contains(text, "too many request") ||
-		strings.Contains(text, "too many requests") ||
-		strings.Contains(text, "rate limit") ||
-		strings.Contains(text, "operation frequent") ||
-		strings.Contains(text, "操作频繁") ||
-		strings.Contains(text, "blocked") ||
-		strings.Contains(text, "temporarily unavailable") ||
-		strings.Contains(text, "service unavailable")
+	return drives.ErrorMentionsHTTPStatus(err,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+		509,
+	)
 }
 
 func (d *Driver) Stat(ctx context.Context, fileID string) (*drives.Entry, error) {

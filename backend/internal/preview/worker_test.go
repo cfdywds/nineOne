@@ -349,42 +349,10 @@ func TestPreviewWorkerNeverCallsDriveUploadOrEnsureDir(t *testing.T) {
 	}
 }
 
-func TestPreviewWorkerSkipsTeaserForVideoLargerThanFiveGiB(t *testing.T) {
+func TestPreviewWorkerGeneratesTeaserForLargeVideo(t *testing.T) {
 	ctx := context.Background()
 	cat, video := seedPreviewTestVideo(t, "preview-large-video")
-	video.Size = maxPreviewTeaserSizeBytes + 1
-	if err := cat.UpsertVideo(ctx, video); err != nil {
-		t.Fatalf("update video: %v", err)
-	}
-
-	gen := &fakeTeaserGenerator{}
-	drv := &previewFakeDrive{}
-	worker := NewWorker(gen, cat, drv)
-
-	worker.process(ctx, video)
-
-	got, err := cat.GetVideo(ctx, video.ID)
-	if err != nil {
-		t.Fatalf("get video: %v", err)
-	}
-	if got.PreviewStatus != previewStatusSkipped {
-		t.Fatalf("preview status = %q, want skipped", got.PreviewStatus)
-	}
-	if got.PreviewLocal != "" {
-		t.Fatalf("preview local = %q, want empty", got.PreviewLocal)
-	}
-	if drv.streamCalls != 0 {
-		t.Fatalf("stream calls = %d, want 0", drv.streamCalls)
-	}
-	if gen.generateCalls != 0 {
-		t.Fatalf("generate calls = %d, want 0", gen.generateCalls)
-	}
-}
-
-func TestPreviewWorkerGeneratesTeaserAtFiveGiBBoundary(t *testing.T) {
-	ctx := context.Background()
-	cat, video := seedPreviewTestVideo(t, "preview-five-gib-video")
-	video.Size = maxPreviewTeaserSizeBytes
+	video.Size = 6 * 1024 * 1024 * 1024
 	if err := cat.UpsertVideo(ctx, video); err != nil {
 		t.Fatalf("update video: %v", err)
 	}
@@ -485,9 +453,9 @@ func TestThumbWorkerRateLimitHonorsRetryAfter(t *testing.T) {
 	assertCooldownAround(t, worker.Status().CooldownUntil, before, 2*time.Hour)
 }
 
-func TestThumbWorkerP115TransientErrorFailsAfterRetryLimit(t *testing.T) {
+func TestThumbWorkerP115MessageOnlyErrorFailsWithoutCooldown(t *testing.T) {
 	ctx := context.Background()
-	cat, video := seedPreviewTestVideo(t, "thumb-p115-transient")
+	cat, video := seedPreviewTestVideo(t, "thumb-p115-message-only")
 
 	gen := &fakeThumbGenerator{
 		generateErr: errors.New("ffmpeg thumb: exit status 183, stderr: partial file Cannot determine format of input 0:0 after EOF"),
@@ -495,69 +463,26 @@ func TestThumbWorkerP115TransientErrorFailsAfterRetryLimit(t *testing.T) {
 	drv := &previewFakeDrive{kind: "p115"}
 	worker := NewThumbWorker(gen, cat, drv)
 
-	for attempt := 1; attempt <= defaultThumbTransientMediaMaxFailures; attempt++ {
-		worker.rateLimit = rateLimitState{}
-		worker.process(ctx, video)
-
-		if attempt < defaultThumbTransientMediaMaxFailures {
-			pending, err := cat.ListVideosByThumbnailStatus(ctx, video.DriveID, "pending", 0)
-			if err != nil {
-				t.Fatalf("list pending thumbnails: %v", err)
-			}
-			if len(pending) != 1 || pending[0].ID != video.ID {
-				t.Fatalf("attempt %d pending thumbnails = %#v, want only %s", attempt, pending, video.ID)
-			}
-			missing, err := cat.CountVideosNeedingThumbnail(ctx, video.DriveID)
-			if err != nil {
-				t.Fatalf("count missing thumbnails: %v", err)
-			}
-			if missing != 1 {
-				t.Fatalf("attempt %d missing thumbnails = %d, want 1 before retry limit", attempt, missing)
-			}
-			continue
-		}
-
-		failed, err := cat.ListVideosByThumbnailStatus(ctx, video.DriveID, "failed", 0)
-		if err != nil {
-			t.Fatalf("list failed thumbnails: %v", err)
-		}
-		if len(failed) != 1 || failed[0].ID != video.ID {
-			t.Fatalf("failed thumbnails = %#v, want only %s", failed, video.ID)
-		}
-		missing, err := cat.CountVideosNeedingThumbnail(ctx, video.DriveID)
-		if err != nil {
-			t.Fatalf("count missing thumbnails: %v", err)
-		}
-		if missing != 0 {
-			t.Fatalf("missing thumbnails = %d, want 0 after retry limit marks failed", missing)
-		}
-	}
-
-	if gen.generateCalls != defaultThumbTransientMediaMaxFailures {
-		t.Fatalf("generate calls = %d, want %d", gen.generateCalls, defaultThumbTransientMediaMaxFailures)
-	}
-
-	if err := cat.UpdateVideoMeta(ctx, video.ID, catalog.VideoMetaPatch{
-		ThumbnailStatus:        "pending",
-		ResetThumbnailFailures: true,
-	}); err != nil {
-		t.Fatalf("reset thumbnail status: %v", err)
-	}
-	worker.rateLimit = rateLimitState{}
 	worker.process(ctx, video)
 
-	pending, err := cat.ListVideosByThumbnailStatus(ctx, video.DriveID, "pending", 0)
+	failed, err := cat.ListVideosByThumbnailStatus(ctx, video.DriveID, "failed", 0)
 	if err != nil {
-		t.Fatalf("list pending thumbnails after reset: %v", err)
+		t.Fatalf("list failed thumbnails: %v", err)
 	}
-	if len(pending) != 1 || pending[0].ID != video.ID {
-		t.Fatalf("pending thumbnails after reset = %#v, want only %s", pending, video.ID)
+	if len(failed) != 1 || failed[0].ID != video.ID {
+		t.Fatalf("failed thumbnails = %#v, want only %s", failed, video.ID)
+	}
+	if !worker.Status().CooldownUntil.IsZero() {
+		t.Fatalf("cooldown until = %s, want no cooldown for message-only media error", worker.Status().CooldownUntil)
+	}
+	if gen.generateCalls != 1 {
+		t.Fatalf("generate calls = %d, want 1", gen.generateCalls)
 	}
 }
 
-func TestThumbWorkerRequeuesP115TransientErrorBeforeRetryLimit(t *testing.T) {
+func TestThumbWorkerDoesNotRequeueP115MessageOnlyError(t *testing.T) {
 	ctx := context.Background()
-	cat, video := seedPreviewTestVideo(t, "thumb-p115-requeue")
+	cat, video := seedPreviewTestVideo(t, "thumb-p115-no-requeue")
 
 	gen := &fakeThumbGenerator{
 		generateErr: errors.New("ffmpeg thumb: partial file Cannot determine format of input 0:0 after EOF"),
@@ -569,11 +494,8 @@ func TestThumbWorkerRequeuesP115TransientErrorBeforeRetryLimit(t *testing.T) {
 
 	select {
 	case queued := <-worker.ch:
-		if queued.ID != video.ID {
-			t.Fatalf("requeued video id = %q, want %q", queued.ID, video.ID)
-		}
+		t.Fatalf("unexpected requeued video id = %q", queued.ID)
 	default:
-		t.Fatal("expected transient thumbnail failure to requeue the same video")
 	}
 
 	got, err := cat.GetVideo(ctx, video.ID)
@@ -581,14 +503,14 @@ func TestThumbWorkerRequeuesP115TransientErrorBeforeRetryLimit(t *testing.T) {
 		t.Fatalf("get video: %v", err)
 	}
 	if got.ThumbnailURL != "" {
-		t.Fatalf("thumbnail = %q, want empty after transient failure", got.ThumbnailURL)
+		t.Fatalf("thumbnail = %q, want empty after message-only failure", got.ThumbnailURL)
 	}
-	pending, err := cat.ListVideosByThumbnailStatus(ctx, video.DriveID, "pending", 0)
+	failed, err := cat.ListVideosByThumbnailStatus(ctx, video.DriveID, "failed", 0)
 	if err != nil {
-		t.Fatalf("list pending thumbnails: %v", err)
+		t.Fatalf("list failed thumbnails: %v", err)
 	}
-	if len(pending) != 1 || pending[0].ID != video.ID {
-		t.Fatalf("pending thumbnails = %#v, want only %s", pending, video.ID)
+	if len(failed) != 1 || failed[0].ID != video.ID {
+		t.Fatalf("failed thumbnails = %#v, want only %s", failed, video.ID)
 	}
 }
 
@@ -649,12 +571,14 @@ func TestP123TransientErrorsShouldCooldown(t *testing.T) {
 	drv := &previewFakeDrive{kind: "p123"}
 	for _, err := range []error{
 		errors.New("Server returned 403 Forbidden"),
-		errors.New("请求太频繁"),
 		errors.New("http 503 service unavailable"),
 	} {
 		if !driveErrorShouldCooldown(drv, err) {
 			t.Fatalf("driveErrorShouldCooldown(%v) = false, want true", err)
 		}
+	}
+	if driveErrorShouldCooldown(drv, errors.New("请求太频繁")) {
+		t.Fatal("message-only throttling text should not trigger p123 cooldown")
 	}
 	if driveErrorShouldCooldown(drv, errors.New("invalid credential")) {
 		t.Fatal("invalid credential should not trigger p123 cooldown")
@@ -666,29 +590,56 @@ func TestWopanTransientErrorsShouldCooldown(t *testing.T) {
 	for _, err := range []error{
 		errors.New("ffmpeg: Server returned 403 Forbidden"),
 		errors.New("wopan download url: request failed with status: 429 Too Many Requests"),
-		errors.New("操作频繁，请稍后重试"),
 		errors.New("http 503 service unavailable"),
 	} {
 		if !driveErrorShouldCooldown(drv, err) {
 			t.Fatalf("driveErrorShouldCooldown(%v) = false, want true", err)
 		}
 	}
+	if driveErrorShouldCooldown(drv, errors.New("操作频繁，请稍后重试")) {
+		t.Fatal("message-only throttling text should not trigger wopan cooldown")
+	}
 	if driveErrorShouldCooldown(drv, errors.New("invalid access token")) {
 		t.Fatal("invalid access token should not trigger wopan cooldown")
+	}
+}
+
+func TestGuangYaPanTransientErrorsShouldCooldown(t *testing.T) {
+	drv := &previewFakeDrive{kind: "guangyapan"}
+	for _, err := range []error{
+		errors.New("ffmpeg: Server returned 403 Forbidden"),
+		errors.New("guangyapan api rate limited: status=429 msg=操作频繁，请稍后重试"),
+		errors.New("http 503 service unavailable"),
+	} {
+		if !driveErrorShouldCooldown(drv, err) {
+			t.Fatalf("driveErrorShouldCooldown(%v) = false, want true", err)
+		}
+	}
+	if driveErrorShouldCooldown(drv, errors.New("操作频繁，请稍后重试")) {
+		t.Fatal("message-only throttling text should not trigger guangyapan cooldown")
+	}
+	if driveErrorShouldCooldown(drv, errors.New("invalid access token")) {
+		t.Fatal("invalid access token should not trigger guangyapan cooldown")
 	}
 }
 
 func TestGoogleDriveMediaErrorsShouldCooldown(t *testing.T) {
 	drv := &previewFakeDrive{kind: "googledrive"}
 	for _, err := range []error{
-		errors.New("google drive api error: usageLimits userRateLimitExceeded"),
 		errors.New("ffmpeg: Server returned 403 Forbidden"),
-		errors.New("downloadQuotaExceeded: The download quota for this file has been exceeded"),
-		errors.New("sharingRateLimitExceeded"),
 		errors.New("http 503 service unavailable"),
 	} {
 		if !driveErrorShouldCooldown(drv, err) {
 			t.Fatalf("driveErrorShouldCooldown(%v) = false, want true", err)
+		}
+	}
+	for _, err := range []error{
+		errors.New("google drive api error: usageLimits userRateLimitExceeded"),
+		errors.New("downloadQuotaExceeded: The download quota for this file has been exceeded"),
+		errors.New("sharingRateLimitExceeded"),
+	} {
+		if driveErrorShouldCooldown(drv, err) {
+			t.Fatalf("message-only google drive error %v should not trigger cooldown", err)
 		}
 	}
 	if driveErrorShouldCooldown(drv, errors.New("invalid credentials")) {

@@ -11,6 +11,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -455,6 +457,29 @@ func TestUploadPresignedPUT429ReturnsRateLimitError(t *testing.T) {
 	}
 	if rateLimit.RetryAfter != 4*time.Second {
 		t.Fatalf("RetryAfter = %s, want 4s", rateLimit.RetryAfter)
+	}
+}
+
+func TestBufferAndHashMD5UsesConfiguredTempDir(t *testing.T) {
+	body := []byte("hello-123-upload-test")
+	tempDir := filepath.Join(t.TempDir(), "upload-tmp")
+	tmp, gotHex, n, err := bufferAndHashMD5(tempDir, bytes.NewReader(body), int64(len(body)))
+	if err != nil {
+		t.Fatalf("bufferAndHashMD5 returned error: %v", err)
+	}
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+	}()
+	if gotDir := filepath.Dir(tmp.Name()); gotDir != tempDir {
+		t.Fatalf("tmp dir = %q, want %q", gotDir, tempDir)
+	}
+	want := md5.Sum(body)
+	if gotHex != fmt.Sprintf("%x", want) {
+		t.Fatalf("md5 = %s, want %x", gotHex, want)
+	}
+	if n != int64(len(body)) {
+		t.Fatalf("written = %d, want %d", n, len(body))
 	}
 }
 

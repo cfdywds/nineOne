@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -139,6 +141,80 @@ func TestUploadInstantSuccessReturnsFileID(t *testing.T) {
 	wantHash := computeExpectedGCID(body)
 	if got.Hash != wantHash {
 		t.Errorf("hash = %s, want %s", got.Hash, wantHash)
+	}
+}
+
+func TestUploadUsesReadSeekerWithoutTempCopy(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/drive/v1/files", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"upload_type": "UPLOAD_TYPE_RESUMABLE",
+			"resumable":   null,
+			"file":        {"id": "instant-file-id", "name": "test.mp4", "kind": "drive#file"}
+		}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	d := newTestDriver(t, server)
+	uploadTempDir := filepath.Join(t.TempDir(), "upload-tmp")
+	d.uploadTempDir = uploadTempDir
+
+	data := bytes.Repeat([]byte{0x31}, 1024)
+	path := filepath.Join(t.TempDir(), "video.bin")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	defer f.Close()
+
+	id, err := d.Upload(context.Background(), "parent-id", "test.mp4", f, int64(len(data)))
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	if id != "instant-file-id" {
+		t.Fatalf("file id = %q, want instant-file-id", id)
+	}
+	if _, err := os.Stat(uploadTempDir); !os.IsNotExist(err) {
+		t.Fatalf("upload temp dir stat err = %v, want not created for read seeker input", err)
+	}
+}
+
+func TestUploadBuffersNonSeekReaderInConfiguredTempDir(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/drive/v1/files", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"upload_type": "UPLOAD_TYPE_RESUMABLE",
+			"resumable":   null,
+			"file":        {"id": "instant-file-id", "name": "test.mp4", "kind": "drive#file"}
+		}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	d := newTestDriver(t, server)
+	uploadTempDir := filepath.Join(t.TempDir(), "upload-tmp")
+	d.uploadTempDir = uploadTempDir
+
+	data := bytes.Repeat([]byte{0x42}, 1024)
+	id, err := d.Upload(context.Background(), "parent-id", "test.mp4", bytes.NewBuffer(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	if id != "instant-file-id" {
+		t.Fatalf("file id = %q, want instant-file-id", id)
+	}
+	entries, err := os.ReadDir(uploadTempDir)
+	if err != nil {
+		t.Fatalf("read upload temp dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("upload temp dir entries = %d, want cleaned", len(entries))
 	}
 }
 
@@ -304,7 +380,7 @@ func TestUploadRejectsInvalidArguments(t *testing.T) {
 func TestBufferAndHashGCIDDetectsSizeMismatch(t *testing.T) {
 	src := bytes.NewReader([]byte("hello"))
 	// 声明 size=10 但实际只有 5 字节
-	_, _, _, err := bufferAndHashGCID(src, 10)
+	_, _, _, err := bufferAndHashGCID("", src, 10)
 	if err == nil {
 		t.Fatal("expected size mismatch error")
 	}
@@ -315,7 +391,7 @@ func TestBufferAndHashGCIDDetectsSizeMismatch(t *testing.T) {
 
 func TestBufferAndHashGCIDComputesCorrectHash(t *testing.T) {
 	data := bytes.Repeat([]byte{0x55}, 1024)
-	tmp, hex, written, err := bufferAndHashGCID(bytes.NewReader(data), int64(len(data)))
+	tmp, hex, written, err := bufferAndHashGCID("", bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		t.Fatalf("buffer: %v", err)
 	}

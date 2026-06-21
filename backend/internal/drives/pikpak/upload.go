@@ -79,6 +79,20 @@ type UploadResult struct {
 	Size   int64
 }
 
+type preparedUploadBody struct {
+	reader  io.ReadSeeker
+	start   int64
+	cleanup func()
+}
+
+func (b preparedUploadBody) rewind() error {
+	if b.reader == nil {
+		return errors.New("pikpak upload: nil upload body")
+	}
+	_, err := b.reader.Seek(b.start, io.SeekStart)
+	return err
+}
+
 // Upload 实现 drives.Drive 接口；只返回 fileID。
 // 完整上传元数据见 UploadAndReportHash。
 func (d *Driver) Upload(ctx context.Context, parentID, name string, r io.Reader, size int64) (string, error) {
@@ -125,15 +139,15 @@ func (d *Driver) UploadAndReportHash(ctx context.Context, parentID, name string,
 		parentID = d.rootID
 	}
 
-	// 1) 把 r 全量缓冲到临时文件，同时算 GCID。
-	tmp, gcidHex, actualSize, err := bufferAndHashGCID(r, size)
+	// 1) 算 GCID，并准备一个可重试读取的 body。爬虫迁移传入的是
+	// *os.File，可直接复用原文件，避免再占用一份视频大小的临时空间。
+	body, gcidHex, actualSize, err := d.prepareUploadBody(r, size)
 	if err != nil {
 		return UploadResult{}, err
 	}
-	defer func() {
-		_ = tmp.Close()
-		_ = os.Remove(tmp.Name())
-	}()
+	if body.cleanup != nil {
+		defer body.cleanup()
+	}
 
 	result := UploadResult{Hash: gcidHex, Size: actualSize}
 	var lastErr error
@@ -155,7 +169,7 @@ func (d *Driver) UploadAndReportHash(ctx context.Context, parentID, name string,
 			continue
 		}
 
-		out, err := d.completeUploadAttempt(ctx, tmp, parentID, name, result, resp)
+		out, err := d.completeUploadAttempt(ctx, body, parentID, name, result, resp)
 		if err == nil {
 			return out, nil
 		}
@@ -190,7 +204,7 @@ func (d *Driver) requestUploadSession(ctx context.Context, parentID, name string
 	return resp, nil
 }
 
-func (d *Driver) completeUploadAttempt(ctx context.Context, tmp *os.File, parentID, name string, result UploadResult, resp uploadTaskData) (UploadResult, error) {
+func (d *Driver) completeUploadAttempt(ctx context.Context, body preparedUploadBody, parentID, name string, result UploadResult, resp uploadTaskData) (UploadResult, error) {
 	// 命中秒传：服务端已经知道这个 hash，直接返回新文件 ID。
 	if resp.Resumable == nil {
 		if resp.File.ID != "" {
@@ -207,10 +221,10 @@ func (d *Driver) completeUploadAttempt(ctx context.Context, tmp *os.File, parent
 	}
 
 	// 未命中秒传：把字节传到 S3 兼容存储。
-	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-		return UploadResult{}, fmt.Errorf("pikpak upload: seek tmp: %w", err)
+	if err := body.rewind(); err != nil {
+		return UploadResult{}, fmt.Errorf("pikpak upload: rewind body: %w", err)
 	}
-	if err := d.uploadToOSS(ctx, &resp.Resumable.Params, tmp); err != nil {
+	if err := d.uploadToOSS(ctx, &resp.Resumable.Params, body.reader); err != nil {
 		return UploadResult{}, fmt.Errorf("pikpak upload: oss put: %w", err)
 	}
 
@@ -279,12 +293,62 @@ func isRetryablePikPakUploadError(err error) bool {
 		strings.Contains(text, "service unavailable")
 }
 
+func (d *Driver) prepareUploadBody(r io.Reader, size int64) (preparedUploadBody, string, int64, error) {
+	if rs, ok := r.(io.ReadSeeker); ok {
+		gcidHex, actualSize, start, err := hashGCIDFromReadSeeker(rs, size)
+		if err != nil {
+			return preparedUploadBody{}, "", 0, err
+		}
+		return preparedUploadBody{reader: rs, start: start, cleanup: func() {}}, gcidHex, actualSize, nil
+	}
+
+	tmp, gcidHex, actualSize, err := bufferAndHashGCID(d.uploadTempDir, r, size)
+	if err != nil {
+		return preparedUploadBody{}, "", 0, err
+	}
+	return preparedUploadBody{
+		reader: tmp,
+		start:  0,
+		cleanup: func() {
+			_ = tmp.Close()
+			_ = os.Remove(tmp.Name())
+		},
+	}, gcidHex, actualSize, nil
+}
+
+func hashGCIDFromReadSeeker(r io.ReadSeeker, size int64) (string, int64, int64, error) {
+	start, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("pikpak upload: seek body: %w", err)
+	}
+
+	h := NewGCID(size)
+	written, copyErr := io.Copy(h, r)
+	_, seekErr := r.Seek(start, io.SeekStart)
+	if copyErr != nil {
+		return "", 0, start, fmt.Errorf("pikpak upload: hash body: %w", copyErr)
+	}
+	if seekErr != nil {
+		return "", 0, start, fmt.Errorf("pikpak upload: rewind body: %w", seekErr)
+	}
+	if size > 0 && written != size {
+		return "", 0, start, fmt.Errorf("pikpak upload: size mismatch: declared %d, copied %d", size, written)
+	}
+	return strings.ToUpper(hex.EncodeToString(h.Sum(nil))), written, start, nil
+}
+
 // bufferAndHashGCID 把 r 复制到一个临时文件，同时计算 GCID。
-// 返回临时文件（位置在末尾，需要调用方 Seek 回 0）、GCID hex 大写、实际写入字节数。
+// 返回临时文件（位置在末尾，需要调用方 Seek 回 start）、GCID hex 大写、实际写入字节数。
 //
 // 调用方负责 Close + Remove 临时文件。
-func bufferAndHashGCID(r io.Reader, size int64) (*os.File, string, int64, error) {
-	tmp, err := os.CreateTemp("", "pikpak-upload-*.bin")
+func bufferAndHashGCID(tempDir string, r io.Reader, size int64) (*os.File, string, int64, error) {
+	tempDir = strings.TrimSpace(tempDir)
+	if tempDir != "" {
+		if err := os.MkdirAll(tempDir, 0o755); err != nil {
+			return nil, "", 0, fmt.Errorf("pikpak upload: create tmp dir: %w", err)
+		}
+	}
+	tmp, err := os.CreateTemp(tempDir, "pikpak-upload-*.bin")
 	if err != nil {
 		return nil, "", 0, fmt.Errorf("pikpak upload: create tmp: %w", err)
 	}

@@ -952,15 +952,7 @@ func redactURLs(text string) string {
 }
 
 func ffmpegOutputLooksRateLimited(output []byte) bool {
-	text := strings.ToLower(string(output))
-	if !strings.Contains(text, "429") {
-		return false
-	}
-	return strings.Contains(text, "too many requests") ||
-		strings.Contains(text, "throttl") ||
-		strings.Contains(text, "rate limit") ||
-		strings.Contains(text, "rate-limit") ||
-		strings.Contains(text, "server returned 429")
+	return drives.TextMentionsHTTPStatus(string(output), http.StatusTooManyRequests)
 }
 
 // --- 本地落盘 ---
@@ -1064,12 +1056,10 @@ type ThumbWorker struct {
 }
 
 const (
-	defaultTransientMediaCooldown               = 5 * time.Minute
-	defaultGenerationRateLimitCooldown          = 5 * time.Minute
-	defaultThumbTransientMediaMaxFailures       = 3
-	defaultWorkerQueueSize                      = 10000
-	maxPreviewTeaserSizeBytes             int64 = 5 * 1024 * 1024 * 1024
-	previewStatusSkipped                        = "skipped"
+	defaultTransientMediaCooldown         = 5 * time.Minute
+	defaultGenerationRateLimitCooldown    = 5 * time.Minute
+	defaultThumbTransientMediaMaxFailures = 3
+	defaultWorkerQueueSize                = 10000
 )
 
 type rateLimitState struct {
@@ -1122,6 +1112,19 @@ func (q *videoQueue) release(v *catalog.Video) {
 	q.mu.Lock()
 	delete(q.ids, v.ID)
 	q.mu.Unlock()
+}
+
+func (q *videoQueue) idsSnapshot() []string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.ids) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(q.ids))
+	for id := range q.ids {
+		out = append(out, id)
+	}
+	return out
 }
 
 func (q *videoQueue) lengthExcluding(currentID string) int {
@@ -1249,6 +1252,13 @@ func (w *Worker) Status() TaskStatus {
 	}
 	currentID, _ := w.activity.current()
 	return taskStatus(&w.activity, &w.rateLimit, w.queue.lengthExcluding(currentID))
+}
+
+func (w *Worker) ActiveVideoIDs() []string {
+	if w == nil {
+		return nil
+	}
+	return w.queue.idsSnapshot()
 }
 
 func (w *ThumbWorker) Status() TaskStatus {
@@ -1518,143 +1528,19 @@ func driveErrorShouldCooldown(d drives.Drive, err error) bool {
 	}
 	switch d.Kind() {
 	case "p115":
-		text := strings.ToLower(err.Error())
-		return strings.Contains(text, "server returned 403") ||
-			strings.Contains(text, "403 forbidden") ||
-			strings.Contains(text, "server returned 405") ||
-			strings.Contains(text, "405 method") ||
-			strings.Contains(text, "access denied") ||
-			strings.Contains(text, "moov atom not found") ||
-			strings.Contains(text, "partial file") ||
-			strings.Contains(text, "request has been blocked") ||
-			strings.Contains(text, "访问被阻断")
+		return drives.ErrorMentionsHTTPStatus(err, http.StatusForbidden, http.StatusMethodNotAllowed, http.StatusTooManyRequests)
 	case "pikpak":
-		// PikPak 在预览视频 / 封面生成阶段（取链或拉直链字节）可能命中：
-		//   - error_code=10  操作频繁
-		//   - HTTP 429 / 5xx / 509 限流和服务端不可用
-		//   - 通用文本：rate limit / too many requests / blocked
-		// 命中时让 worker 冷却 5 分钟，避免连续请求加重风控。
-		text := strings.ToLower(err.Error())
-		return strings.Contains(text, "error_code=10") ||
-			strings.Contains(text, "操作频繁") ||
-			strings.Contains(text, "429") ||
-			strings.Contains(text, "http 500") ||
-			strings.Contains(text, "http 502") ||
-			strings.Contains(text, "http 503") ||
-			strings.Contains(text, "http 504") ||
-			strings.Contains(text, "http 509") ||
-			strings.Contains(text, "too many request") ||
-			strings.Contains(text, "too many requests") ||
-			strings.Contains(text, "rate limit") ||
-			strings.Contains(text, "blocked") ||
-			strings.Contains(text, "partial file") ||
-			strings.Contains(text, "service unavailable")
+		return drives.ErrorMentionsHTTPStatus(err, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, 509)
 	case "p123":
-		// 123网盘直链解析 / ffmpeg 读取阶段可能返回 429、5xx，或 WAF 类
-		// blocked / 访问阻断文本。命中时冷却，避免封面和预览视频生成连续打接口。
-		text := strings.ToLower(err.Error())
-		return strings.Contains(text, "请求太频繁") ||
-			strings.Contains(text, "请求过于频繁") ||
-			strings.Contains(text, "请求频繁") ||
-			strings.Contains(text, "操作频繁") ||
-			strings.Contains(text, "频率限制") ||
-			strings.Contains(text, "请求次数过多") ||
-			strings.Contains(text, "429") ||
-			strings.Contains(text, "http 500") ||
-			strings.Contains(text, "http 502") ||
-			strings.Contains(text, "http 503") ||
-			strings.Contains(text, "http 504") ||
-			strings.Contains(text, "server returned 403") ||
-			strings.Contains(text, "403 forbidden") ||
-			strings.Contains(text, "too many request") ||
-			strings.Contains(text, "too many requests") ||
-			strings.Contains(text, "rate limit") ||
-			strings.Contains(text, "blocked") ||
-			strings.Contains(text, "访问被阻断") ||
-			strings.Contains(text, "service unavailable")
+		return drives.ErrorMentionsHTTPStatus(err, http.StatusForbidden, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout)
 	case "wopan":
-		// 联通网盘的取链接口和下载直链都可能返回"操作频繁"、429、5xx
-		// 或 WAF 阻断文本。封面/预览失败时先冷却，避免持续触发风控。
-		text := strings.ToLower(err.Error())
-		return strings.Contains(text, "请求太频繁") ||
-			strings.Contains(text, "请求过于频繁") ||
-			strings.Contains(text, "请求频繁") ||
-			strings.Contains(text, "操作频繁") ||
-			strings.Contains(text, "频率限制") ||
-			strings.Contains(text, "请求次数过多") ||
-			strings.Contains(text, "系统繁忙") ||
-			strings.Contains(text, "服务繁忙") ||
-			strings.Contains(text, "稍后再试") ||
-			strings.Contains(text, "稍后重试") ||
-			strings.Contains(text, "429") ||
-			strings.Contains(text, "http 500") ||
-			strings.Contains(text, "http 502") ||
-			strings.Contains(text, "http 503") ||
-			strings.Contains(text, "http 504") ||
-			strings.Contains(text, "http 509") ||
-			strings.Contains(text, "server returned 403") ||
-			strings.Contains(text, "403 forbidden") ||
-			strings.Contains(text, "server returned 429") ||
-			strings.Contains(text, "server returned 500") ||
-			strings.Contains(text, "server returned 502") ||
-			strings.Contains(text, "server returned 503") ||
-			strings.Contains(text, "server returned 504") ||
-			strings.Contains(text, "too many request") ||
-			strings.Contains(text, "too many requests") ||
-			strings.Contains(text, "rate limit") ||
-			strings.Contains(text, "rate-limit") ||
-			strings.Contains(text, "throttl") ||
-			strings.Contains(text, "blocked") ||
-			strings.Contains(text, "request has been blocked") ||
-			strings.Contains(text, "访问被阻断") ||
-			strings.Contains(text, "风控") ||
-			strings.Contains(text, "service unavailable")
+		return drives.ErrorMentionsHTTPStatus(err, http.StatusForbidden, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, 509)
+	case "guangyapan":
+		return drives.ErrorMentionsHTTPStatus(err, http.StatusForbidden, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, 509)
 	case "googledrive":
-		// Google Drive 下载/取样阶段常把频控和配额问题包装成 403，
-		// 具体标识在 error.errors[].reason/message 里（OpenList 也按该结构解析）。
-		// ffmpeg/ffprobe 只能看到 stderr 文本时，按这些 reason/文本兜底冷却。
-		text := strings.ToLower(err.Error())
-		return googleDriveMediaErrorShouldCooldown(text)
+		return drives.ErrorMentionsHTTPStatus(err, http.StatusForbidden, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout)
 	}
 	return false
-}
-
-func googleDriveMediaErrorShouldCooldown(text string) bool {
-	if text == "" {
-		return false
-	}
-	compact := compactGoogleDriveErrorText(text)
-	return strings.Contains(text, "server returned 403") ||
-		strings.Contains(text, "403 forbidden") ||
-		strings.Contains(text, "server returned 429") ||
-		strings.Contains(text, "http 429") ||
-		strings.Contains(text, "http 500") ||
-		strings.Contains(text, "http 502") ||
-		strings.Contains(text, "http 503") ||
-		strings.Contains(text, "http 504") ||
-		strings.Contains(text, "too many request") ||
-		strings.Contains(text, "too many requests") ||
-		strings.Contains(text, "rate limit") ||
-		strings.Contains(text, "quota exceeded") ||
-		strings.Contains(text, "download quota") ||
-		strings.Contains(text, "sharing rate") ||
-		strings.Contains(text, "daily limit") ||
-		strings.Contains(text, "user rate") ||
-		strings.Contains(text, "usage limit") ||
-		strings.Contains(text, "service unavailable") ||
-		strings.Contains(compact, "ratelimitexceeded") ||
-		strings.Contains(compact, "userratelimitexceeded") ||
-		strings.Contains(compact, "dailylimitexceeded") ||
-		strings.Contains(compact, "downloadquotaexceeded") ||
-		strings.Contains(compact, "sharingratelimitexceeded") ||
-		strings.Contains(compact, "quotaexceeded") ||
-		strings.Contains(compact, "toomanyrequests") ||
-		strings.Contains(compact, "usagelimits")
-}
-
-func compactGoogleDriveErrorText(text string) string {
-	replacer := strings.NewReplacer("_", "", "-", "", " ", "", ".", "", ":", "")
-	return replacer.Replace(strings.ToLower(strings.TrimSpace(text)))
 }
 
 func (w *ThumbWorker) process(ctx context.Context, v *catalog.Video) bool {
@@ -1806,15 +1692,6 @@ func localPreviewLink(v *catalog.Video) (*drives.StreamLink, bool) {
 }
 
 func (w *Worker) process(ctx context.Context, v *catalog.Video) {
-	if shouldSkipTeaser(v) {
-		removePreviousLocalTeaser(v.PreviewLocal, "")
-		if err := w.Catalog.UpdatePreview(ctx, v.ID, "", previewStatusSkipped); err != nil {
-			log.Printf("[preview] skip %s: update status: %v", v.Title, err)
-			return
-		}
-		log.Printf("[preview] skip %s: size=%d exceeds 5GiB teaser limit", v.Title, v.Size)
-		return
-	}
 	if w.skipIfRateLimited(v) {
 		return
 	}
@@ -1865,10 +1742,6 @@ func (w *Worker) process(ctx context.Context, v *catalog.Video) {
 		return
 	}
 	log.Printf("[preview] ready %s (duration=%.1fs)", v.Title, duration)
-}
-
-func shouldSkipTeaser(v *catalog.Video) bool {
-	return v != nil && v.Size > maxPreviewTeaserSizeBytes
 }
 
 func (w *Worker) generateTeaser(ctx context.Context, v *catalog.Video, link *drives.StreamLink, duration float64) (string, error) {

@@ -214,7 +214,7 @@ func TestGraph429ReturnsRateLimitErrorWithRetryAfter(t *testing.T) {
 	}
 }
 
-func TestGraphThrottleMessageReturnsRateLimitError(t *testing.T) {
+func TestGraphThrottleMessageDoesNotReturnRateLimitError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusForbidden)
@@ -238,11 +238,11 @@ func TestGraphThrottleMessageReturnsRateLimitError(t *testing.T) {
 
 	_, err := d.StreamURL(context.Background(), "file-id")
 	if err == nil {
-		t.Fatal("list succeeded, want rate limit error")
+		t.Fatal("list succeeded, want graph error")
 	}
 	var rateLimit *drives.RateLimitError
-	if !errors.As(err, &rateLimit) {
-		t.Fatalf("error = %T %[1]v, want RateLimitError", err)
+	if errors.As(err, &rateLimit) {
+		t.Fatalf("error = %T %[1]v, want non-rate-limit error", err)
 	}
 }
 

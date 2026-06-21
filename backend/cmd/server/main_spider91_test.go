@@ -41,6 +41,7 @@ func TestSpider91UploadDriveIDDoesNotAutoSelectTarget(t *testing.T) {
 	reg.Set("p123-one", &spider91UploadTargetFakeDrive{id: "p123-one", kind: "p123"})
 	reg.Set("onedrive-one", &spider91UploadTargetFakeDrive{id: "onedrive-one", kind: "onedrive"})
 	reg.Set("wopan-one", &spider91UploadTargetFakeDrive{id: "wopan-one", kind: "wopan"})
+	reg.Set("guangyapan-one", &spider91UploadTargetFakeDrive{id: "guangyapan-one", kind: "guangyapan"})
 
 	app := &App{registry: reg}
 	if got := app.Spider91UploadDriveID(); got != "" {
@@ -65,6 +66,11 @@ func TestSpider91UploadDriveIDDoesNotAutoSelectTarget(t *testing.T) {
 	app.spider91UploadDriveID = "wopan-one"
 	if got := app.Spider91UploadDriveID(); got != "wopan-one" {
 		t.Fatalf("explicit wopan upload target = %q, want wopan-one", got)
+	}
+
+	app.spider91UploadDriveID = "guangyapan-one"
+	if got := app.Spider91UploadDriveID(); got != "guangyapan-one" {
+		t.Fatalf("explicit guangyapan upload target = %q, want guangyapan-one", got)
 	}
 
 	app.spider91UploadDriveID = "missing"

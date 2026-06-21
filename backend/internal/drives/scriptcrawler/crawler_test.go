@@ -39,7 +39,7 @@ func writeScriptCrawlerFFprobeStub(t *testing.T, dir string, ok bool) string {
 func writeScriptCrawlerFFmpegStub(t *testing.T, dir string) string {
 	t.Helper()
 	path := filepath.Join(dir, "ffmpeg-hls.sh")
-	body := "#!/bin/sh\nout=\"\"\nfor arg do out=\"$arg\"; done\nprintf 'hls-video-bytes' > \"$out\"\n"
+	body := "#!/bin/sh\nif [ -n \"$GO_SCRIPTCRAWLER_FFMPEG_ARGS_FILE\" ]; then printf '%s\\n' \"$@\" > \"$GO_SCRIPTCRAWLER_FFMPEG_ARGS_FILE\"; fi\nout=\"\"\nfor arg do out=\"$arg\"; done\nprintf 'hls-video-bytes' > \"$out\"\n"
 	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
 		t.Fatalf("write ffmpeg stub: %v", err)
 	}
@@ -111,6 +111,128 @@ func TestCrawlerRunOnceImportsLocalFileAndSkipsExisting(t *testing.T) {
 	}
 	if res.SeenSnapshot != 1 {
 		t.Fatalf("seen snapshot = %d, want 1", res.SeenSnapshot)
+	}
+}
+
+func TestCrawlerRunOnceMarksPreviewDisabledWhenConfigured(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	cat, err := catalog.Open(filepath.Join(tmp, "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	drv := New(Config{ID: "demo", RootDir: filepath.Join(tmp, "crawler")})
+	if err := drv.Init(ctx); err != nil {
+		t.Fatalf("driver init: %v", err)
+	}
+	dummyScript := filepath.Join(tmp, "helper-script")
+	if err := os.WriteFile(dummyScript, []byte("helper"), 0o755); err != nil {
+		t.Fatalf("write dummy script: %v", err)
+	}
+	wrapper := filepath.Join(tmp, "helper-wrapper.sh")
+	wrapperScript := fmt.Sprintf("#!/bin/sh\nexec %q -test.run=TestScriptCrawlerHelperProcess \"$@\"\n", os.Args[0])
+	if err := os.WriteFile(wrapper, []byte(wrapperScript), 0o755); err != nil {
+		t.Fatalf("write helper wrapper: %v", err)
+	}
+
+	t.Setenv("GO_WANT_SCRIPTCRAWLER_HELPER", "1")
+	c := NewCrawler(CrawlerConfig{
+		Driver:         drv,
+		Catalog:        cat,
+		PythonPath:     wrapper,
+		FFprobePath:    writeScriptCrawlerFFprobeStub(t, tmp, true),
+		ScriptPath:     dummyScript,
+		DisablePreview: true,
+	})
+	res, err := c.RunOnce(ctx, 1)
+	if err != nil {
+		t.Fatalf("run once: %v", err)
+	}
+	if res.NewVideos != 1 || res.Failed != 0 {
+		t.Fatalf("result = new:%d failed:%d, want 1/0", res.NewVideos, res.Failed)
+	}
+	v, err := cat.GetVideo(ctx, BuildVideoID("demo", "abc-123"))
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if v.PreviewStatus != "disabled" {
+		t.Fatalf("preview status = %q, want disabled", v.PreviewStatus)
+	}
+	if v.FingerprintStatus != "ready" || v.SampledSHA256 == "" {
+		t.Fatalf("fingerprint status=%q sampled=%q, want ready and sampled hash", v.FingerprintStatus, v.SampledSHA256)
+	}
+	pending, err := cat.ListVideosByPreviewStatus(ctx, "demo", "pending", 0)
+	if err != nil {
+		t.Fatalf("list pending previews: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending previews = %d, want 0", len(pending))
+	}
+}
+
+func TestCrawlerRunOnceUsesCurrentDrivePreviewSwitch(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	cat, err := catalog.Open(filepath.Join(tmp, "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	drv := New(Config{ID: "demo", RootDir: filepath.Join(tmp, "crawler")})
+	if err := drv.Init(ctx); err != nil {
+		t.Fatalf("driver init: %v", err)
+	}
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:            drv.ID(),
+		Kind:          Kind,
+		Name:          "Demo",
+		RootID:        "/",
+		Credentials:   map[string]string{"script_path": "/tmp/crawler.py"},
+		TeaserEnabled: true,
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	dummyScript := filepath.Join(tmp, "helper-script")
+	if err := os.WriteFile(dummyScript, []byte("helper"), 0o755); err != nil {
+		t.Fatalf("write dummy script: %v", err)
+	}
+	wrapper := filepath.Join(tmp, "helper-wrapper.sh")
+	wrapperScript := fmt.Sprintf("#!/bin/sh\nexec %q -test.run=TestScriptCrawlerHelperProcess \"$@\"\n", os.Args[0])
+	if err := os.WriteFile(wrapper, []byte(wrapperScript), 0o755); err != nil {
+		t.Fatalf("write helper wrapper: %v", err)
+	}
+
+	t.Setenv("GO_WANT_SCRIPTCRAWLER_HELPER", "1")
+	c := NewCrawler(CrawlerConfig{
+		Driver:         drv,
+		Catalog:        cat,
+		PythonPath:     wrapper,
+		FFprobePath:    writeScriptCrawlerFFprobeStub(t, tmp, true),
+		ScriptPath:     dummyScript,
+		DisablePreview: true,
+	})
+	res, err := c.RunOnce(ctx, 1)
+	if err != nil {
+		t.Fatalf("run once: %v", err)
+	}
+	if res.NewVideos != 1 || res.Failed != 0 {
+		t.Fatalf("result = new:%d failed:%d, want 1/0", res.NewVideos, res.Failed)
+	}
+	v, err := cat.GetVideo(ctx, BuildVideoID("demo", "abc-123"))
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if v.PreviewStatus != "pending" {
+		t.Fatalf("preview status = %q, want pending from current drive switch", v.PreviewStatus)
 	}
 }
 
@@ -500,6 +622,8 @@ func TestCrawlerRunOnceDownloadsHLSMediaURL(t *testing.T) {
 
 	t.Setenv("GO_WANT_SCRIPTCRAWLER_HELPER", "1")
 	t.Setenv("GO_WANT_SCRIPTCRAWLER_HLS", "1")
+	ffmpegArgsFile := filepath.Join(tmp, "ffmpeg-args.txt")
+	t.Setenv("GO_SCRIPTCRAWLER_FFMPEG_ARGS_FILE", ffmpegArgsFile)
 	c := NewCrawler(CrawlerConfig{
 		Driver:      drv,
 		Catalog:     cat,
@@ -529,6 +653,21 @@ func TestCrawlerRunOnceDownloadsHLSMediaURL(t *testing.T) {
 	}
 	if string(data) != "hls-video-bytes" {
 		t.Fatalf("hls output = %q", string(data))
+	}
+	argsData, err := os.ReadFile(ffmpegArgsFile)
+	if err != nil {
+		t.Fatalf("read ffmpeg args: %v", err)
+	}
+	argsText := "\n" + string(argsData) + "\n"
+	for _, want := range []string{
+		"\n-protocol_whitelist\nhttp,https,tcp,tls,crypto\n",
+		"\n-allowed_extensions\nALL\n",
+		"\n-allowed_segment_extensions\nALL\n",
+		"\n-extension_picky\n0\n",
+	} {
+		if !strings.Contains(argsText, want) {
+			t.Fatalf("ffmpeg args missing %q in:\n%s", strings.TrimSpace(want), string(argsData))
+		}
 	}
 }
 

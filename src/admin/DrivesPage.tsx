@@ -104,7 +104,8 @@ export function DrivesPage() {
           d.kind === "p123" ||
           d.kind === "onedrive" ||
           d.kind === "googledrive" ||
-          d.kind === "wopan"
+          d.kind === "wopan" ||
+          d.kind === "guangyapan"
       ),
     [list]
   );
@@ -238,7 +239,10 @@ export function DrivesPage() {
           : d.kind === "spider91"
           ? { proxy: d.spider91Proxy ?? "" }
           : d.kind === "googledrive"
-          ? { use_online_api: (d.googleDriveUseOnlineAPI ?? true) ? "true" : "false" }
+          ? {
+              use_online_api: (d.googleDriveUseOnlineAPI ?? true) ? "true" : "false",
+              api_url_address: d.googleDriveOpenListApiUrl ?? "",
+            }
           : d.kind === "localstorage"
           ? { strm_allow_outside_root: (d.strmAllowOutsideRoot ?? false) ? "true" : "false" }
           : {},
@@ -658,7 +662,7 @@ export function DrivesPage() {
                   </button>
                   <button
                     type="button"
-                    className="admin-btn is-stop"
+                    className="admin-btn is-primary"
                     onClick={() => handleStopDriveTasks(d)}
                     disabled={!!stoppingDriveId}
                     title="停止此网盘当前的扫描、封面、预览视频和视频指纹生成任务。"
@@ -668,7 +672,7 @@ export function DrivesPage() {
                   </button>
                 </div>
                 {d.kind !== "spider91" && (
-                  <button type="button" className="admin-btn" onClick={() => openEdit(d)}>
+                  <button type="button" className="admin-btn is-primary" onClick={() => openEdit(d)}>
                     {isSpiderCrawlerKind(d.kind) ? "编辑配置" : "编辑配置凭证"}
                   </button>
                 )}

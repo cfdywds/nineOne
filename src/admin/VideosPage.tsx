@@ -21,8 +21,16 @@ import { formatBytes } from "./storageFormat";
 const DESKTOP_VIDEOS_PAGE_SIZE = 50;
 const MOBILE_VIDEOS_PAGE_SIZE = 20;
 const VIDEOS_MOBILE_QUERY = "(max-width: 640px)";
+const REGEN_PREVIEW_STATUS = "generating";
+const REGEN_PREVIEW_POLL_INTERVAL_MS = 2000;
+const REGEN_PREVIEW_TRACK_TIMEOUT_MS = 30 * 60 * 1000;
 
 type TabKey = "current" | "blacklist";
+
+type RegenPreviewState = {
+  expiresAt: number;
+  originalUpdatedAt: number;
+};
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: "current", label: "当前视频" },
@@ -121,6 +129,7 @@ function CurrentVideosTab({ onStatsChanged }: { onStatsChanged: () => void }) {
   const [deleteTarget, setDeleteTarget] = useState<api.AdminVideo | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteSource, setDeleteSource] = useState(false);
+  const [regenPreviewById, setRegenPreviewById] = useState<Record<string, RegenPreviewState>>({});
   const pageSize = useVideosPageSize();
   const { show } = useToast();
 
@@ -147,6 +156,19 @@ function CurrentVideosTab({ onStatsChanged }: { onStatsChanged: () => void }) {
     }
   }
 
+  async function refreshListOnly() {
+    try {
+      const r = await api.listVideos({ driveId, page, size: pageSize, keyword: searchKeyword });
+      setList(r.items ?? []);
+      setTotal(r.total ?? 0);
+    } catch {
+      // Polling is only used to clear optimistic preview-generation state.
+    }
+  }
+
+  const trackedRegenCount = Object.keys(regenPreviewById).length;
+  const hasGeneratingPreview = list.some((v) => v.previewStatus === REGEN_PREVIEW_STATUS);
+
   useEffect(() => {
     refresh();
   }, [driveId, page, searchKeyword, pageSize]);
@@ -164,6 +186,33 @@ function CurrentVideosTab({ onStatsChanged }: { onStatsChanged: () => void }) {
     return () => window.clearTimeout(timer);
   }, [keyword]);
 
+  useEffect(() => {
+    if (trackedRegenCount === 0 && !hasGeneratingPreview) return;
+    const timer = window.setInterval(() => {
+      refreshListOnly();
+    }, REGEN_PREVIEW_POLL_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [trackedRegenCount, hasGeneratingPreview, driveId, page, pageSize, searchKeyword]);
+
+  useEffect(() => {
+    if (trackedRegenCount === 0) return;
+    const now = Date.now();
+    setRegenPreviewById((current) => {
+      const next = { ...current };
+      let changed = false;
+      const byId = new Map(list.map((v) => [v.id, v]));
+      for (const [id, state] of Object.entries(current)) {
+        const video = byId.get(id);
+        const updatedAt = videoUpdatedAtMs(video);
+        if (!video || now >= state.expiresAt || updatedAt > state.originalUpdatedAt) {
+          delete next[id];
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [list, trackedRegenCount]);
+
   const driveNameMap = new Map(drives.map((d) => [d.id, d.name || d.id]));
 
   const listItems = list;
@@ -177,6 +226,7 @@ function CurrentVideosTab({ onStatsChanged }: { onStatsChanged: () => void }) {
   async function handleRegen(v: api.AdminVideo) {
     try {
       await api.regenPreview(v.id);
+      trackRegeneratingPreview([v]);
       show("已触发预览视频重生", "success");
     } catch (e) {
       show(e instanceof Error ? e.message : "触发失败", "error");
@@ -196,13 +246,20 @@ function CurrentVideosTab({ onStatsChanged }: { onStatsChanged: () => void }) {
 
   async function confirmBatchRegen() {
     const ids = [...selectedIds];
+    const videoById = new Map(listItems.map((v) => [v.id, v]));
     setBatchRegening(true);
     let success = 0;
     try {
       const results = await Promise.allSettled(ids.map((id) => api.regenPreview(id)));
-      for (const r of results) {
-        if (r.status === "fulfilled") success++;
-      }
+      const acceptedVideos: api.AdminVideo[] = [];
+      results.forEach((r, index) => {
+        if (r.status === "fulfilled") {
+          const video = videoById.get(ids[index]);
+          if (video) acceptedVideos.push(video);
+          success++;
+        }
+      });
+      trackRegeneratingPreview(acceptedVideos);
       show(
         `批量触发完成，成功 ${success} / ${ids.length} 个`,
         success === ids.length ? "success" : "info"
@@ -212,6 +269,25 @@ function CurrentVideosTab({ onStatsChanged }: { onStatsChanged: () => void }) {
     } finally {
       setBatchRegening(false);
     }
+  }
+
+  function trackRegeneratingPreview(videos: api.AdminVideo[]) {
+    if (videos.length === 0) return;
+    const startedAt = Date.now();
+    setRegenPreviewById((current) => {
+      const next = { ...current };
+      for (const v of videos) {
+        next[v.id] = {
+          expiresAt: startedAt + REGEN_PREVIEW_TRACK_TIMEOUT_MS,
+          originalUpdatedAt: videoUpdatedAtMs(v),
+        };
+      }
+      return next;
+    });
+  }
+
+  function isPreviewGenerating(v: api.AdminVideo) {
+    return !!regenPreviewById[v.id] || v.previewStatus === REGEN_PREVIEW_STATUS;
   }
 
   async function confirmDeleteVideo() {
@@ -398,7 +474,7 @@ function CurrentVideosTab({ onStatsChanged }: { onStatsChanged: () => void }) {
                   <td data-label="作者">{v.author || <span className="admin-text-faint">—</span>}</td>
                   <td data-label="时长">{formatDur(v.durationSeconds)}</td>
                   <td data-label="预览视频">
-                    <PreviewStatus s={v.previewStatus} />
+                    <PreviewStatus s={isPreviewGenerating(v) ? REGEN_PREVIEW_STATUS : v.previewStatus} />
                   </td>
                   <td data-label="来源" className="admin-mono-cell">
                     {driveNameMap.get(v.driveId) ?? v.driveId}
@@ -407,8 +483,14 @@ function CurrentVideosTab({ onStatsChanged }: { onStatsChanged: () => void }) {
                     <button type="button" className="admin-btn" onClick={() => setEditing(v)} title="编辑视频">
                       <Edit size={13} />
                     </button>{" "}
-                    <button type="button" className="admin-btn" onClick={() => handleRegen(v)} title="重生预览视频">
-                      <RefreshCw size={13} />
+                    <button
+                      type="button"
+                      className="admin-btn"
+                      onClick={() => handleRegen(v)}
+                      disabled={isPreviewGenerating(v)}
+                      title={isPreviewGenerating(v) ? "预览视频正在生成" : "重生预览视频"}
+                    >
+                      <RefreshCw size={13} className={isPreviewGenerating(v) ? "admin-spin" : undefined} />
                     </button>{" "}
                     <button
                       type="button"
@@ -832,8 +914,10 @@ function VideoTitleCell({ video: v }: { video: api.AdminVideo }) {
 }
 
 function PreviewStatus({ s }: { s: string }) {
+  if (s === REGEN_PREVIEW_STATUS) return <span className="admin-status is-generating">生成中</span>;
   if (s === "ready") return <span className="admin-status is-ok">就绪</span>;
   if (s === "failed") return <span className="admin-status is-error">失败</span>;
+  if (s === "disabled") return <span className="admin-status">已关闭</span>;
   if (s === "skipped") return <span className="admin-status">跳过</span>;
   return <span className="admin-status is-pending">待生成</span>;
 }
@@ -868,6 +952,12 @@ function formatDateTime(ms: number): string {
   if (Number.isNaN(d.getTime())) return "—";
   const pad = (n: number) => n.toString().padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function videoUpdatedAtMs(video?: api.AdminVideo): number {
+  if (!video?.updatedAt) return 0;
+  const value = Date.parse(video.updatedAt);
+  return Number.isFinite(value) ? value : 0;
 }
 
 function useVideosPageSize() {

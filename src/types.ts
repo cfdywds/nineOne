@@ -57,7 +57,7 @@ export type VideoDetail = VideoItem & {
 
 export type PreviewState = "idle" | "intent" | "loading" | "playing" | "error";
 
-export type SortKey = "latest" | "hot" | "week" | "long" | "hd" | "featured";
+export type SortKey = "latest" | "hot" | "recent";
 
 export type TagItem = {
   id: string;

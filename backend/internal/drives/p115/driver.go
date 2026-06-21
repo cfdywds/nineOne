@@ -20,11 +20,12 @@ import (
 )
 
 type Driver struct {
-	id     string
-	cookie string
-	rootID string
-	client *sdk.Pan115Client
-	ua     string
+	id            string
+	cookie        string
+	rootID        string
+	client        *sdk.Pan115Client
+	ua            string
+	uploadTempDir string
 
 	listMu       sync.Mutex
 	lastListAt   time.Time
@@ -32,10 +33,11 @@ type Driver struct {
 }
 
 type Config struct {
-	ID     string
-	Cookie string // 形如 "UID=xxx; CID=xxx; SEID=xxx; KID=xxx"
-	RootID string // 默认 "0"
-	UA     string // 默认 UA115Browser
+	ID            string
+	Cookie        string // 形如 "UID=xxx; CID=xxx; SEID=xxx; KID=xxx"
+	RootID        string // 默认 "0"
+	UA            string // 默认 UA115Browser
+	UploadTempDir string
 }
 
 func New(c Config) *Driver {
@@ -48,11 +50,12 @@ func New(c Config) *Driver {
 		ua = sdk.UA115Browser
 	}
 	return &Driver{
-		id:           c.ID,
-		cookie:       c.Cookie,
-		rootID:       rootID,
-		ua:           ua,
-		listInterval: 2 * time.Second,
+		id:            c.ID,
+		cookie:        c.Cookie,
+		rootID:        rootID,
+		ua:            ua,
+		uploadTempDir: strings.TrimSpace(c.UploadTempDir),
+		listInterval:  2 * time.Second,
 	}
 }
 
@@ -87,7 +90,7 @@ func (d *Driver) List(ctx context.Context, dirID string) ([]drives.Entry, error)
 // p115ListCooldown 是列目录触发疑似风控错误时的冷却时长。
 //
 // 历史上是 [30min × 3]，3 次都失败就放弃；新策略改为 10 分钟无限重试 ——
-// 只要错误仍属 transient（429 / 405 / WAF / blocked / 安全威胁 / unexpected），
+// 只要错误仍属明确 HTTP transient 状态（429 / 405），
 // 就持续等 10 分钟再发一次列目录请求，直到成功或 ctx 取消。这样即使 115
 // 风控持续较长时间，扫描会自然延后到风控结束，不再丢半棵子树。
 const p115ListCooldown = 10 * time.Minute
@@ -156,17 +159,7 @@ func isTransient115UpstreamError(err error) bool {
 	if err == nil {
 		return false
 	}
-	text := strings.ToLower(err.Error())
-	return strings.Contains(text, "405") ||
-		strings.Contains(text, "429") ||
-		strings.Contains(text, "too many request") ||
-		strings.Contains(text, "too many requests") ||
-		strings.Contains(text, "blocked") ||
-		strings.Contains(text, "security") ||
-		strings.Contains(text, "waf") ||
-		strings.Contains(text, "unexpected error") ||
-		strings.Contains(text, "访问被阻断") ||
-		strings.Contains(text, "安全威胁")
+	return drives.ErrorMentionsHTTPStatus(err, http.StatusMethodNotAllowed, http.StatusTooManyRequests)
 }
 
 // ListDirsOnly 只列指定目录的直接**子目录**，不返回文件条目。专为 admin 后台
@@ -357,7 +350,7 @@ func (d *Driver) UploadAndReportSha1(ctx context.Context, parentID, name string,
 		parentID = d.rootID
 	}
 
-	tmp, sha1Hex, written, err := bufferAndHashSha1(r, size)
+	tmp, sha1Hex, written, err := bufferAndHashSha1(d.uploadTempDir, r, size)
 	if err != nil {
 		return UploadResult{}, err
 	}
@@ -482,8 +475,14 @@ func (d *Driver) Remove(ctx context.Context, fileID string) error {
 // 返回临时文件（位置在末尾，需调用方 Seek 回 0）、SHA1 hex 大写、实际字节数。
 //
 // 调用方负责 Close + Remove 临时文件。
-func bufferAndHashSha1(r io.Reader, declaredSize int64) (*os.File, string, int64, error) {
-	tmp, err := os.CreateTemp("", "p115-upload-*.bin")
+func bufferAndHashSha1(tempDir string, r io.Reader, declaredSize int64) (*os.File, string, int64, error) {
+	tempDir = strings.TrimSpace(tempDir)
+	if tempDir != "" {
+		if err := os.MkdirAll(tempDir, 0o755); err != nil {
+			return nil, "", 0, fmt.Errorf("p115 upload: create tmp dir: %w", err)
+		}
+	}
+	tmp, err := os.CreateTemp(tempDir, "p115-upload-*.bin")
 	if err != nil {
 		return nil, "", 0, fmt.Errorf("p115 upload: create tmp: %w", err)
 	}

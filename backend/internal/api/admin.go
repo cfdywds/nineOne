@@ -21,6 +21,7 @@ import (
 
 	"github.com/video-site/backend/internal/auth"
 	"github.com/video-site/backend/internal/catalog"
+	"github.com/video-site/backend/internal/drives/guangyapan"
 	"github.com/video-site/backend/internal/drives/p123"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
 	"github.com/video-site/backend/internal/drives/spider91"
@@ -52,6 +53,7 @@ type AdminServer struct {
 	OnDriveDeleteCleanup      func(ctx context.Context, driveID string) (int, error)
 	OnDriveRemoved            func(driveID string)
 	OnScanRequested           func(driveID string) bool
+	OnCrawlerUploadRequested  func(driveID string) (bool, string)
 	OnStopDriveTasks          func(driveID string) bool
 	OnStopAllTasks            func() int
 	GetDriveCrawlStatus       func(driveID string) CrawlStatus
@@ -65,17 +67,18 @@ type AdminServer struct {
 	// 处理完候选列表后任务自然结束。
 	OnStartDriveTranscode func(driveID string) (bool, string)
 	// OnStopDriveTranscode 手动停止某盘正在进行的转码任务。返回是否有任务被停。
-	OnStopDriveTranscode       func(driveID string) bool
-	OnDeleteVideo              func(ctx context.Context, videoID string, deleteSource bool) (DeleteVideoResult, error)
-	GetDriveGenerationStatuses func() map[string]DriveGenerationStatuses
+	OnStopDriveTranscode         func(driveID string) bool
+	OnDeleteVideo                func(ctx context.Context, videoID string, deleteSource bool) (DeleteVideoResult, error)
+	GetDriveGenerationStatuses   func() map[string]DriveGenerationStatuses
+	GetPreviewGenerationVideoIDs func() map[string]bool
 	// OnTeaserEnabledChanged 在 per-drive 预览视频开关被切换后调用。
 	// enabled=true 时上层应该重新把 pending 预览视频入队（类似旧的全局开关从关到开）；
 	// enabled=false 时通常不用做事 —— worker 入队前会再次查 catalog，自然停止。
 	OnTeaserEnabledChanged func(driveID string, enabled bool)
-	// Theme 读写（"dark" | "pink"）
+	// Theme 读写（"dark" | "pink" | "sky"）
 	GetTheme func() string
 	SetTheme func(theme string) error
-	// Spider91 → 115/123/PikPak/OneDrive/Google Drive/联通网盘 上传目标 drive ID 读写
+	// Spider91 → 115/123/PikPak/OneDrive/Google Drive/联通网盘/光鸭网盘 上传目标 drive ID 读写
 	GetSpider91UploadDriveID func() string
 	SetSpider91UploadDriveID func(driveID string) error
 	// OnRunNightlyJob 触发一次完整的凌晨流水线（Phase1 扫盘 + Phase2 91 爬虫 +
@@ -95,6 +98,9 @@ type AdminServer struct {
 	// 联通网盘扫码登录接口测试注入；生产留空走官方 panservice.mail.wo.cn。
 	WopanQRAPIBaseURL string
 	WopanQRHTTPClient *http.Client
+	// 光鸭网盘扫码登录接口测试注入；生产留空走官方 account.guangyapan.com。
+	GuangYaPanAccountBaseURL string
+	GuangYaPanHTTPClient     *http.Client
 }
 
 const (
@@ -187,6 +193,8 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Get("/drives/p123/qr/{uniID}", a.handleP123QRStatus)
 			r.Post("/drives/wopan/qr", a.handleWopanQRStart)
 			r.Get("/drives/wopan/qr/{uuid}", a.handleWopanQRStatus)
+			r.Post("/drives/guangyapan/qr", a.handleGuangYaPanQRStart)
+			r.Get("/drives/guangyapan/qr/status", a.handleGuangYaPanQRStatus)
 			r.Delete("/drives/{id}", a.handleDeleteDrive)
 			r.Post("/drives/{id}/rescan", a.handleRescan)
 			r.Get("/drives/{id}/crawl/status", a.handleDriveCrawlStatus)
@@ -208,6 +216,7 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Post("/crawlers/test-script", a.handleTestCrawlerScript)
 			r.Delete("/crawlers/{id}", a.handleDeleteCrawler)
 			r.Post("/crawlers/{id}/run", a.handleRunCrawler)
+			r.Post("/crawlers/{id}/upload", a.handleUploadCrawlerVideos)
 			r.Post("/crawlers/{id}/tasks/stop", a.handleStopCrawlerTasks)
 
 			// 视频
@@ -484,7 +493,8 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		Status        string `json:"status"`
 		LastError     string `json:"lastError,omitempty"`
 		HasCredential bool   `json:"hasCredential"`
-		// TeaserEnabled 控制是否给本盘生成预览视频/封面。前端用它在网盘列表/编辑表单展示开关状态。
+		// TeaserEnabled 控制是否给本盘生成预览视频；封面生成不受影响。
+		// 前端用它在网盘列表/编辑表单展示开关状态。
 		TeaserEnabled bool `json:"teaserEnabled"`
 		// SkipDirIDs 是用户在 admin 配置的"扫描跳过目录"集合（drive 侧目录 fileID）。
 		// 前端用它在"设置跳过目录"弹窗里回显已选项；JSON 字段名 camelCase 与
@@ -496,6 +506,7 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		SpiderCrawlerConfig     map[string]string `json:"spiderCrawlerConfig,omitempty"`
 		LastCrawlAt             int64             `json:"lastCrawlAt,omitempty"`
 		GoogleDriveUseOnlineAPI *bool             `json:"googleDriveUseOnlineAPI,omitempty"`
+		GoogleDriveOpenListAPIURL string `json:"googleDriveOpenListApiUrl,omitempty"`
 		// STRMAllowOutsideRoot 是 localstorage 的 .strm 越root开关；其它 kind 省略。
 		STRMAllowOutsideRoot          *bool            `json:"strmAllowOutsideRoot,omitempty"`
 		ScanGenerationStatus          GenerationStatus `json:"scanGenerationStatus"`
@@ -575,6 +586,7 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 			SpiderCrawlerConfig:           spiderCrawlerConfigForDrive(d),
 			LastCrawlAt:                   lastCrawlAt,
 			GoogleDriveUseOnlineAPI:       googleDriveUseOnlineAPIForDrive(d),
+			GoogleDriveOpenListAPIURL:     googleDriveOpenListAPIURLForDrive(d),
 			STRMAllowOutsideRoot:          strmAllowOutsideRootForDrive(d),
 			ScanGenerationStatus:          generation.Scan,
 			ThumbnailGenerationStatus:     generation.Thumbnail,
@@ -608,7 +620,7 @@ type upsertDriveReq struct {
 	// Deprecated: 扫描起点已固定为 rootId；保留字段只为兼容旧客户端请求体。
 	ScanRootID  string            `json:"scanRootId"`
 	Credentials map[string]string `json:"credentials"`
-	// TeaserEnabled 是 per-drive 预览视频/封面生成开关。
+	// TeaserEnabled 是 per-drive 预览视频生成开关；封面生成不受影响。
 	// 用 *bool 区分 "未传" / "传了 false"：未传时表示客户端不打算改这个字段，
 	// 沿用 catalog 现有值；新建时未传一律默认开启（true）。
 	TeaserEnabled *bool `json:"teaserEnabled,omitempty"`
@@ -650,9 +662,11 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		body.Credentials = credentials
-	} else if body.Kind == "googledrive" || body.Kind == "localstorage" {
+	} else if body.Kind == "googledrive" {
+		body.Credentials = mergeGoogleDriveCredentials(existing, body.Credentials)
+	} else if body.Kind == "localstorage" || body.Kind == "guangyapan" {
 		// 按键合并、空值沿用旧值：localstorage 编辑表单里 path 留空表示不改，
-		// 但 strm_allow_outside_root 开关每次都会带值，必须逐键合并而不是整体替换。
+		// 光鸭编辑表单里各 token/path 字段也允许只改其中一部分；因此两类都按键合并。
 		body.Credentials = mergeNonEmptyCredentials(existing, body.Credentials)
 	} else if len(body.Credentials) == 0 && existing != nil && len(existing.Credentials) > 0 {
 		body.Credentials = existing.Credentials
@@ -714,6 +728,7 @@ type crawlerDTO struct {
 	Proxy                       string           `json:"proxy,omitempty"`
 	TargetNew                   string           `json:"targetNew,omitempty"`
 	UploadDriveID               string           `json:"uploadDriveId,omitempty"`
+	TeaserEnabled               bool             `json:"teaserEnabled"`
 	LastCrawlAt                 int64            `json:"lastCrawlAt,omitempty"`
 	ScanGenerationStatus        GenerationStatus `json:"scanGenerationStatus"`
 	ThumbnailGenerationStatus   GenerationStatus `json:"thumbnailGenerationStatus"`
@@ -741,6 +756,7 @@ type upsertCrawlerReq struct {
 	Proxy           string `json:"proxy"`
 	TargetNew       string `json:"targetNew"`
 	UploadDriveID   string `json:"uploadDriveId"`
+	TeaserEnabled   *bool  `json:"teaserEnabled,omitempty"`
 }
 
 func (a *AdminServer) handleListCrawlers(w http.ResponseWriter, r *http.Request) {
@@ -802,6 +818,7 @@ func (a *AdminServer) crawlerDTOForDrive(d *catalog.Drive, assets catalog.Crawle
 		Proxy:                       strings.TrimSpace(d.Credentials["proxy"]),
 		TargetNew:                   strings.TrimSpace(d.Credentials["target_new"]),
 		UploadDriveID:               strings.TrimSpace(d.Credentials["upload_drive_id"]),
+		TeaserEnabled:               d.TeaserEnabled,
 		LastCrawlAt:                 lastCrawlAt,
 		ScanGenerationStatus:        generation.Scan,
 		ThumbnailGenerationStatus:   generation.Thumbnail,
@@ -888,6 +905,13 @@ func (a *AdminServer) handleUpsertCrawler(w http.ResponseWriter, r *http.Request
 		return
 	}
 	name := meta.Name
+	teaserEnabled := true
+	if existing != nil {
+		teaserEnabled = existing.TeaserEnabled
+	}
+	if body.TeaserEnabled != nil {
+		teaserEnabled = *body.TeaserEnabled
+	}
 	if id == "" {
 		generatedID, err := a.generateCrawlerID(r.Context(), name)
 		if err != nil {
@@ -903,14 +927,14 @@ func (a *AdminServer) handleUpsertCrawler(w http.ResponseWriter, r *http.Request
 		RootID:        "/",
 		Credentials:   merged,
 		Status:        "disconnected",
-		TeaserEnabled: true,
-	}
-	if existing != nil {
-		d.TeaserEnabled = existing.TeaserEnabled
+		TeaserEnabled: teaserEnabled,
 	}
 	if err := a.Catalog.UpsertDrive(r.Context(), d); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
+	}
+	if existing != nil && existing.TeaserEnabled != teaserEnabled && a.OnTeaserEnabledChanged != nil {
+		a.OnTeaserEnabledChanged(id, teaserEnabled)
 	}
 	if a.OnDriveSaved != nil {
 		if err := a.OnDriveSaved(id); err != nil {
@@ -961,14 +985,14 @@ func (a *AdminServer) validateCrawlerUploadDrive(ctx context.Context, driveID st
 		return fmt.Errorf("上传目标网盘 %q 不存在", driveID)
 	}
 	if !isCrawlerUploadTargetKind(d.Kind) {
-		return fmt.Errorf("上传目标网盘 %q 类型为 %s，仅支持 115网盘、PikPak、123网盘、Google Drive、OneDrive、联通网盘", driveID, d.Kind)
+		return fmt.Errorf("上传目标网盘 %q 类型为 %s，仅支持 115网盘、PikPak、123网盘、Google Drive、OneDrive、联通网盘、光鸭网盘", driveID, d.Kind)
 	}
 	return nil
 }
 
 func isCrawlerUploadTargetKind(kind string) bool {
 	switch strings.TrimSpace(kind) {
-	case "p115", "pikpak", "p123", "googledrive", "onedrive", "wopan":
+	case "p115", "pikpak", "p123", "googledrive", "onedrive", "wopan", "guangyapan":
 		return true
 	default:
 		return false
@@ -1297,6 +1321,104 @@ func (a *AdminServer) handleRunCrawler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, resp)
 }
 
+func (a *AdminServer) handleUploadCrawlerVideos(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	d, err := a.Catalog.GetDrive(r.Context(), id)
+	if err != nil || d == nil || !isConfiguredCrawlerDrive(d) {
+		http.Error(w, "crawler not found", http.StatusNotFound)
+		return
+	}
+	status := a.nightlyJobStatus()
+	if status.Running || status.Queued {
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"ok":       true,
+			"accepted": false,
+			"message":  fullScanBusyMessage,
+			"status":   status,
+		})
+		return
+	}
+
+	assets, err := a.Catalog.CountCrawlerAssets(r.Context(), d.ID, crawlerVideoIDPrefixes(d))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	generation := DriveGenerationStatuses{}
+	if a.GetDriveGenerationStatuses != nil {
+		generation = a.GetDriveGenerationStatuses()[d.ID]
+	}
+	if reason := crawlerUploadBlockedReason(d, assets, generation); reason != "" {
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"ok":       true,
+			"accepted": false,
+			"message":  reason,
+		})
+		return
+	}
+
+	accepted := true
+	message := ""
+	if a.OnCrawlerUploadRequested != nil {
+		accepted, message = a.OnCrawlerUploadRequested(id)
+	}
+	resp := map[string]any{"ok": true, "accepted": accepted}
+	if !accepted {
+		if strings.TrimSpace(message) == "" {
+			message = driveTaskBusyMessage
+		}
+		resp["message"] = message
+	}
+	writeJSON(w, http.StatusAccepted, resp)
+}
+
+func crawlerUploadBlockedReason(d *catalog.Drive, assets catalog.CrawlerAssetCounts, generation DriveGenerationStatuses) string {
+	if d == nil || !isConfiguredCrawlerDrive(d) {
+		return "爬虫不存在"
+	}
+	if strings.TrimSpace(d.Credentials["upload_drive_id"]) == "" {
+		return "请先配置上传网盘"
+	}
+	if assets.Local <= 0 {
+		return "没有待上传的本地视频"
+	}
+	if crawlerGenerationBusy(generation) {
+		return "当前爬虫有正在进行的任务，请稍后重试"
+	}
+	if assets.Fingerprint.Pending > 0 {
+		return "还有待生成的视频指纹"
+	}
+	if assets.Fingerprint.Failed > 0 {
+		return "存在指纹生成失败的视频，请先重试或处理失败项"
+	}
+	if d.TeaserEnabled {
+		if assets.Teaser.Pending > 0 {
+			return "还有待生成的预览视频"
+		}
+		if assets.Teaser.Failed > 0 {
+			return "存在预览视频生成失败的视频，请先重试或处理失败项"
+		}
+	}
+	return ""
+}
+
+func crawlerGenerationBusy(g DriveGenerationStatuses) bool {
+	return generationBusy(g.Scan) ||
+		generationBusy(g.Thumbnail) ||
+		generationBusy(g.Preview) ||
+		generationBusy(g.Fingerprint) ||
+		generationBusy(g.Upload)
+}
+
+func generationBusy(g GenerationStatus) bool {
+	switch strings.TrimSpace(g.State) {
+	case "", "idle":
+		return false
+	default:
+		return true
+	}
+}
+
 func (a *AdminServer) handleStopCrawlerTasks(w http.ResponseWriter, r *http.Request) {
 	a.handleStopDriveTasks(w, r)
 }
@@ -1508,8 +1630,23 @@ func googleDriveUseOnlineAPIForDrive(d *catalog.Drive) *bool {
 	return &result
 }
 
+func googleDriveOpenListAPIURLForDrive(d *catalog.Drive) string {
+	if d == nil || d.Kind != "googledrive" || d.Credentials == nil {
+		return ""
+	}
+	return strings.TrimSpace(d.Credentials["api_url_address"])
+}
+
+func mergeGoogleDriveCredentials(existing *catalog.Drive, incoming map[string]string) map[string]string {
+	merged := mergeNonEmptyCredentials(existing, incoming)
+	if _, ok := incoming["api_url_address"]; ok && strings.TrimSpace(incoming["api_url_address"]) == "" {
+		delete(merged, "api_url_address")
+	}
+	return merged
+}
+
 // mergeNonEmptyCredentials 逐键合并凭证：incoming 里非空的键覆盖旧值，
-// 空值/缺失的键沿用旧值。googledrive 和 localstorage 的编辑表单都依赖
+// 空值/缺失的键沿用旧值。googledrive、localstorage 和 guangyapan 的编辑表单都依赖
 // 这个语义（留空 = 不修改）。
 func mergeNonEmptyCredentials(existing *catalog.Drive, incoming map[string]string) map[string]string {
 	merged := map[string]string{}
@@ -1829,6 +1966,38 @@ func (a *AdminServer) handleWopanQRStatus(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, status)
 }
 
+func (a *AdminServer) guangYaPanQRClient() *guangyapan.QRClient {
+	return guangyapan.NewQRClient(guangyapan.QRConfig{
+		AccountBaseURL: a.GuangYaPanAccountBaseURL,
+		HTTPClient:     a.GuangYaPanHTTPClient,
+	})
+}
+
+func (a *AdminServer) handleGuangYaPanQRStart(w http.ResponseWriter, r *http.Request) {
+	session, err := a.guangYaPanQRClient().Generate(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, session)
+}
+
+func (a *AdminServer) handleGuangYaPanQRStatus(w http.ResponseWriter, r *http.Request) {
+	deviceCode := r.URL.Query().Get("deviceCode")
+	if strings.TrimSpace(deviceCode) == "" {
+		http.Error(w, "deviceCode is required", http.StatusBadRequest)
+		return
+	}
+	status, err := a.guangYaPanQRClient().Poll(r.Context(), deviceCode)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, status)
+}
+
 // handleRunNightlyJob 触发一次完整的凌晨流水线（不论当前时间，不论今日是否已跑）。
 // 立即返回 202；进度通过 backend 日志和下次 GET /admin/api/drives 的状态变化观察。
 // 流水线已在跑或已排队时，Runner 会拒绝重复触发。
@@ -2014,6 +2183,14 @@ func (a *AdminServer) handleAdminListVideos(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
+	}
+	if a.GetPreviewGenerationVideoIDs != nil {
+		generating := a.GetPreviewGenerationVideoIDs()
+		for _, item := range items {
+			if item != nil && generating[item.ID] {
+				item.PreviewStatus = "generating"
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items": items,

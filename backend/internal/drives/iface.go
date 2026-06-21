@@ -5,12 +5,14 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
 // Drive 是多家网盘统一抽象。上层不区分盘，只区分 Kind。
 type Drive interface {
-	// Kind 返回驱动代号："quark" / "p115" / "p123" / "pikpak" / "wopan" / "onedrive" / "googledrive" / "localstorage"
+	// Kind 返回驱动代号："quark" / "p115" / "p123" / "pikpak" / "wopan" / "guangyapan" / "onedrive" / "googledrive" / "localstorage"
 	Kind() string
 
 	// ID 返回该盘在 catalog 中的唯一标识
@@ -118,4 +120,43 @@ func RateLimitRetryAfter(err error) (time.Duration, bool) {
 		return rateLimit.RetryAfter, true
 	}
 	return 0, false
+}
+
+// TextMentionsHTTPStatus only looks for explicit numeric HTTP status contexts
+// in errors from tools that do not expose structured response metadata.
+func TextMentionsHTTPStatus(text string, statuses ...int) bool {
+	text = strings.ToLower(strings.TrimSpace(text))
+	if text == "" {
+		return false
+	}
+	for _, status := range statuses {
+		if status <= 0 {
+			continue
+		}
+		code := strconv.Itoa(status)
+		if strings.HasPrefix(text, code+" ") ||
+			strings.Contains(text, "status="+code) ||
+			strings.Contains(text, "status: "+code) ||
+			strings.Contains(text, "status "+code) ||
+			strings.Contains(text, "status code "+code) ||
+			strings.Contains(text, "http "+code) ||
+			strings.Contains(text, "http status="+code) ||
+			strings.Contains(text, "http status: "+code) ||
+			strings.Contains(text, "http status "+code) ||
+			strings.Contains(text, "server returned "+code) ||
+			strings.Contains(text, "code="+code) ||
+			strings.Contains(text, "code: "+code) ||
+			strings.Contains(text, "error_code="+code) ||
+			strings.Contains(text, "error_code: "+code) {
+			return true
+		}
+	}
+	return false
+}
+
+func ErrorMentionsHTTPStatus(err error, statuses ...int) bool {
+	if err == nil {
+		return false
+	}
+	return TextMentionsHTTPStatus(err.Error(), statuses...)
 }

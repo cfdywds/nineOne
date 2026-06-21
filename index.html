@@ -3,8 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="referrer" content="no-referrer" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" href="/icon.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="91" />
+    <meta name="theme-color" content="#000000" />
     <meta name="description" content="91 视频站" />
     <title>91</title>
     <!-- Premium Fonts Preconnect & Links -->
@@ -19,7 +26,7 @@
       (function () {
         try {
           var t = localStorage.getItem("video-site:theme");
-          if (t === "pink" || t === "dark") {
+          if (t === "pink" || t === "dark" || t === "sky") {
             document.documentElement.setAttribute("data-theme", t);
           } else {
             document.documentElement.setAttribute("data-theme", "dark");

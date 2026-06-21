@@ -56,7 +56,7 @@ preview:
   width: 480
 
 # 盘列表。上线后请通过管理后台添加，本文件可留空。
-# kind 支持 quark / p115 / p123 / pikpak / wopan / onedrive / googledrive / localstorage。
+# kind 支持 quark / p115 / p123 / pikpak / wopan / guangyapan / onedrive / googledrive / localstorage。
 # OneDrive 示例：
 # - id: "my-onedrive"
 #   kind: "onedrive"
@@ -76,6 +76,17 @@ preview:
 #     # use_online_api: "false"
 #     # client_id: "..."
 #     # client_secret: "..."
+# 光鸭网盘示例：
+# - id: "my-guangyapan"
+#   kind: "guangyapan"
+#   name: "我的光鸭网盘"
+#   # 留空表示光鸭网盘根目录；也可以填写光鸭目录 fileId
+#   root_id: ""
+#   params:
+#     # 推荐在后台使用扫码登录自动写入 access_token / refresh_token。
+#     refresh_token: "..."
+#     # 可选：按路径解析扫描根目录，优先于 root_id
+#     # root_path: "影视/电影"
 # 本地存储示例：
 # - id: "local-media"
 #   kind: "localstorage"

@@ -86,16 +86,16 @@ func TestComputeRemoteUsesRangeSamples(t *testing.T) {
 	}
 }
 
-func TestComputeRemoteGoogleQuotaExceededReturnsRateLimit(t *testing.T) {
+func TestComputeRemote429ReturnsRateLimit(t *testing.T) {
 	ctx := context.Background()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "60")
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write([]byte(`{"error":{"code":403,"message":"The download quota for this file has been exceeded.","errors":[{"domain":"usageLimits","reason":"downloadQuotaExceeded","message":"The download quota for this file has been exceeded."}]}}`))
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":429}}`))
 	}))
 	defer srv.Close()
 
-	drv := &fakeDrive{paths: map[string]string{"remote": srv.URL + "/drive/v3/files/file-1?alt=media"}}
+	drv := &fakeDrive{paths: map[string]string{"remote": srv.URL + "/video.mp4"}}
 	_, err := Compute(ctx, drv, &catalog.Video{ID: "remote", FileID: "remote", Size: 1024 * 1024}, Config{
 		SampleSizeBytes: 4,
 		FullHashMaxSize: 8,
@@ -128,6 +128,30 @@ func TestWopanRemoteRangeErrorsLookRateLimited(t *testing.T) {
 	}
 	if remoteRangeResponseLooksRateLimited("https://example.com/video.mp4", http.StatusForbidden, nil) {
 		t.Fatal("generic 403 should not be treated as wopan rate limit")
+	}
+}
+
+func TestGuangYaPanRemoteRangeErrorsLookRateLimited(t *testing.T) {
+	for _, tc := range []struct {
+		rawURL string
+		status int
+	}{
+		{rawURL: "https://txgz02-httpdown.guangyacdn.com/download/?fid=encoded", status: http.StatusForbidden},
+		{rawURL: "https://txgz02-httpdown.guangyacdn.com/download/?fid=encoded", status: http.StatusServiceUnavailable},
+		{rawURL: "https://txgz02-httpdown.guangyacdn.com/download/?fid=encoded", status: 509},
+	} {
+		if !remoteRangeResponseLooksRateLimited(tc.rawURL, tc.status, nil) {
+			t.Fatalf("remoteRangeResponseLooksRateLimited(%q, %d) = false, want true", tc.rawURL, tc.status)
+		}
+	}
+	if remoteRangeResponseLooksRateLimited("https://example.com/video.mp4", http.StatusForbidden, nil) {
+		t.Fatal("generic 403 should not be treated as guangyapan rate limit")
+	}
+}
+
+func TestGoogleDriveRemoteRangeForbiddenLooksRateLimitedByURL(t *testing.T) {
+	if !remoteRangeResponseLooksRateLimited("https://www.googleapis.com/drive/v3/files/file-1?alt=media", http.StatusForbidden, nil) {
+		t.Fatal("google drive media 403 should be treated as rate limit by URL and status")
 	}
 }
 

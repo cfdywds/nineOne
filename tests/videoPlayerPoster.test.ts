@@ -74,6 +74,14 @@ test("detail player exposes a non-persistent loop switch in ArtPlayer settings",
   assert.match(playerSource, /item\.tooltip = next \? "开" : "关"/);
 });
 
+test("detail player limits ArtPlayer automatic reconnect attempts", () => {
+  assert.match(playerSource, /const ARTPLAYER_RECONNECT_TIME_MAX = 3;/);
+  assert.match(
+    playerSource,
+    /Artplayer\.RECONNECT_TIME_MAX = ARTPLAYER_RECONNECT_TIME_MAX;/
+  );
+});
+
 test("detail loading skeleton matches current desktop video page layout", () => {
   assert.match(detailPageSource, /className="vd-layout vd-skeleton"/);
   assert.match(detailPageSource, /className="vd-skeleton__summary"/);

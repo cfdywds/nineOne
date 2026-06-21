@@ -226,9 +226,6 @@ function isSortKey(value: unknown): value is SortKey {
   return (
     value === "latest" ||
     value === "hot" ||
-    value === "week" ||
-    value === "long" ||
-    value === "hd" ||
-    value === "featured"
+    value === "recent"
   );
 }

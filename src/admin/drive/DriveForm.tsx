@@ -2,6 +2,7 @@ import { useId, useMemo, useState } from "react";
 import { ArrowLeft, ChevronDown } from "lucide-react";
 import { P123QRCodeLogin } from "./P123QRCodeLogin";
 import { WopanQRCodeLogin } from "./WopanQRCodeLogin";
+import { GuangYaPanQRCodeLogin } from "./GuangYaPanQRCodeLogin";
 import { Spider91UploadTargetField } from "./Spider91UploadTargetField";
 import {
   FormState,
@@ -25,6 +26,7 @@ const DRIVE_OPTIONS: DriveOption[] = [
   { kind: "p115", label: "115 网盘", abbr: "115", desc: "302直链，不占带宽" },
   { kind: "p123", label: "123网盘", abbr: "123", desc: "扫码登录，302直链" },
   { kind: "pikpak", label: "PikPak", abbr: "Pk", desc: "302直链，稳定快速" },
+  { kind: "guangyapan", label: "光鸭网盘", abbr: "GY", desc: "扫码登录，302直链" },
   { kind: "onedrive", label: "OneDrive", abbr: "OD", desc: "302直链，微软网盘" },
   { kind: "googledrive", label: "Google Drive", abbr: "GD", desc: "服务器中转模式" },
   { kind: "localstorage", label: "本地存储", abbr: "Lo", desc: "本机文件目录" },
@@ -190,6 +192,21 @@ export function DriveForm({
                     access_token: credentials.accessToken,
                     refresh_token: credentials.refreshToken,
                     ...(credentials.familyID ? { family_id: credentials.familyID } : {}),
+                  },
+                })
+              }
+            />
+          )}
+
+          {form.kind === "guangyapan" && (
+            <GuangYaPanQRCodeLogin
+              onCredentials={(credentials) =>
+                onChange({
+                  ...form,
+                  creds: {
+                    ...form.creds,
+                    access_token: credentials.accessToken,
+                    refresh_token: credentials.refreshToken,
                   },
                 })
               }
