@@ -82,8 +82,8 @@ type Video struct {
 	Favorites        int       `json:"favorites"`
 	Comments         int       `json:"comments"`
 	Likes            int       `json:"likes"`
+	LastLikedAt      time.Time `json:"lastLikedAt"`
 	Dislikes         int       `json:"dislikes"`
-	Category         string    `json:"category"`
 	Hidden           bool      `json:"hidden"`
 	Badges           []string  `json:"badges"`
 	Description      string    `json:"description"`
@@ -112,16 +112,16 @@ func (c *Catalog) UpsertVideo(ctx context.Context, v *Video) error {
 INSERT INTO videos (
   id, drive_id, file_id, file_name, content_hash, sampled_sha256, fingerprint_status, fingerprint_error, parent_id, title, author, tags,
   duration_seconds, size_bytes, ext, quality, thumbnail_url, thumbnail_status,
-  preview_file_id, preview_local, preview_status,
-  views, last_viewed_at, favorites, comments, likes, dislikes,
-  category, hidden, badges, description, published_at, created_at, updated_at
-) VALUES (
-  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-  ?, ?, ?, ?, ?, CASE WHEN COALESCE(?, '') != '' THEN 'ready' ELSE 'pending' END,
-  ?, ?, ?,
-  ?, ?, ?, ?, ?, ?,
-  ?, ?, ?, ?, ?, ?, ?
-)
+	  preview_file_id, preview_local, preview_status,
+	  views, last_viewed_at, favorites, comments, likes, dislikes,
+	  hidden, badges, description, published_at, created_at, updated_at
+	) VALUES (
+	  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+	  ?, ?, ?, ?, ?, CASE WHEN COALESCE(?, '') != '' THEN 'ready' ELSE 'pending' END,
+	  ?, ?, ?,
+	  ?, ?, ?, ?, ?, ?,
+	  ?, ?, ?, ?, ?, ?
+	)
 ON CONFLICT(id) DO UPDATE SET
   file_name       = CASE
                       WHEN excluded.file_name != '' THEN excluded.file_name
@@ -162,16 +162,15 @@ ON CONFLICT(id) DO UPDATE SET
                       WHEN COALESCE(excluded.thumbnail_url, '') != '' THEN 'ready'
                       ELSE videos.thumbnail_status
                     END,
-  category        = excluded.category,
-  badges          = excluded.badges,
-  description     = excluded.description,
+	  badges          = excluded.badges,
+	  description     = excluded.description,
   updated_at      = excluded.updated_at
 `,
 		v.ID, v.DriveID, v.FileID, v.FileName, v.ContentHash, v.SampledSHA256, fingerprintStatus, v.FingerprintError, v.ParentID, v.Title, v.Author, string(tagsJSON),
 		v.DurationSeconds, v.Size, v.Ext, v.Quality, v.ThumbnailURL, v.ThumbnailURL,
 		v.PreviewFileID, v.PreviewLocal, nullableStatus(v.PreviewStatus),
 		v.Views, unixMilliOrZero(v.LastViewedAt), v.Favorites, v.Comments, v.Likes, v.Dislikes,
-		v.Category, boolToInt(v.Hidden), string(badgesJSON), v.Description,
+		boolToInt(v.Hidden), string(badgesJSON), v.Description,
 		v.PublishedAt.UnixMilli(), v.CreatedAt.UnixMilli(), v.UpdatedAt.UnixMilli(),
 	)
 	if err != nil {
@@ -309,10 +308,9 @@ func (c *Catalog) ListHiddenVideos(ctx context.Context) ([]*Video, error) {
 	return out, rows.Err()
 }
 
-// MigrateVideoToDrive 把 catalog 里 id=videoID 这条视频迁移到另一个 drive。
-// 用于 spider91 → PikPak 的迁移：上传成功后改写 drive_id / file_id /
-// content_hash，保留视频自身的 id（spider91-<driveID>-<sourceID>），这样
-// 关联表 (video_tags / 收藏 / 点赞) 都不需要动。
+// MigrateVideoToDrive rewrites a crawler video row after it has been uploaded
+// to another drive. The video id is preserved so tags, favorites, likes and
+// view records keep pointing at the same logical video.
 //
 // scanner 后续看到 PikPak 目录下相同 hash / file_name 的文件时，会通过
 // findDuplicate 命中本行，不会再插入重复行。
@@ -338,8 +336,8 @@ func (c *Catalog) MigrateVideoToDrive(ctx context.Context, videoID, newDriveID, 
 }
 
 // ListVideosByDriveID 列出指定 drive 下所有未隐藏的视频，按 published_at 倒序。
-// 给 spider91 → 115/PikPak 迁移 worker 用：扫描 spider91 drive 下所有视频，
-// 检查哪些还有本地文件，依次上传到目标盘。
+// crawler upload worker uses this to find local crawler rows before uploading
+// them to their configured target drive.
 func (c *Catalog) ListVideosByDriveID(ctx context.Context, driveID string, limit int) ([]*Video, error) {
 	if driveID == "" {
 		return nil, fmt.Errorf("catalog: list videos by drive: empty drive id")
@@ -375,9 +373,10 @@ func (c *Catalog) IncrementLike(ctx context.Context, id string) (int, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
+	now := time.Now().UnixMilli()
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE videos SET likes = likes + 1, updated_at = ? WHERE id = ?`,
-		time.Now().UnixMilli(), id); err != nil {
+		`UPDATE videos SET likes = likes + 1, last_liked_at = ?, updated_at = ? WHERE id = ?`,
+		now, now, id); err != nil {
 		return 0, err
 	}
 	var likes int
@@ -398,9 +397,14 @@ func (c *Catalog) DecrementLike(ctx context.Context, id string) (int, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
+	now := time.Now().UnixMilli()
 	res, err := tx.ExecContext(ctx,
-		`UPDATE videos SET likes = MAX(likes - 1, 0), updated_at = ? WHERE id = ?`,
-		time.Now().UnixMilli(), id)
+		`UPDATE videos
+		    SET likes = MAX(likes - 1, 0),
+		        last_liked_at = CASE WHEN likes <= 1 THEN 0 ELSE last_liked_at END,
+		        updated_at = ?
+		  WHERE id = ?`,
+		now, id)
 	if err != nil {
 		return 0, err
 	}
@@ -450,7 +454,6 @@ type VideoMetaPatch struct {
 	ThumbnailStatus        string
 	ResetThumbnailFailures bool
 	DurationSeconds        int
-	Category               string
 	ContentHash            string
 	FileName               string
 	Title                  string
@@ -493,10 +496,6 @@ func (c *Catalog) UpdateVideoMeta(ctx context.Context, id string, p VideoMetaPat
 	if p.DurationSeconds > 0 {
 		parts = append(parts, "duration_seconds = ?")
 		args = append(args, p.DurationSeconds)
-	}
-	if p.Category != "" {
-		parts = append(parts, "category = ?")
-		args = append(args, p.Category)
 	}
 	if p.ContentHash != "" {
 		parts = append(parts, "content_hash = ?")
@@ -565,35 +564,6 @@ func (c *Catalog) IncrementThumbnailFailures(ctx context.Context, id string) (in
 		return 0, err
 	}
 	return failures, nil
-}
-
-// ListCategories 聚合所有 category，按视频数降序
-type CategoryStat struct {
-	Category string
-	Count    int
-}
-
-func (c *Catalog) ListCategories(ctx context.Context) ([]CategoryStat, error) {
-	rows, err := c.db.QueryContext(ctx,
-		`SELECT COALESCE(category, '') AS c, COUNT(*) AS cnt
-		 FROM videos
-		 WHERE category IS NOT NULL AND category != ''
-		   AND COALESCE(hidden, 0) = 0
-		 GROUP BY c
-		 ORDER BY cnt DESC, c ASC`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []CategoryStat
-	for rows.Next() {
-		var s CategoryStat
-		if err := rows.Scan(&s.Category, &s.Count); err != nil {
-			return nil, err
-		}
-		out = append(out, s)
-	}
-	return out, nil
 }
 
 type TagStat struct {
@@ -759,6 +729,29 @@ func (c *Catalog) ListVideosByDrive(ctx context.Context, driveID string) ([]*Vid
 	return out, rows.Err()
 }
 
+// ListVideoMaintenanceCandidates returns all current catalog videos without the
+// public listing dedupe filter. Nightly maintenance needs to see duplicate rows
+// that ListVideos intentionally hides from the frontend.
+func (c *Catalog) ListVideoMaintenanceCandidates(ctx context.Context) ([]*Video, error) {
+	rows, err := c.db.QueryContext(ctx,
+		`SELECT `+allVideoCols+` FROM videos
+		 WHERE COALESCE(hidden, 0) = 0
+		 ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Video
+	for rows.Next() {
+		v, err := scanVideo(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
 func (c *Catalog) ListVideosByIDPrefix(ctx context.Context, prefix string) ([]*Video, error) {
 	prefix = strings.TrimSpace(prefix)
 	if prefix == "" {
@@ -828,21 +821,6 @@ func (c *Catalog) ListVideoFileIDsByDrive(ctx context.Context, driveID string) (
 		out = append(out, fid)
 	}
 	return out, rows.Err()
-}
-
-// ListSpider91Viewkeys 列出某个 spider91 drive 历史上爬过的所有 ID 后缀。
-// 函数名保留历史叫法；新 spider91 数据的后缀是 91 mp4 源 ID，不再是 viewkey。
-//
-// 不能再用 ListVideoFileIDsByDrive：那个只看 drive_id，但 spider91 视频
-// 一旦被 spider91migrate 迁移到 PikPak，drive_id 就变成 PikPak 了。
-//
-// 这里按 video.id 前缀 "spider91-<driveID>-" 查，即使迁移后视频也仍能被
-// 找到——id 本身会保留 "spider91-<driveID>-<sourceID>" 这个来源前缀。
-//
-// 用途：crawler 把这个集合写到 seen 文件，让 Python/Go 跳过已爬过的视频，
-// 配合 --target-new 真正凑出 N 个未爬过的视频。
-func (c *Catalog) ListSpider91Viewkeys(ctx context.Context, driveID string) ([]string, error) {
-	return c.ListCrawlerSourceIDs(ctx, "spider91", driveID)
 }
 
 // ListCrawlerSourceIDs lists source IDs that were already imported by a
@@ -926,10 +904,19 @@ ON CONFLICT(kind, drive_id, source_id) DO UPDATE SET
 	return err
 }
 
-// DeleteVideoWithTombstone records that an administrator explicitly deleted a
-// video, then removes the visible catalog row. The tombstone is used by
-// scanners/crawlers to avoid importing the same source file again.
+const DeletedVideoReasonDuplicate = "duplicate"
+
+// DeleteVideoWithTombstone records that a video was removed, then removes the
+// visible catalog row. The tombstone is used by scanners/crawlers to avoid
+// importing the same source file again.
 func (c *Catalog) DeleteVideoWithTombstone(ctx context.Context, id string) error {
+	return c.DeleteVideoWithTombstoneReason(ctx, id, "")
+}
+
+// DeleteVideoWithTombstoneReason is the same tombstone path with an optional
+// machine reason for admin UI hints. Empty reason means user/admin initiated.
+func (c *Catalog) DeleteVideoWithTombstoneReason(ctx context.Context, id, reason string) error {
+	reason = normalizeDeletedVideoReason(reason)
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -953,7 +940,7 @@ SELECT id, drive_id, file_id, COALESCE(content_hash, ''), COALESCE(file_name, ''
 	}
 	v.ContentHash = normalizeContentHash(v.ContentHash)
 
-	// 先记录这次视频关联的 tag_id，便于事务末尾清理孤儿 collection 标签。
+	// 先记录这次视频关联的 tag_id，便于事务末尾清理旧版本遗留的孤儿 collection 标签。
 	tagIDs, err := collectVideoTagIDs(ctx, tx, id)
 	if err != nil {
 		return err
@@ -961,16 +948,17 @@ SELECT id, drive_id, file_id, COALESCE(content_hash, ''), COALESCE(file_name, ''
 
 	now := time.Now().UnixMilli()
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO deleted_videos (id, drive_id, file_id, content_hash, file_name, size_bytes, deleted_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+INSERT INTO deleted_videos (id, drive_id, file_id, content_hash, file_name, size_bytes, reason, deleted_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
   drive_id     = excluded.drive_id,
   file_id      = excluded.file_id,
   content_hash = excluded.content_hash,
   file_name    = excluded.file_name,
   size_bytes   = excluded.size_bytes,
+  reason       = excluded.reason,
   deleted_at   = excluded.deleted_at`,
-		v.ID, v.DriveID, v.FileID, v.ContentHash, v.FileName, v.Size, now); err != nil {
+		v.ID, v.DriveID, v.FileID, v.ContentHash, v.FileName, v.Size, reason, now); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM video_tags WHERE video_id = ?`, id); err != nil {
@@ -996,7 +984,7 @@ func (c *Catalog) DeleteVideo(ctx context.Context, id string) error {
 	}
 	defer tx.Rollback()
 
-	// 先记录这次视频关联的 tag_id，便于事务末尾清理孤儿 collection 标签
+	// 先记录这次视频关联的 tag_id，便于事务末尾清理旧版本遗留的孤儿 collection 标签。
 	tagIDs, err := collectVideoTagIDs(ctx, tx, id)
 	if err != nil {
 		return err
@@ -1013,7 +1001,7 @@ func (c *Catalog) DeleteVideo(ctx context.Context, id string) error {
 		return sql.ErrNoRows
 	}
 
-	// collection 标签是 scanner 按目录名机器生成的；视频删完后若不再被引用就一起回收。
+	// collection 标签来自旧版本按目录名生成的标签；视频删完后若不再被引用就一起回收。
 	// system / user / auto / legacy 不在此处删除，避免破坏管理员手动维护的标签语义。
 	if err := pruneOrphanCollectionTagsByID(ctx, tx, tagIDs); err != nil {
 		return err
@@ -1030,23 +1018,28 @@ type DeletedVideo struct {
 	FileID    string `json:"fileId"`
 	FileName  string `json:"fileName"`
 	Size      int64  `json:"size"`
+	Reason    string `json:"reason"`
 	DeletedAt int64  `json:"deletedAt"` // unix 毫秒
 }
 
 // ListDeletedVideos 分页列出黑名单视频，按拉黑时间倒序。
-// keyword 非空时按文件名模糊匹配。
-func (c *Catalog) ListDeletedVideos(ctx context.Context, keyword string, page, size int) ([]*DeletedVideo, int, error) {
-	if size <= 0 {
-		size = 50
+// Keyword 非空时按文件名模糊匹配，DriveID 非空时限定来源网盘。
+func (c *Catalog) ListDeletedVideos(ctx context.Context, p ListParams) ([]*DeletedVideo, int, error) {
+	if p.PageSize <= 0 {
+		p.PageSize = 50
 	}
-	if page <= 0 {
-		page = 1
+	if p.Page <= 0 {
+		p.Page = 1
 	}
 	var where []string
 	var args []any
-	if kw := strings.TrimSpace(keyword); kw != "" {
+	if kw := strings.TrimSpace(p.Keyword); kw != "" {
 		where = append(where, "file_name LIKE ?")
 		args = append(args, "%"+kw+"%")
+	}
+	if driveID := strings.TrimSpace(p.DriveID); driveID != "" {
+		where = append(where, "drive_id = ?")
+		args = append(args, driveID)
 	}
 	whereSQL := ""
 	if len(where) > 0 {
@@ -1058,13 +1051,13 @@ func (c *Catalog) ListDeletedVideos(ctx context.Context, keyword string, page, s
 		return nil, 0, err
 	}
 
-	offset := (page - 1) * size
+	offset := (p.Page - 1) * p.PageSize
 	rows, err := c.db.QueryContext(ctx,
-		`SELECT id, COALESCE(drive_id, ''), COALESCE(file_id, ''), COALESCE(file_name, ''), COALESCE(size_bytes, 0), deleted_at
+		`SELECT id, COALESCE(drive_id, ''), COALESCE(file_id, ''), COALESCE(file_name, ''), COALESCE(size_bytes, 0), COALESCE(reason, ''), deleted_at
 		   FROM deleted_videos`+whereSQL+`
 		  ORDER BY deleted_at DESC
 		  LIMIT ? OFFSET ?`,
-		append(args, size, offset)...)
+		append(args, p.PageSize, offset)...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1073,7 +1066,7 @@ func (c *Catalog) ListDeletedVideos(ctx context.Context, keyword string, page, s
 	var out []*DeletedVideo
 	for rows.Next() {
 		v := &DeletedVideo{}
-		if err := rows.Scan(&v.ID, &v.DriveID, &v.FileID, &v.FileName, &v.Size, &v.DeletedAt); err != nil {
+		if err := rows.Scan(&v.ID, &v.DriveID, &v.FileID, &v.FileName, &v.Size, &v.Reason, &v.DeletedAt); err != nil {
 			return nil, 0, err
 		}
 		out = append(out, v)
@@ -1205,6 +1198,73 @@ func (c *Catalog) FindEquivalentVideo(ctx context.Context, source *Video) (*Vide
 		 ORDER BY created_at ASC, id ASC
 		 LIMIT 1`, args...)
 	return scanVideo(row)
+}
+
+// FindVideoBySampledFingerprint returns the earliest visible video with the
+// same file size and sampled fingerprint as source.
+func (c *Catalog) FindVideoBySampledFingerprint(ctx context.Context, source *Video) (*Video, error) {
+	if source == nil || source.Size <= 0 {
+		return nil, sql.ErrNoRows
+	}
+	sampled := normalizeContentHash(source.SampledSHA256)
+	if sampled == "" {
+		return nil, sql.ErrNoRows
+	}
+	row := c.db.QueryRowContext(ctx,
+		`SELECT `+allVideoCols+` FROM videos
+		 WHERE id != ?
+		   AND COALESCE(hidden, 0) = 0
+		   AND COALESCE(file_id, '') != ''
+		   AND size_bytes = ?
+		   AND COALESCE(sampled_sha256, '') != ''
+		   AND sampled_sha256 = ?
+		 ORDER BY created_at ASC, id ASC
+		 LIMIT 1`,
+		source.ID, source.Size, sampled)
+	return scanVideo(row)
+}
+
+// ListNearDuplicateVideoCandidates returns visible videos that are cheap
+// candidates for perceptual duplicate checking: same-ish duration and a ready
+// thumbnail URL. Callers are expected to apply title similarity and image SSIM.
+func (c *Catalog) ListNearDuplicateVideoCandidates(ctx context.Context, source *Video, durationToleranceSeconds, limit int) ([]*Video, error) {
+	if source == nil || strings.TrimSpace(source.Title) == "" || source.DurationSeconds <= 0 {
+		return nil, nil
+	}
+	if durationToleranceSeconds < 0 {
+		durationToleranceSeconds = 0
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+	minDuration := source.DurationSeconds - durationToleranceSeconds
+	if minDuration < 1 {
+		minDuration = 1
+	}
+	maxDuration := source.DurationSeconds + durationToleranceSeconds
+	rows, err := c.db.QueryContext(ctx,
+		`SELECT `+allVideoCols+` FROM videos
+		 WHERE id != ?
+		   AND COALESCE(hidden, 0) = 0
+		   AND COALESCE(file_id, '') != ''
+		   AND COALESCE(thumbnail_url, '') != ''
+		   AND COALESCE(duration_seconds, 0) BETWEEN ? AND ?
+		 ORDER BY ABS(duration_seconds - ?) ASC, created_at ASC, id ASC
+		 LIMIT ?`,
+		source.ID, minDuration, maxDuration, source.DurationSeconds, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Video
+	for rows.Next() {
+		v, err := scanVideo(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
 }
 
 // FindEquivalentVideoOnDrive returns a visible video on driveID that represents
@@ -1370,7 +1430,6 @@ type ListParams struct {
 	Keyword               string
 	DriveID               string
 	Tag                   string
-	Category              string
 	Sort                  string // latest | hot | recent
 	ThumbnailReadyOnly    bool
 	PreferReadyThumbnails bool
@@ -1390,9 +1449,9 @@ func (c *Catalog) ListVideos(ctx context.Context, p ListParams) ([]*Video, int, 
 	var where []string
 	var args []any
 	if p.Keyword != "" {
-		where = append(where, "(title LIKE ? OR author LIKE ?)")
+		where = append(where, "(title LIKE ? OR author LIKE ? OR file_name LIKE ?)")
 		like := "%" + p.Keyword + "%"
-		args = append(args, like, like)
+		args = append(args, like, like, like)
 	}
 	if p.DriveID != "" {
 		where = append(where, "drive_id = ?")
@@ -1401,10 +1460,6 @@ func (c *Catalog) ListVideos(ctx context.Context, p ListParams) ([]*Video, int, 
 	if p.Tag != "" {
 		where = append(where, videoMatchesTagLabelSQL("videos"))
 		args = append(args, p.Tag)
-	}
-	if p.Category != "" && p.Category != "all" {
-		where = append(where, "category = ?")
-		args = append(args, p.Category)
 	}
 	if p.ThumbnailReadyOnly {
 		where = append(where, "COALESCE(thumbnail_url, '') != ''")
@@ -1424,8 +1479,8 @@ func (c *Catalog) ListVideos(ctx context.Context, p ListParams) ([]*Video, int, 
 	orderBy := " ORDER BY " + readyOrderPrefix + "published_at DESC"
 	switch p.Sort {
 	case "hot":
-		// 热度 = 点赞数，点赞相同按最新
-		orderBy = " ORDER BY " + readyOrderPrefix + "likes DESC, published_at DESC"
+		// 热度 = 点赞数；点赞数相同按最近点赞时间，最后用发布时间兜底。
+		orderBy = " ORDER BY " + readyOrderPrefix + "likes DESC, COALESCE(last_liked_at, 0) DESC, published_at DESC"
 	case "recent":
 		orderBy = " ORDER BY " + readyOrderPrefix + "COALESCE(last_viewed_at, 0) DESC, published_at DESC"
 	}
@@ -2019,7 +2074,7 @@ func normalizeDriveRootID(kind, rootID string) string {
 			return "root"
 		}
 		return rootID
-	case "localstorage", "spider91":
+	case "localstorage", "scriptcrawler":
 		return "/"
 	default:
 		if rootID == "" {
@@ -2143,28 +2198,39 @@ func (c *Catalog) SetDriveSkipDirIDs(ctx context.Context, id string, ids []strin
 
 // ---------- Admin session ----------
 
-func (c *Catalog) CreateSession(ctx context.Context, token string, ttl time.Duration) error {
+func (c *Catalog) CreateSession(ctx context.Context, token string, ttl time.Duration, userID int64) error {
 	now := time.Now()
 	_, err := c.db.ExecContext(ctx,
-		`INSERT INTO admin_sessions (token, created_at, expires_at) VALUES (?, ?, ?)`,
-		token, now.UnixMilli(), now.Add(ttl).UnixMilli())
+		`INSERT INTO admin_sessions (token, created_at, expires_at, user_id) VALUES (?, ?, ?, ?)`,
+		token, now.UnixMilli(), now.Add(ttl).UnixMilli(), userID)
 	return err
 }
 
-func (c *Catalog) ValidateSession(ctx context.Context, token string) (bool, error) {
+func (c *Catalog) ValidateSession(ctx context.Context, token string) (bool, int64, error) {
 	var expires int64
-	err := c.db.QueryRowContext(ctx, `SELECT expires_at FROM admin_sessions WHERE token = ?`, token).Scan(&expires)
+	var userID int64
+	err := c.db.QueryRowContext(ctx,
+		`SELECT expires_at, COALESCE(user_id, 0) FROM admin_sessions WHERE token = ?`,
+		token).Scan(&expires, &userID)
 	if err == sql.ErrNoRows {
-		return false, nil
+		return false, 0, nil
 	}
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
-	return time.Now().UnixMilli() < expires, nil
+	return time.Now().UnixMilli() < expires, userID, nil
 }
 
 func (c *Catalog) DeleteSession(ctx context.Context, token string) error {
 	_, err := c.db.ExecContext(ctx, `DELETE FROM admin_sessions WHERE token = ?`, token)
+	return err
+}
+
+func (c *Catalog) DeleteSessionsForUser(ctx context.Context, userID int64) error {
+	if userID <= 0 {
+		return nil
+	}
+	_, err := c.db.ExecContext(ctx, `DELETE FROM admin_sessions WHERE user_id = ?`, userID)
 	return err
 }
 
@@ -2219,11 +2285,11 @@ COALESCE(sampled_sha256, ''), COALESCE(fingerprint_status, 'pending'), COALESCE(
 COALESCE(parent_id, ''), title, COALESCE(author, ''), COALESCE(tags, '[]'),
 duration_seconds, size_bytes, COALESCE(ext, ''), COALESCE(quality, ''), COALESCE(thumbnail_url, ''),
 COALESCE(preview_file_id, ''), COALESCE(preview_local, ''), COALESCE(preview_status, 'pending'),
-COALESCE(transcode_status, ''), COALESCE(transcode_error, ''), COALESCE(transcoded_file_id, ''), COALESCE(transcoded_size, 0),
-views, COALESCE(last_viewed_at, 0), favorites, comments, likes, dislikes,
-COALESCE(category, ''), COALESCE(hidden, 0), COALESCE(badges, '[]'), COALESCE(description, ''),
-published_at, created_at, updated_at
-`
+	COALESCE(transcode_status, ''), COALESCE(transcode_error, ''), COALESCE(transcoded_file_id, ''), COALESCE(transcoded_size, 0),
+	views, COALESCE(last_viewed_at, 0), favorites, comments, likes, COALESCE(last_liked_at, 0), dislikes,
+	COALESCE(hidden, 0), COALESCE(badges, '[]'), COALESCE(description, ''),
+	published_at, created_at, updated_at
+	`
 
 const activeDriveWhereSQL = `(videos.drive_id = 'local-upload'
 	OR EXISTS (
@@ -2283,7 +2349,7 @@ type rowScanner interface {
 func scanVideo(row rowScanner) (*Video, error) {
 	v := &Video{}
 	var tagsJSON, badgesJSON string
-	var publishedAt, createdAt, updatedAt, lastViewedAt int64
+	var publishedAt, createdAt, updatedAt, lastViewedAt, lastLikedAt int64
 	var hidden int
 	err := row.Scan(
 		&v.ID, &v.DriveID, &v.FileID, &v.FileName, &v.ContentHash,
@@ -2292,8 +2358,8 @@ func scanVideo(row rowScanner) (*Video, error) {
 		&v.DurationSeconds, &v.Size, &v.Ext, &v.Quality, &v.ThumbnailURL,
 		&v.PreviewFileID, &v.PreviewLocal, &v.PreviewStatus,
 		&v.TranscodeStatus, &v.TranscodeError, &v.TranscodedFileID, &v.TranscodedSize,
-		&v.Views, &lastViewedAt, &v.Favorites, &v.Comments, &v.Likes, &v.Dislikes,
-		&v.Category, &hidden, &badgesJSON, &v.Description,
+		&v.Views, &lastViewedAt, &v.Favorites, &v.Comments, &v.Likes, &lastLikedAt, &v.Dislikes,
+		&hidden, &badgesJSON, &v.Description,
 		&publishedAt, &createdAt, &updatedAt,
 	)
 	if err != nil {
@@ -2308,11 +2374,23 @@ func scanVideo(row rowScanner) (*Video, error) {
 	if lastViewedAt > 0 {
 		v.LastViewedAt = time.UnixMilli(lastViewedAt)
 	}
+	if lastLikedAt > 0 {
+		v.LastLikedAt = time.UnixMilli(lastLikedAt)
+	}
 	return v, nil
 }
 
 func normalizeContentHash(hash string) string {
 	return strings.ToLower(strings.TrimSpace(hash))
+}
+
+func normalizeDeletedVideoReason(reason string) string {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case DeletedVideoReasonDuplicate:
+		return DeletedVideoReasonDuplicate
+	default:
+		return ""
+	}
 }
 
 func unixMilliOrZero(t time.Time) int64 {

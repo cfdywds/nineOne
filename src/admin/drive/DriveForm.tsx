@@ -3,17 +3,14 @@ import { ArrowLeft, ChevronDown } from "lucide-react";
 import { P123QRCodeLogin } from "./P123QRCodeLogin";
 import { WopanQRCodeLogin } from "./WopanQRCodeLogin";
 import { GuangYaPanQRCodeLogin } from "./GuangYaPanQRCodeLogin";
-import { Spider91UploadTargetField } from "./Spider91UploadTargetField";
 import {
   FormState,
   Kind,
   credentialFields,
   credentialHelp,
-  isSpiderCrawlerKind,
   usesRootDirectoryID,
   rootIdPlaceholder,
 } from "./constants";
-import * as api from "../api";
 
 type DriveOption = {
   kind: Kind;
@@ -30,7 +27,6 @@ const DRIVE_OPTIONS: DriveOption[] = [
   { kind: "onedrive", label: "OneDrive", abbr: "OD", desc: "302直链，微软网盘" },
   { kind: "googledrive", label: "Google Drive", abbr: "GD", desc: "服务器中转模式" },
   { kind: "localstorage", label: "本地存储", abbr: "Lo", desc: "本机文件目录" },
-  { kind: "spiderxvideos", label: "XVideos Spider", abbr: "XV", desc: "按规则抓取 XVideos" },
   { kind: "quark", label: "夸克网盘", abbr: "Qk", desc: "302直链" },
   { kind: "wopan", label: "联通网盘", abbr: "Wo", desc: "302直链" },
 ];
@@ -39,7 +35,6 @@ export function DriveForm({
   form,
   onChange,
   isEdit,
-  uploadTargets,
   nameError,
   onNameBlur,
   onBack,
@@ -47,7 +42,6 @@ export function DriveForm({
   form: FormState;
   onChange: (f: FormState) => void;
   isEdit: boolean;
-  uploadTargets: api.AdminDrive[];
   nameError?: string;
   onNameBlur?: () => void;
   onBack?: () => void;
@@ -266,17 +260,6 @@ export function DriveForm({
               {f.help && <div className="admin-form__help">{f.help}</div>}
             </div>
           ))}
-        </div>
-      )}
-
-      {isSpiderCrawlerKind(form.kind) && (
-        <div className="admin-form__section">
-          <h3 className="admin-form__section-label">上传设置</h3>
-          <Spider91UploadTargetField
-            value={form.spider91UploadDriveId}
-            onChange={(v) => set("spider91UploadDriveId", v)}
-            uploadTargets={uploadTargets}
-          />
         </div>
       )}
     </div>

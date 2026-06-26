@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// TestListVideoFileIDsByDrive 校验 spider91 crawler 用到的轻量 file_id 查询：
+// TestListVideoFileIDsByDrive 校验上传 worker 用到的轻量 file_id 查询：
 // - 只返回指定 drive 的 file_id；不返回其它 drive 的
 // - 跳过 file_id 为空的视频
 // - 返回顺序无要求，但每个 file_id 只出现一次
@@ -33,20 +33,20 @@ func TestListVideoFileIDsByDrive(t *testing.T) {
 		}
 	}
 
-	insert("spider91-A-vk001", "spider-a", "vk001.mp4")
-	insert("spider91-A-vk002", "spider-a", "vk002.flv")
-	insert("spider91-A-vk003", "spider-a", "vk003.mp4")
+	insert("scriptcrawler-A-source001", "crawler-a", "source001.mp4")
+	insert("scriptcrawler-A-source002", "crawler-a", "source002.flv")
+	insert("scriptcrawler-A-source003", "crawler-a", "source003.mp4")
 	// 不同 drive 的视频不应出现
 	insert("quark-other-fid", "drive-quark", "abcdef")
 	// 空 file_id 应被过滤
-	insert("spider91-A-empty", "spider-a", "")
+	insert("scriptcrawler-A-empty", "crawler-a", "")
 
-	got, err := cat.ListVideoFileIDsByDrive(ctx, "spider-a")
+	got, err := cat.ListVideoFileIDsByDrive(ctx, "crawler-a")
 	if err != nil {
 		t.Fatalf("ListVideoFileIDsByDrive: %v", err)
 	}
 	sort.Strings(got)
-	want := []string{"vk001.mp4", "vk002.flv", "vk003.mp4"}
+	want := []string{"source001.mp4", "source002.flv", "source003.mp4"}
 	sort.Strings(want)
 	if len(got) != len(want) {
 		t.Fatalf("got %d ids, want %d: got=%v", len(got), len(want), got)
@@ -67,11 +67,11 @@ func TestListVideoFileIDsByDrive(t *testing.T) {
 	}
 }
 
-// TestListSpider91ViewkeysFindsMigratedVideos 校验：即使 spider91 视频
-// 被迁移到 PikPak（drive_id 改了），ListSpider91Viewkeys 仍能通过 video.id
-// 前缀找到这些 viewkey。这是 crawler 写 seen 文件的关键不变量，
-// 否则下一次爬取会把已爬过的 viewkey 当作"新"的再爬一遍。
-func TestListSpider91ViewkeysFindsMigratedVideos(t *testing.T) {
+// TestListCrawlerSourceIDsFindsMigratedVideos 校验：即使爬虫视频被上传迁移
+// 到目标网盘（drive_id 改了），ListCrawlerSourceIDs 仍能通过 video.id 前缀
+// 找到这些 source_id。这是 crawler 写 seen 文件的关键不变量，否则下一次
+// 爬取会把已爬过的 source_id 当作"新"的再爬一遍。
+func TestListCrawlerSourceIDsFindsMigratedVideos(t *testing.T) {
 	ctx := context.Background()
 	cat, err := Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -92,25 +92,25 @@ func TestListSpider91ViewkeysFindsMigratedVideos(t *testing.T) {
 		}
 	}
 
-	// 1) 仍在 spider91 drive 下的视频（未迁移）
-	insert("spider91-91Spider-vk001", "91Spider", "vk001.mp4")
-	// 2) 已迁移到 PikPak 的视频：drive_id 变了，但 id 仍是 spider91-91Spider-...
-	insert("spider91-91Spider-vk002", "PikPak", "PIKPAK-FILE-ID-2")
-	insert("spider91-91Spider-vk003", "PikPak", "PIKPAK-FILE-ID-3")
-	// 3) 别的 spider91 drive 的视频，不应混进来
-	insert("spider91-OtherDrive-vk999", "OtherDrive", "vk999.mp4")
+	// 1) 仍在本地爬虫 drive 下的视频（未上传）
+	insert("scriptcrawler-crawler-a-source001", "crawler-a", "source001.mp4")
+	// 2) 已上传到目标盘的视频：drive_id 变了，但 id 仍保留 crawler 来源前缀。
+	insert("scriptcrawler-crawler-a-source002", "target-drive", "TARGET-FILE-ID-2")
+	insert("scriptcrawler-crawler-a-source003", "target-drive", "TARGET-FILE-ID-3")
+	// 3) 别的爬虫 drive 的视频，不应混进来
+	insert("scriptcrawler-other-source999", "other-crawler", "source999.mp4")
 	// 4) 完全无关的视频
 	insert("quark-some-fid", "drive-quark", "abc")
 
-	got, err := cat.ListSpider91Viewkeys(ctx, "91Spider")
+	got, err := cat.ListCrawlerSourceIDs(ctx, "scriptcrawler", "crawler-a")
 	if err != nil {
-		t.Fatalf("ListSpider91Viewkeys: %v", err)
+		t.Fatalf("ListCrawlerSourceIDs: %v", err)
 	}
 	sort.Strings(got)
-	want := []string{"vk001", "vk002", "vk003"}
+	want := []string{"source001", "source002", "source003"}
 	sort.Strings(want)
 	if len(got) != len(want) {
-		t.Fatalf("got %d viewkeys, want %d: got=%v", len(got), len(want), got)
+		t.Fatalf("got %d source ids, want %d: got=%v", len(got), len(want), got)
 	}
 	for i := range got {
 		if got[i] != want[i] {
@@ -119,9 +119,9 @@ func TestListSpider91ViewkeysFindsMigratedVideos(t *testing.T) {
 	}
 
 	// 不存在的 drive 返回空列表
-	other, err := cat.ListSpider91Viewkeys(ctx, "no-such-drive")
+	other, err := cat.ListCrawlerSourceIDs(ctx, "scriptcrawler", "no-such-drive")
 	if err != nil {
-		t.Fatalf("ListSpider91Viewkeys empty: %v", err)
+		t.Fatalf("ListCrawlerSourceIDs empty: %v", err)
 	}
 	if len(other) != 0 {
 		t.Fatalf("non-existent drive: got %v, want empty", other)
@@ -138,12 +138,12 @@ func TestDeleteVideoWithTombstonePreventsReimport(t *testing.T) {
 
 	now := time.Now()
 	if err := cat.UpsertVideo(ctx, &Video{
-		ID:            "spider91-91Spider-vk004",
-		DriveID:       "91Spider",
-		FileID:        "vk004.mp4",
-		FileName:      "vk004.mp4",
+		ID:            "scriptcrawler-crawler-a-source004",
+		DriveID:       "crawler-a",
+		FileID:        "source004.mp4",
+		FileName:      "source004.mp4",
 		ContentHash:   "ABCDEF",
-		Title:         "Deleted Spider",
+		Title:         "Deleted Source",
 		Size:          2048,
 		PreviewStatus: "ready",
 		PublishedAt:   now,
@@ -153,24 +153,24 @@ func TestDeleteVideoWithTombstonePreventsReimport(t *testing.T) {
 		t.Fatalf("upsert: %v", err)
 	}
 
-	if err := cat.DeleteVideoWithTombstone(ctx, "spider91-91Spider-vk004"); err != nil {
+	if err := cat.DeleteVideoWithTombstone(ctx, "scriptcrawler-crawler-a-source004"); err != nil {
 		t.Fatalf("delete with tombstone: %v", err)
 	}
-	if _, err := cat.GetVideo(ctx, "spider91-91Spider-vk004"); err != sql.ErrNoRows {
+	if _, err := cat.GetVideo(ctx, "scriptcrawler-crawler-a-source004"); err != sql.ErrNoRows {
 		t.Fatalf("get deleted video error = %v, want sql.ErrNoRows", err)
 	}
-	deleted, err := cat.IsDeletedVideoCandidate(ctx, "spider91-91Spider-vk004", "91Spider", "vk004.mp4", "abcdef", "vk004.mp4", 2048)
+	deleted, err := cat.IsDeletedVideoCandidate(ctx, "scriptcrawler-crawler-a-source004", "crawler-a", "source004.mp4", "abcdef", "source004.mp4", 2048)
 	if err != nil {
 		t.Fatalf("check deleted candidate: %v", err)
 	}
 	if !deleted {
 		t.Fatal("deleted candidate was not recognized")
 	}
-	viewkeys, err := cat.ListSpider91Viewkeys(ctx, "91Spider")
+	sourceIDs, err := cat.ListCrawlerSourceIDs(ctx, "scriptcrawler", "crawler-a")
 	if err != nil {
-		t.Fatalf("ListSpider91Viewkeys: %v", err)
+		t.Fatalf("ListCrawlerSourceIDs: %v", err)
 	}
-	if len(viewkeys) != 1 || viewkeys[0] != "vk004" {
-		t.Fatalf("viewkeys = %#v, want [vk004]", viewkeys)
+	if len(sourceIDs) != 1 || sourceIDs[0] != "source004" {
+		t.Fatalf("source ids = %#v, want [source004]", sourceIDs)
 	}
 }

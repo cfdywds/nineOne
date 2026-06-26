@@ -3,8 +3,6 @@ package api
 import (
 	"context"
 	crand "crypto/rand"
-	"crypto/sha256"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -15,9 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,8 +25,6 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/drives/localstorage"
 	"github.com/video-site/backend/internal/drives/localupload"
-	"github.com/video-site/backend/internal/drives/spider91"
-	"github.com/video-site/backend/internal/drives/spiderxvideos"
 	"github.com/video-site/backend/internal/mediaasset"
 	"github.com/video-site/backend/internal/proxy"
 )
@@ -69,8 +63,6 @@ type Server struct {
 	tagCacheUntil time.Time
 	tagCache      []TagDTO
 
-	progressHub *ProgressHub
-
 	// GetTheme 返回当前生效的主题（"dark" | "pink" | "sky"）。前台 /api/settings/theme 用，
 	// 不需要登录。无注入时返回 "dark"。
 	GetTheme func() string
@@ -101,7 +93,6 @@ type VideoDTO struct {
 	Dislikes        int      `json:"dislikes"`
 	PublishedAt     string   `json:"publishedAt"`
 	Tags            []string `json:"tags,omitempty"`
-	Category        string   `json:"category,omitempty"`
 }
 
 type TagDTO struct {
@@ -139,35 +130,33 @@ type Comment struct {
 
 // RegisterRoutes 挂载前台 REST 路由。前台接口需要登录态。
 func (s *Server) RegisterRoutes(r chi.Router, a *auth.Authenticator) {
-	s.ensureProgressHub()
 	// 公开端点：拿当前生效的主题。登录页本身要在挂前就能读，所以单独挂在
 	// 鉴权组之外。只暴露 theme 一个字段，避免泄露其他设置。
 	r.Get("/api/settings/theme", s.handleGetTheme)
-	r.Get("/api/import/progress/{sessionID}", s.handleImportProgress)
 
 	r.Group(func(r chi.Router) {
 		r.Use(a.Required)
 		r.Get("/api/home", s.handleHome)
 		r.Get("/api/list", s.handleList)
 		r.Get("/api/video/{id}", s.handleVideoDetail)
-		r.Put("/api/video/{id}/tags", s.handleUpdateVideoTags)
 		r.Post("/api/video/{id}/like", s.handleLike)
 		r.Delete("/api/video/{id}/like", s.handleUnlike)
 		r.Post("/api/video/{id}/view", s.handleView)
-		r.Post("/api/video/{id}/hide", s.handleHideVideo)
-		r.Post("/api/upload", s.handleUploadVideo)
-		r.Post("/api/import/remote", s.handleImportRemoteVideo)
-		r.Post("/api/import/remote/batch", s.handleImportRemoteVideoBatch)
 		r.Get("/api/tags", s.handleTags)
 		r.Post("/api/shorts/next", s.handleShortsNext)
 
 		// 代理路由同样需要鉴权，防止绕过
 		r.Get("/p/stream/{driveID}/*", s.handleStream)
 		r.Get("/p/upload/{videoID}", s.handleUploadedVideo)
-		r.Get("/p/spider91/{videoID}", s.handleSpider91Video)
-		r.Get("/p/spiderxvideos/{videoID}", s.handleSpiderXVideosVideo)
 		r.Get("/p/preview/{videoID}", s.handlePreview)
 		r.Get("/p/thumb/{videoID}", s.handleThumb)
+	})
+
+	r.Group(func(r chi.Router) {
+		r.Use(a.AdminRequired)
+		r.Put("/api/video/{id}/tags", s.handleUpdateVideoTags)
+		r.Post("/api/video/{id}/hide", s.handleHideVideo)
+		r.Post("/api/upload", s.handleUploadVideo)
 	})
 }
 
@@ -307,7 +296,6 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	params := catalog.ListParams{
 		Keyword:   q.Get("q"),
 		Tag:       q.Get("tag"),
-		Category:  q.Get("cat"),
 		Sort:      sort,
 		Page:      page,
 		PageSize:  size,
@@ -819,713 +807,6 @@ func (s *Server) handleUploadVideo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, mapVideo(video))
 }
 
-type remoteImportReq struct {
-	SourceSite      string   `json:"sourceSite"`
-	PageURL         string   `json:"pageUrl"`
-	VideoURL        string   `json:"videoUrl"`
-	Title           string   `json:"title"`
-	ThumbnailURL    string   `json:"thumbnailUrl"`
-	Quality         string   `json:"quality"`
-	DurationSeconds int      `json:"durationSeconds"`
-	Referer         string   `json:"referer"`
-	Cookie          string   `json:"cookie"`
-	Tags            []string `json:"tags"`
-}
-
-type remoteImportSite struct {
-	ID     string
-	Label  string
-	Author string
-}
-
-var remoteImportSites = map[string]remoteImportSite{
-	"xvideos":     {ID: "xvideos", Label: "XVideos", Author: "XVideos 导入"},
-	"xvideos.com": {ID: "xvideos", Label: "XVideos", Author: "XVideos 导入"},
-	"pornhub":     {ID: "pornhub", Label: "Pornhub", Author: "Pornhub 导入"},
-	"pornhub.com": {ID: "pornhub", Label: "Pornhub", Author: "Pornhub 导入"},
-}
-
-type batchRemoteImportReq struct {
-	Videos []remoteImportReq `json:"videos"`
-}
-
-type batchRemoteImportResp struct {
-	Status        string                    `json:"status"`
-	SessionID     string                    `json:"sessionId"`
-	ProgressToken string                    `json:"progressToken"`
-	Results       []batchRemoteImportResult `json:"results"`
-}
-
-type batchRemoteImportResult struct {
-	Index  int    `json:"index"`
-	ID     string `json:"id"`
-	Href   string `json:"href"`
-	Status string `json:"status"`
-	Error  string `json:"error,omitempty"`
-}
-
-func (s *Server) handleImportRemoteVideo(w http.ResponseWriter, r *http.Request) {
-	if s.LocalDir == "" {
-		writeErr(w, http.StatusInternalServerError, errors.New("local storage is not configured"))
-		return
-	}
-	var body remoteImportReq
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	site, err := resolveRemoteImportSite(body.SourceSite, body.PageURL)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	videoURL, err := parseRemoteImportURL("videoUrl", body.VideoURL, true)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := validateRemoteImportVideoURL(site, videoURL); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	pageURL, err := parseRemoteImportURL("pageUrl", body.PageURL, true)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	thumbURL, err := parseRemoteImportURL("thumbnailUrl", body.ThumbnailURL, false)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	thumbURLString := ""
-	if thumbURL != nil {
-		thumbURLString = thumbURL.String()
-	}
-	referer := strings.TrimSpace(body.Referer)
-	if referer == "" {
-		referer = pageURL.String()
-	}
-
-	now := time.Now()
-	title := strings.TrimSpace(body.Title)
-	if title == "" {
-		title = fallbackRemoteImportTitle(site.ID, pageURL)
-	}
-
-	uploadID, err := newUploadID(now)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	videoID := localUploadDriveID + "-" + uploadID
-	writeJSON(w, http.StatusAccepted, map[string]string{
-		"status": "accepted",
-		"id":     videoID,
-		"href":   "/video/" + videoID,
-	})
-
-	go s.importRemoteVideo(context.Background(), remoteImportJob{
-		Site:            site,
-		VideoURL:        videoURL,
-		PageURL:         pageURL,
-		ThumbnailURL:    thumbURLString,
-		Referer:         referer,
-		Cookie:          strings.TrimSpace(body.Cookie),
-		UploadID:        uploadID,
-		VideoID:         videoID,
-		Title:           title,
-		Quality:         strings.TrimSpace(body.Quality),
-		DurationSeconds: body.DurationSeconds,
-		Tags:            append([]string(nil), body.Tags...),
-		Now:             now,
-	})
-}
-
-func (s *Server) handleImportRemoteVideoBatch(w http.ResponseWriter, r *http.Request) {
-	if s.LocalDir == "" {
-		writeErr(w, http.StatusInternalServerError, errors.New("local storage is not configured"))
-		return
-	}
-
-	var body batchRemoteImportReq
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-
-	const maxBatchSize = 50
-	if len(body.Videos) == 0 {
-		writeErr(w, http.StatusBadRequest, errors.New("empty batch"))
-		return
-	}
-	if len(body.Videos) > maxBatchSize {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("batch size exceeds limit: %d > %d", len(body.Videos), maxBatchSize))
-		return
-	}
-
-	now := time.Now()
-	sessionID := fmt.Sprintf("import-%d-%d", now.Unix(), rand.IntN(10000))
-	progressToken, err := newImportProgressToken()
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	hub := s.ensureProgressHub()
-	hub.SetProgressToken(sessionID, progressToken)
-	results := make([]batchRemoteImportResult, len(body.Videos))
-
-	for i, videoReq := range body.Videos {
-		result := &results[i]
-		result.Index = i
-
-		site, err := resolveRemoteImportSite(videoReq.SourceSite, videoReq.PageURL)
-		if err != nil {
-			result.Status = "error"
-			result.Error = err.Error()
-			continue
-		}
-
-		videoURL, err := parseRemoteImportURL("videoUrl", videoReq.VideoURL, true)
-		if err != nil {
-			result.Status = "error"
-			result.Error = err.Error()
-			continue
-		}
-		if err := validateRemoteImportVideoURL(site, videoURL); err != nil {
-			result.Status = "error"
-			result.Error = err.Error()
-			continue
-		}
-
-		pageURL, err := parseRemoteImportURL("pageUrl", videoReq.PageURL, true)
-		if err != nil {
-			result.Status = "error"
-			result.Error = err.Error()
-			continue
-		}
-
-		thumbURL, err := parseRemoteImportURL("thumbnailUrl", videoReq.ThumbnailURL, false)
-		if err != nil {
-			result.Status = "error"
-			result.Error = err.Error()
-			continue
-		}
-
-		thumbURLString := ""
-		if thumbURL != nil {
-			thumbURLString = thumbURL.String()
-		}
-
-		referer := strings.TrimSpace(videoReq.Referer)
-		if referer == "" {
-			referer = pageURL.String()
-		}
-
-		title := strings.TrimSpace(videoReq.Title)
-		if title == "" {
-			title = fallbackRemoteImportTitle(site.ID, pageURL)
-		}
-
-		uploadID, err := newUploadID(now)
-		if err != nil {
-			result.Status = "error"
-			result.Error = err.Error()
-			continue
-		}
-
-		videoID := localUploadDriveID + "-" + uploadID
-		result.ID = videoID
-		result.Href = "/video/" + videoID
-		result.Status = "accepted"
-
-		hub.Publish(ImportProgressEvent{
-			SessionID: sessionID,
-			Index:     i,
-			VideoID:   videoID,
-			Status:    "queued",
-			Progress:  0,
-			Message:   "已加入下载队列",
-		})
-
-		go s.importRemoteVideoWithProgress(context.Background(), remoteImportJob{
-			Site:            site,
-			VideoURL:        videoURL,
-			PageURL:         pageURL,
-			ThumbnailURL:    thumbURLString,
-			Referer:         referer,
-			Cookie:          strings.TrimSpace(videoReq.Cookie),
-			UploadID:        uploadID,
-			VideoID:         videoID,
-			Title:           title,
-			Quality:         strings.TrimSpace(videoReq.Quality),
-			DurationSeconds: videoReq.DurationSeconds,
-			Tags:            append([]string(nil), videoReq.Tags...),
-			Now:             now,
-		}, sessionID, i)
-	}
-
-	writeJSON(w, http.StatusAccepted, batchRemoteImportResp{
-		Status:        "accepted",
-		SessionID:     sessionID,
-		ProgressToken: progressToken,
-		Results:       results,
-	})
-}
-
-func (s *Server) handleImportProgress(w http.ResponseWriter, r *http.Request) {
-	setImportProgressCORSHeaders(w, r)
-	sessionID := chi.URLParam(r, "sessionID")
-	if sessionID == "" {
-		writeErr(w, http.StatusBadRequest, errors.New("missing sessionID"))
-		return
-	}
-	hub := s.ensureProgressHub()
-	if !hub.ValidProgressToken(sessionID, r.URL.Query().Get("token")) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeErr(w, http.StatusInternalServerError, errors.New("streaming not supported"))
-		return
-	}
-
-	ch := hub.Subscribe(sessionID)
-	defer hub.Unsubscribe(sessionID, ch)
-
-	ctx := r.Context()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case event, ok := <-ch:
-			if !ok {
-				return
-			}
-			data, _ := json.Marshal(event)
-			fmt.Fprintf(w, "data: %s\n\n", data)
-			flusher.Flush()
-		}
-	}
-}
-
-func setImportProgressCORSHeaders(w http.ResponseWriter, r *http.Request) {
-	if origin := r.Header.Get("Origin"); origin != "" {
-		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
-		w.Header().Add("Vary", "Origin")
-	} else {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-	}
-}
-
-type remoteImportJob struct {
-	Site            remoteImportSite
-	VideoURL        *url.URL
-	PageURL         *url.URL
-	ThumbnailURL    string
-	Referer         string
-	Cookie          string
-	UploadID        string
-	VideoID         string
-	Title           string
-	Quality         string
-	DurationSeconds int
-	Tags            []string
-	Now             time.Time
-}
-
-func (s *Server) importRemoteVideo(ctx context.Context, job remoteImportJob) {
-	downloaded, err := s.downloadRemoteImport(ctx, job.UploadID, job.VideoURL, job.Referer, job.Cookie, nil)
-	if err != nil {
-		return
-	}
-
-	originalName := "[" + job.Site.Label + "] " + sanitizeImportFileName(job.Title) + downloaded.Ext
-	video := &catalog.Video{
-		ID:              job.VideoID,
-		DriveID:         localUploadDriveID,
-		FileID:          downloaded.StoredName,
-		FileName:        originalName,
-		ContentHash:     downloaded.ContentHash,
-		Title:           job.Title,
-		Author:          job.Site.Author,
-		Tags:            remoteImportTags(job.Site.ID, job.Tags),
-		DurationSeconds: job.DurationSeconds,
-		Size:            downloaded.Size,
-		Ext:             strings.TrimPrefix(downloaded.Ext, "."),
-		Quality:         job.Quality,
-		ThumbnailURL:    job.ThumbnailURL,
-		PreviewStatus:   "pending",
-		Description:     remoteImportDescription(job.Site, job.PageURL.String(), job.VideoURL.String()),
-		PublishedAt:     job.Now,
-		CreatedAt:       job.Now,
-		UpdatedAt:       job.Now,
-	}
-	if err := s.Catalog.UpsertVideo(ctx, video); err != nil {
-		_ = os.Remove(downloaded.Path)
-		return
-	}
-	if s.OnVideoUploaded != nil {
-		s.OnVideoUploaded(video)
-	}
-}
-
-func (s *Server) importRemoteVideoWithProgress(ctx context.Context, job remoteImportJob, sessionID string, index int) {
-	lastDownloadProgress := 10
-	s.ensureProgressHub().Publish(ImportProgressEvent{
-		SessionID: sessionID,
-		Index:     index,
-		VideoID:   job.VideoID,
-		Status:    "downloading",
-		Progress:  10,
-		Message:   "正在下载视频...",
-	})
-
-	downloaded, err := s.downloadRemoteImport(ctx, job.UploadID, job.VideoURL, job.Referer, job.Cookie, func(downloadedBytes, totalBytes int64) {
-		progress := remoteImportDownloadProgressPercent(downloadedBytes, totalBytes)
-		if progress <= lastDownloadProgress {
-			return
-		}
-		lastDownloadProgress = progress
-		s.ensureProgressHub().Publish(ImportProgressEvent{
-			SessionID: sessionID,
-			Index:     index,
-			VideoID:   job.VideoID,
-			Status:    "downloading",
-			Progress:  progress,
-			Message:   fmt.Sprintf("正在下载视频... %d%%", progress),
-		})
-	})
-	if err != nil {
-		s.ensureProgressHub().Publish(ImportProgressEvent{
-			SessionID: sessionID,
-			Index:     index,
-			VideoID:   job.VideoID,
-			Status:    "error",
-			Progress:  0,
-			Error:     err.Error(),
-		})
-		return
-	}
-
-	s.ensureProgressHub().Publish(ImportProgressEvent{
-		SessionID: sessionID,
-		Index:     index,
-		VideoID:   job.VideoID,
-		Status:    "saving",
-		Progress:  80,
-		Message:   "正在保存到数据库...",
-	})
-
-	originalName := "[" + job.Site.Label + "] " + sanitizeImportFileName(job.Title) + downloaded.Ext
-	video := &catalog.Video{
-		ID:              job.VideoID,
-		DriveID:         localUploadDriveID,
-		FileID:          downloaded.StoredName,
-		FileName:        originalName,
-		ContentHash:     downloaded.ContentHash,
-		Title:           job.Title,
-		Author:          job.Site.Author,
-		Tags:            remoteImportTags(job.Site.ID, job.Tags),
-		DurationSeconds: job.DurationSeconds,
-		Size:            downloaded.Size,
-		Ext:             strings.TrimPrefix(downloaded.Ext, "."),
-		Quality:         job.Quality,
-		ThumbnailURL:    job.ThumbnailURL,
-		PreviewStatus:   "pending",
-		Description:     remoteImportDescription(job.Site, job.PageURL.String(), job.VideoURL.String()),
-		PublishedAt:     job.Now,
-		CreatedAt:       job.Now,
-		UpdatedAt:       job.Now,
-	}
-	if err := s.Catalog.UpsertVideo(ctx, video); err != nil {
-		_ = os.Remove(downloaded.Path)
-		s.ensureProgressHub().Publish(ImportProgressEvent{
-			SessionID: sessionID,
-			Index:     index,
-			VideoID:   job.VideoID,
-			Status:    "error",
-			Progress:  0,
-			Error:     err.Error(),
-		})
-		return
-	}
-
-	s.ensureProgressHub().Publish(ImportProgressEvent{
-		SessionID: sessionID,
-		Index:     index,
-		VideoID:   job.VideoID,
-		Status:    "completed",
-		Progress:  100,
-		Message:   "导入成功",
-	})
-
-	if s.OnVideoUploaded != nil {
-		s.OnVideoUploaded(video)
-	}
-}
-
-type remoteImportDownload struct {
-	StoredName  string
-	Path        string
-	Ext         string
-	Size        int64
-	ContentHash string
-}
-
-func (s *Server) downloadRemoteImport(ctx context.Context, uploadID string, videoURL *url.URL, referer, cookie string, onProgress func(downloadedBytes, totalBytes int64)) (remoteImportDownload, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, videoURL.String(), nil)
-	if err != nil {
-		return remoteImportDownload{}, err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36")
-	if referer != "" {
-		req.Header.Set("Referer", referer)
-	}
-	if cookie != "" {
-		req.Header.Set("Cookie", cookie)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return remoteImportDownload{}, fmt.Errorf("download remote video: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return remoteImportDownload{}, fmt.Errorf("download remote video: HTTP %d", resp.StatusCode)
-	}
-	ext := remoteImportExtension(videoURL, resp.Header.Get("Content-Type"))
-	if _, ok := allowedUploadExtensions[ext]; !ok {
-		return remoteImportDownload{}, fmt.Errorf("unsupported video extension: %s", ext)
-	}
-
-	storedName := uploadID + ext
-	dst, err := s.localUploadFilePath(storedName)
-	if err != nil {
-		return remoteImportDownload{}, err
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return remoteImportDownload{}, err
-	}
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		return remoteImportDownload{}, err
-	}
-	hasher := sha256.New()
-	var body io.Reader = resp.Body
-	if onProgress != nil {
-		body = &remoteImportProgressReader{
-			reader:     resp.Body,
-			totalBytes: resp.ContentLength,
-			onProgress: onProgress,
-		}
-	}
-	size, copyErr := io.Copy(io.MultiWriter(out, hasher), body)
-	closeErr := out.Close()
-	if copyErr != nil {
-		_ = os.Remove(dst)
-		return remoteImportDownload{}, copyErr
-	}
-	if closeErr != nil {
-		_ = os.Remove(dst)
-		return remoteImportDownload{}, closeErr
-	}
-	if size <= 0 {
-		_ = os.Remove(dst)
-		return remoteImportDownload{}, errors.New("downloaded video is empty")
-	}
-	return remoteImportDownload{
-		StoredName:  storedName,
-		Path:        dst,
-		Ext:         ext,
-		Size:        size,
-		ContentHash: hex.EncodeToString(hasher.Sum(nil)),
-	}, nil
-}
-
-type remoteImportProgressReader struct {
-	reader          io.Reader
-	totalBytes      int64
-	downloadedBytes int64
-	onProgress      func(downloadedBytes, totalBytes int64)
-}
-
-func (r *remoteImportProgressReader) Read(p []byte) (int, error) {
-	n, err := r.reader.Read(p)
-	if n > 0 {
-		r.downloadedBytes += int64(n)
-		r.onProgress(r.downloadedBytes, r.totalBytes)
-	}
-	return n, err
-}
-
-func remoteImportDownloadProgressPercent(downloadedBytes, totalBytes int64) int {
-	if downloadedBytes <= 0 || totalBytes <= 0 {
-		return 10
-	}
-	progress := 10 + int(downloadedBytes*70/totalBytes)
-	if progress < 11 {
-		return 11
-	}
-	if progress > 79 {
-		return 79
-	}
-	return progress
-}
-
-func resolveRemoteImportSite(rawSite, rawPageURL string) (remoteImportSite, error) {
-	site := strings.ToLower(strings.TrimSpace(rawSite))
-	site = strings.TrimPrefix(site, "www.")
-	if info, ok := remoteImportSites[site]; ok {
-		return info, nil
-	}
-	if rawPageURL != "" {
-		if parsed, err := url.Parse(rawPageURL); err == nil {
-			host := strings.ToLower(strings.TrimPrefix(parsed.Hostname(), "www."))
-			switch {
-			case host == "xvideos.com" || strings.HasSuffix(host, ".xvideos.com"):
-				return remoteImportSites["xvideos"], nil
-			case host == "pornhub.com" || strings.HasSuffix(host, ".pornhub.com"):
-				return remoteImportSites["pornhub"], nil
-			}
-		}
-	}
-	return remoteImportSite{}, fmt.Errorf("unsupported source site: %s", strings.TrimSpace(rawSite))
-}
-
-func parseRemoteImportURL(field, raw string, required bool) (*url.URL, error) {
-	value := strings.TrimSpace(raw)
-	if value == "" {
-		if required {
-			return nil, fmt.Errorf("%s is required", field)
-		}
-		return nil, nil
-	}
-	parsed, err := url.Parse(value)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return nil, fmt.Errorf("%s must be an absolute URL", field)
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return nil, fmt.Errorf("%s must use http or https", field)
-	}
-	return parsed, nil
-}
-
-func validateRemoteImportVideoURL(site remoteImportSite, videoURL *url.URL) error {
-	if videoURL == nil {
-		return nil
-	}
-	if site.ID != "pornhub" {
-		return nil
-	}
-	host := strings.ToLower(videoURL.Hostname())
-	if !strings.Contains(host, "pornhub.com") {
-		return nil
-	}
-	cleanPath := strings.ToLower(videoURL.EscapedPath())
-	if strings.HasPrefix(cleanPath, "/embed/") || strings.HasPrefix(cleanPath, "/view_video.php") {
-		return errors.New("videoUrl must be a direct video file URL, not a Pornhub page")
-	}
-	return nil
-}
-
-func remoteImportExtension(videoURL *url.URL, contentType string) string {
-	if videoURL != nil {
-		ext := strings.ToLower(path.Ext(videoURL.Path))
-		if _, ok := allowedUploadExtensions[ext]; ok {
-			return ext
-		}
-	}
-	ct := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
-	switch ct {
-	case "video/webm":
-		return ".webm"
-	case "video/quicktime":
-		return ".mov"
-	case "video/x-msvideo":
-		return ".avi"
-	case "video/x-matroska":
-		return ".mkv"
-	default:
-		return ".mp4"
-	}
-}
-
-func fallbackRemoteImportTitle(sourceSite string, pageURL *url.URL) string {
-	if pageURL != nil {
-		if base := strings.Trim(strings.ReplaceAll(path.Base(pageURL.Path), "-", " "), " /._"); base != "" && base != "." {
-			return base
-		}
-	}
-	return sourceSite + "-" + time.Now().Format("20060102150405")
-}
-
-func sanitizeImportFileName(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "video"
-	}
-	var b strings.Builder
-	for _, r := range value {
-		if r < 32 {
-			continue
-		}
-		switch r {
-		case '<', '>', ':', '"', '/', '\\', '|', '?', '*':
-			b.WriteRune('_')
-		default:
-			b.WriteRune(r)
-		}
-		if b.Len() >= 160 {
-			break
-		}
-	}
-	out := strings.Trim(strings.Join(strings.Fields(b.String()), " "), " ._")
-	if out == "" {
-		return "video"
-	}
-	return out
-}
-
-func remoteImportTags(sourceSite string, extra []string) []string {
-	seen := map[string]struct{}{}
-	out := []string{}
-	add := func(value string) {
-		value = strings.TrimSpace(value)
-		if value == "" {
-			return
-		}
-		key := strings.ToLower(value)
-		if _, ok := seen[key]; ok {
-			return
-		}
-		seen[key] = struct{}{}
-		out = append(out, value)
-	}
-	add(sourceSite)
-	for _, tag := range extra {
-		add(tag)
-	}
-	return out
-}
-
-func remoteImportDescription(site remoteImportSite, pageURL, videoURL string) string {
-	lines := []string{
-		"通过浏览器油猴脚本从 " + site.Label + " 导入。",
-		"来源页面: " + pageURL,
-	}
-	if videoURL != "" {
-		lines = append(lines, "下载地址: "+videoURL)
-	}
-	return strings.Join(lines, "\n")
-}
-
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	driveID := routeParam(r, "driveID")
 	fileID := routeWildcardParam(r, "*")
@@ -1541,79 +822,6 @@ func (s *Server) handleUploadedVideo(w http.ResponseWriter, r *http.Request) {
 	path, err := s.localUploadFilePath(v.FileID)
 	if err != nil {
 		http.Error(w, "invalid upload file", http.StatusForbidden)
-		return
-	}
-	info, err := os.Stat(path)
-	if err != nil || info.IsDir() || info.Size() == 0 {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Cache-Control", "private, max-age=300")
-	http.ServeFile(w, r, path)
-}
-
-// handleSpider91Video 服务 spider91 drive 下载到本地的视频文件。
-// 路径形如 /p/spider91/<videoID>，videoID = "spider91-<driveID>-<sourceID>"。
-// 通过 catalog 拿到 file_id（"<sourceID>.mp4"），再让 driver 解析到绝对路径并 ServeFile。
-func (s *Server) handleSpider91Video(w http.ResponseWriter, r *http.Request) {
-	videoID := routeParam(r, "videoID")
-	v, err := s.Catalog.GetVideo(r.Context(), videoID)
-	if err != nil || v.Hidden {
-		http.NotFound(w, r)
-		return
-	}
-	if s.Proxy == nil || s.Proxy.Registry == nil {
-		http.NotFound(w, r)
-		return
-	}
-	d, ok := s.Proxy.Registry.Get(v.DriveID)
-	if !ok || d.Kind() != spider91.Kind {
-		http.NotFound(w, r)
-		return
-	}
-	sd, ok := d.(*spider91.Driver)
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	path, err := sd.VideoPath(v.FileID)
-	if err != nil {
-		http.Error(w, "invalid video id", http.StatusForbidden)
-		return
-	}
-	info, err := os.Stat(path)
-	if err != nil || info.IsDir() || info.Size() == 0 {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Cache-Control", "private, max-age=300")
-	http.ServeFile(w, r, path)
-}
-
-func (s *Server) handleSpiderXVideosVideo(w http.ResponseWriter, r *http.Request) {
-	videoID := chi.URLParam(r, "videoID")
-	v, err := s.Catalog.GetVideo(r.Context(), videoID)
-	if err != nil || v.Hidden {
-		http.NotFound(w, r)
-		return
-	}
-	if s.Proxy == nil || s.Proxy.Registry == nil {
-		http.NotFound(w, r)
-		return
-	}
-	d, ok := s.Proxy.Registry.Get(v.DriveID)
-	if !ok || d.Kind() != spiderxvideos.Kind {
-		http.NotFound(w, r)
-		return
-	}
-	sd, ok := d.(*spiderxvideos.Driver)
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	path, err := sd.VideoPath(v.FileID)
-	if err != nil {
-		http.Error(w, "invalid video id", http.StatusForbidden)
 		return
 	}
 	info, err := os.Stat(path)
@@ -1703,7 +911,6 @@ func mapVideo(v *catalog.Video) VideoDTO {
 		Dislikes:        v.Dislikes,
 		PublishedAt:     v.PublishedAt.Format("2006-01-02"),
 		Tags:            tags,
-		Category:        v.Category,
 	}
 }
 
@@ -1741,17 +948,6 @@ func transcodedSource(v *catalog.Video) (string, bool) {
 func (s *Server) videoSource(v *catalog.Video) string {
 	if v.DriveID == localUploadDriveID {
 		return "/p/upload/" + pathSegment(v.ID)
-	}
-	if s.Proxy != nil && s.Proxy.Registry != nil {
-		if d, ok := s.Proxy.Registry.Get(v.DriveID); ok {
-			switch d.Kind() {
-			case spider91.Kind:
-				return "/p/spider91/" + pathSegment(v.ID)
-			}
-		}
-		if d, ok := s.Proxy.Registry.Get(v.DriveID); ok && d.Kind() == spiderxvideos.Kind {
-			return "/p/spiderxvideos/" + v.ID
-		}
 	}
 	if src, ok := transcodedSource(v); ok {
 		return src
@@ -1833,10 +1029,6 @@ func driveKindLabel(kind string) string {
 		return "Google Drive"
 	case localstorage.Kind:
 		return "本地存储"
-	case spider91.Kind:
-		return "91 爬虫"
-	case spiderxvideos.Kind:
-		return "XVideos 爬虫"
 	default:
 		return kind
 	}
@@ -1967,127 +1159,4 @@ func writeJSON(w http.ResponseWriter, code int, body any) {
 
 func writeErr(w http.ResponseWriter, code int, err error) {
 	writeJSON(w, code, map[string]string{"error": err.Error()})
-}
-
-func newImportProgressToken() (string, error) {
-	var b [32]byte
-	if _, err := crand.Read(b[:]); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b[:]), nil
-}
-
-type ImportProgressEvent struct {
-	SessionID string `json:"sessionId"`
-	Index     int    `json:"index"`
-	VideoID   string `json:"videoId"`
-	Status    string `json:"status"`
-	Progress  int    `json:"progress"`
-	Message   string `json:"message,omitempty"`
-	Error     string `json:"error,omitempty"`
-}
-
-type ProgressHub struct {
-	mu          sync.RWMutex
-	subscribers map[string][]chan ImportProgressEvent
-	latest      map[string]map[int]ImportProgressEvent
-	tokens      map[string]string
-}
-
-func (s *Server) ensureProgressHub() *ProgressHub {
-	if s.progressHub == nil {
-		s.progressHub = NewProgressHub()
-	}
-	return s.progressHub
-}
-
-func NewProgressHub() *ProgressHub {
-	return &ProgressHub{
-		subscribers: make(map[string][]chan ImportProgressEvent),
-		latest:      make(map[string]map[int]ImportProgressEvent),
-		tokens:      make(map[string]string),
-	}
-}
-
-func (h *ProgressHub) SetProgressToken(sessionID, token string) {
-	if sessionID == "" || token == "" {
-		return
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.tokens[sessionID] = token
-}
-
-func (h *ProgressHub) ValidProgressToken(sessionID, token string) bool {
-	if sessionID == "" || token == "" {
-		return false
-	}
-	h.mu.RLock()
-	expected := h.tokens[sessionID]
-	h.mu.RUnlock()
-	if expected == "" || len(expected) != len(token) {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(expected), []byte(token)) == 1
-}
-
-func (h *ProgressHub) Subscribe(sessionID string) <-chan ImportProgressEvent {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	snapshot := h.latestSnapshotLocked(sessionID)
-	ch := make(chan ImportProgressEvent, max(10, len(snapshot)+10))
-	h.subscribers[sessionID] = append(h.subscribers[sessionID], ch)
-	for _, event := range snapshot {
-		ch <- event
-	}
-	return ch
-}
-
-func (h *ProgressHub) Unsubscribe(sessionID string, ch <-chan ImportProgressEvent) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	subs := h.subscribers[sessionID]
-	for i, sub := range subs {
-		if sub == ch {
-			h.subscribers[sessionID] = append(subs[:i], subs[i+1:]...)
-			close(sub)
-			break
-		}
-	}
-	if len(h.subscribers[sessionID]) == 0 {
-		delete(h.subscribers, sessionID)
-	}
-}
-
-func (h *ProgressHub) Publish(event ImportProgressEvent) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.latest[event.SessionID] == nil {
-		h.latest[event.SessionID] = make(map[int]ImportProgressEvent)
-	}
-	h.latest[event.SessionID][event.Index] = event
-	subs := h.subscribers[event.SessionID]
-	for _, ch := range subs {
-		select {
-		case ch <- event:
-		default:
-		}
-	}
-}
-
-func (h *ProgressHub) latestSnapshotLocked(sessionID string) []ImportProgressEvent {
-	eventsByIndex := h.latest[sessionID]
-	if len(eventsByIndex) == 0 {
-		return nil
-	}
-	indexes := make([]int, 0, len(eventsByIndex))
-	for index := range eventsByIndex {
-		indexes = append(indexes, index)
-	}
-	sort.Ints(indexes)
-	events := make([]ImportProgressEvent, 0, len(indexes))
-	for _, index := range indexes {
-		events = append(events, eventsByIndex[index])
-	}
-	return events
 }

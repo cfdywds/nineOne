@@ -39,8 +39,7 @@ const (
 	ossSecurityTokenHeaderName = "X-OSS-Security-Token"
 	ossUserAgent               = "aliyun-sdk-android/2.9.13(Linux/Android 14/M2004j7ac;UKQ1.231108.001)"
 	// 单次 PutObject 的硬上限（OSS 文档限制 5GiB；保守用 5GiB-1）。
-	// spider91 视频通常 ~100MiB，远低于该值。超过则需走 multipart，
-	// 当前未实现，遇到会显式报错。
+	// 超过该值需走 multipart；当前未实现，遇到会显式报错。
 	maxSinglePutSize = 5*1024*1024*1024 - 1
 	// 首次上传失败后最多再重试 3 次。每次重试都会重新申请 PikPak
 	// upload session，以避开偶发不可解析/不可达的临时上传 endpoint。
@@ -105,7 +104,7 @@ func (d *Driver) Upload(ctx context.Context, parentID, name string, r io.Reader,
 
 // UploadAndReportHash 上传并返回 file ID + GCID + 实际字节数。
 //
-// 用于 spider91 → PikPak 迁移 worker：上传完后直接把 hash 写回 catalog
+// 用于 crawler upload worker：上传完后直接把 hash 写回 catalog
 // 的 content_hash 字段，避免再读一次本地文件做 hash。
 //
 // 参数：
@@ -118,8 +117,7 @@ func (d *Driver) Upload(ctx context.Context, parentID, name string, r io.Reader,
 //   - 必须先算 GCID 再申请上传会话（PikPak API 要求 hash 字段），
 //     所以这里先 io.Copy 到临时文件并同步算 GCID。
 //   - 命中秒传时不发任何字节；否则用 OSS PutObject 上传。
-//   - 单次 PutObject 上限保守用 5GiB-1。spider91 视频远小于此值，
-//     超出该值会报错（暂不实现 multipart）。
+//   - 单次 PutObject 上限保守用 5GiB-1，超出该值会报错（暂不实现 multipart）。
 func (d *Driver) UploadAndReportHash(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error) {
 	if r == nil {
 		return UploadResult{}, errors.New("pikpak upload: nil reader")

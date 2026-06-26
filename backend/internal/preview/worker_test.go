@@ -89,9 +89,9 @@ func TestThumbWorkerBackfillsDurationWhenThumbnailAlreadyExists(t *testing.T) {
 	}
 }
 
-func TestThumbWorkerDoesNotGenerateThumbnailForSpider91OriginVideo(t *testing.T) {
+func TestThumbWorkerGeneratesThumbnailForCrawlerLikeVideoID(t *testing.T) {
 	ctx := context.Background()
-	cat, video := seedPreviewTestVideo(t, "spider91-91-spider-1200001")
+	cat, video := seedPreviewTestVideo(t, "scriptcrawler-crawler-main-source001")
 
 	gen := &fakeThumbGenerator{probeDuration: 42}
 	drv := &previewFakeDrive{kind: "pikpak"}
@@ -103,18 +103,18 @@ func TestThumbWorkerDoesNotGenerateThumbnailForSpider91OriginVideo(t *testing.T)
 	if err != nil {
 		t.Fatalf("get video: %v", err)
 	}
-	if got.ThumbnailURL != "" {
-		t.Fatalf("thumbnail = %q, want empty when crawled spider91 thumbnail is missing", got.ThumbnailURL)
+	if got.ThumbnailURL != "/p/thumb/"+video.ID {
+		t.Fatalf("thumbnail = %q, want generated thumb URL", got.ThumbnailURL)
 	}
-	failed, err := cat.ListVideosByThumbnailStatus(ctx, video.DriveID, "failed", 0)
+	ready, err := cat.ListVideosByThumbnailStatus(ctx, video.DriveID, "ready", 0)
 	if err != nil {
-		t.Fatalf("list failed thumbnails: %v", err)
+		t.Fatalf("list ready thumbnails: %v", err)
 	}
-	if len(failed) != 1 || failed[0].ID != video.ID {
-		t.Fatalf("failed thumbnails = %#v, want only %s", failed, video.ID)
+	if len(ready) != 1 || ready[0].ID != video.ID {
+		t.Fatalf("ready thumbnails = %#v, want only %s", ready, video.ID)
 	}
-	if gen.probeCalls != 0 || gen.generateCalls != 0 {
-		t.Fatalf("generator calls probe=%d generate=%d, want no ffmpeg work for spider91-origin thumbnail", gen.probeCalls, gen.generateCalls)
+	if gen.probeCalls != 1 || gen.generateCalls != 1 {
+		t.Fatalf("generator calls probe=%d generate=%d, want one thumbnail generation", gen.probeCalls, gen.generateCalls)
 	}
 }
 

@@ -165,6 +165,42 @@ func TestPreviewURLFallsBackWithoutUpdatedAt(t *testing.T) {
 	}
 }
 
+func TestPublicWriteRoutesRequireAdminRole(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	hash, err := auth.HashPassword("secret123")
+	if err != nil {
+		t.Fatalf("hash password: %v", err)
+	}
+	userID, err := cat.CreateUser(ctx, "viewer", hash, "user")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := cat.CreateSession(ctx, "viewer-token", time.Hour, userID); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	router := chi.NewRouter()
+	(&Server{Catalog: cat}).RegisterRoutes(router, &auth.Authenticator{Catalog: cat})
+	req := httptest.NewRequest(http.MethodPut, "/api/video/video-1/tags", strings.NewReader(`{"tags":[]}`))
+	req.AddCookie(&http.Cookie{Name: "vs_admin", Value: "viewer-token"})
+	rr := httptest.NewRecorder()
+
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body = %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestHandleVideoDetailDecodesEscapedVideoID(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
@@ -496,6 +532,68 @@ func TestHandleListLatestPrefersReadyThumbnails(t *testing.T) {
 	}
 	if len(got.Items) != 12 {
 		t.Fatalf("count=false items = %d, want 12", len(got.Items))
+	}
+}
+
+func TestHandleListIgnoresCategoryQueryAndDoesNotExposeCategory(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	for _, v := range []*catalog.Video{
+		{
+			ID:          "video-a",
+			DriveID:     "drive",
+			FileID:      "file-a",
+			Title:       "A",
+			PublishedAt: now,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		},
+		{
+			ID:          "video-b",
+			DriveID:     "drive",
+			FileID:      "file-b",
+			Title:       "B",
+			PublishedAt: now.Add(-time.Hour),
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		},
+	} {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed video %s: %v", v.ID, err)
+		}
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/list?page=1&size=24&cat=alpha", nil)
+	(&Server{Catalog: cat}).handleList(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Items []map[string]any `json:"items"`
+		Total int              `json:"total"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Total != 2 || len(got.Items) != 2 {
+		t.Fatalf("response total/items = %d/%d, want 2/2", got.Total, len(got.Items))
+	}
+	for _, item := range got.Items {
+		if _, ok := item["category"]; ok {
+			t.Fatalf("list response exposed category: %#v", item)
+		}
 	}
 }
 
@@ -1271,7 +1369,6 @@ func TestHandleTagsReturnsUnifiedTagPool(t *testing.T) {
 		FileID:      "file-1",
 		Title:       "清纯女大后入",
 		Tags:        []string{"后入", "女大"},
-		Category:    "random-category",
 		PublishedAt: now,
 		CreatedAt:   now,
 		UpdatedAt:   now,

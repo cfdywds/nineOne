@@ -30,7 +30,7 @@ import { Modal } from "./Modal";
 import { ConfirmModal } from "./ConfirmModal";
 import { useToast } from "./ToastContext";
 import { generationStateClass, generationStateLabel } from "./drive/constants";
-import { Spider91UploadTargetField } from "./drive/Spider91UploadTargetField";
+import { CrawlerUploadTargetField } from "./drive/CrawlerUploadTargetField";
 import { SpiderIcon } from "./icons/SpiderIcon";
 
 const BUSY_STATES = new Set(["scanning", "generating", "uploading", "queued"]);
@@ -970,7 +970,7 @@ function CrawlerEditorModal({
                     placeholder="http://127.0.0.1:7890"
                   />
                 </div>
-                <Spider91UploadTargetField
+                <CrawlerUploadTargetField
                   value={form.uploadDriveId}
                   onChange={(value) => set("uploadDriveId", value)}
                   uploadTargets={uploadTargets}

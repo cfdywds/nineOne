@@ -24,7 +24,6 @@ import (
 	"github.com/video-site/backend/internal/drives/guangyapan"
 	"github.com/video-site/backend/internal/drives/p123"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
-	"github.com/video-site/backend/internal/drives/spider91"
 	"github.com/video-site/backend/internal/drives/wopan"
 )
 
@@ -56,7 +55,6 @@ type AdminServer struct {
 	OnCrawlerUploadRequested  func(driveID string) (bool, string)
 	OnStopDriveTasks          func(driveID string) bool
 	OnStopAllTasks            func() int
-	GetDriveCrawlStatus       func(driveID string) CrawlStatus
 	OnRegenPreview            func(videoID string)
 	OnRegenAllPreviews        func()
 	OnRegenFailedPreviews     func(driveID string)
@@ -78,11 +76,8 @@ type AdminServer struct {
 	// Theme 读写（"dark" | "pink" | "sky"）
 	GetTheme func() string
 	SetTheme func(theme string) error
-	// Spider91 → 115/123/PikPak/OneDrive/Google Drive/联通网盘/光鸭网盘 上传目标 drive ID 读写
-	GetSpider91UploadDriveID func() string
-	SetSpider91UploadDriveID func(driveID string) error
-	// OnRunNightlyJob 触发一次完整的凌晨流水线（Phase1 扫盘 + Phase2 91 爬虫 +
-	// Phase3 迁移）。立即返回 —— 实际任务在后台跑，admin 在日志或下次状态查询里
+	// OnRunNightlyJob 触发一次完整的凌晨流水线（Phase1 扫盘 + Phase2 爬虫 +
+	// Phase3 上传）。立即返回 —— 实际任务在后台跑，admin 在日志或下次状态查询里
 	// 看进度。若流水线正在跑或已排队，Runner 会拒绝重复触发。
 	OnRunNightlyJob func() bool
 	// GetNightlyJobStatus 返回凌晨流水线当前状态，用于前端禁用重复触发按钮。
@@ -142,25 +137,6 @@ type NightlyJobStatus struct {
 	LastFinishedAt string `json:"lastFinishedAt,omitempty"`
 }
 
-type CrawlStatus struct {
-	DriveID      string   `json:"driveId"`
-	Kind         string   `json:"kind,omitempty"`
-	State        string   `json:"state"`
-	Message      string   `json:"message,omitempty"`
-	LastError    string   `json:"lastError,omitempty"`
-	TargetNew    int      `json:"targetNew,omitempty"`
-	TotalEntries int      `json:"totalEntries,omitempty"`
-	NewVideos    int      `json:"newVideos,omitempty"`
-	Skipped      int      `json:"skipped,omitempty"`
-	Failed       int      `json:"failed,omitempty"`
-	SeenSnapshot int      `json:"seenSnapshot,omitempty"`
-	OutputJSON   string   `json:"outputJson,omitempty"`
-	SeenFile     string   `json:"seenFile,omitempty"`
-	StartedAt    string   `json:"startedAt,omitempty"`
-	FinishedAt   string   `json:"finishedAt,omitempty"`
-	Logs         []string `json:"logs,omitempty"`
-}
-
 const maxCrawlerScriptBytes = 2 * 1024 * 1024
 
 type DeleteVideoResult struct {
@@ -181,9 +157,9 @@ func (a *AdminServer) Register(r chi.Router) {
 		r.Post("/logout", a.handleLogout)
 		r.Get("/me", a.handleMe)
 
-		// 其余路由需鉴权
+		// 其余路由需管理员鉴权
 		r.Group(func(r chi.Router) {
-			r.Use(a.Auth.Required)
+			r.Use(a.Auth.AdminRequired)
 
 			// 网盘
 			r.Get("/drives", a.handleListDrives)
@@ -197,7 +173,6 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Get("/drives/guangyapan/qr/status", a.handleGuangYaPanQRStatus)
 			r.Delete("/drives/{id}", a.handleDeleteDrive)
 			r.Post("/drives/{id}/rescan", a.handleRescan)
-			r.Get("/drives/{id}/crawl/status", a.handleDriveCrawlStatus)
 			r.Post("/drives/{id}/tasks/stop", a.handleStopDriveTasks)
 			r.Post("/drives/{id}/teaser-enabled", a.handleSetDriveTeaserEnabled)
 			r.Post("/drives/{id}/skip-dirs", a.handleSetDriveSkipDirs)
@@ -234,6 +209,18 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Get("/tags", a.handleListTags)
 			r.Post("/tags", a.handleCreateTag)
 			r.Delete("/tags/{id}", a.handleDeleteTag)
+
+			// 用户管理
+			r.Get("/users", a.handleListUsers)
+			r.Post("/users", a.handleCreateUser)
+			r.Delete("/users/{id}", a.handleDeleteUser)
+			r.Post("/users/{id}/ban", a.handleBanUser)
+			r.Post("/users/{id}/unban", a.handleUnbanUser)
+			r.Put("/users/{id}/password", a.handleResetPassword)
+
+			// IP 封禁管理
+			r.Get("/banned-ips", a.handleListBannedIPs)
+			r.Delete("/banned-ips/{ip}", a.handleUnbanIP)
 
 			// 运行时设置
 			r.Get("/settings", a.handleGetSettings)
@@ -308,7 +295,7 @@ func (a *AdminServer) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	ok, err := a.Auth.Login(w, r, username, password)
+	role, err := a.Auth.UserLogin(w, r, username, password)
 	if err != nil {
 		if errors.Is(err, auth.ErrLoginIPBanned) {
 			http.Error(w, "ip banned", http.StatusForbidden)
@@ -317,7 +304,7 @@ func (a *AdminServer) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	if !ok {
+	if role != "admin" {
 		http.Error(w, "setup completed but login failed", http.StatusInternalServerError)
 		return
 	}
@@ -334,20 +321,25 @@ func (a *AdminServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	ok, err := a.Auth.Login(w, r, body.Username, body.Password)
+
+	role, err := a.Auth.UserLogin(w, r, body.Username, body.Password)
 	if err != nil {
 		if errors.Is(err, auth.ErrLoginIPBanned) {
 			http.Error(w, "ip banned", http.StatusForbidden)
 			return
 		}
+		if errors.Is(err, auth.ErrUserBanned) {
+			http.Error(w, "user banned", http.StatusForbidden)
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	if !ok {
-		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+	if role == "" {
+		http.Error(w, "invalid credentials", http.StatusBadRequest)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "role": role})
 }
 
 func (a *AdminServer) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -361,8 +353,28 @@ func (a *AdminServer) handleMe(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"authenticated": false})
 		return
 	}
-	ok, _ := a.Catalog.ValidateSession(r.Context(), c.Value)
-	writeJSON(w, http.StatusOK, map[string]any{"authenticated": ok})
+	ok, userID, err := a.Catalog.ValidateSession(r.Context(), c.Value)
+	if err != nil || !ok {
+		writeJSON(w, http.StatusOK, map[string]any{"authenticated": false})
+		return
+	}
+
+	role := "user"
+	if userID > 0 {
+		u, err := a.Catalog.GetUserByID(r.Context(), userID)
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && u.Banned) {
+			writeJSON(w, http.StatusOK, map[string]any{"authenticated": false})
+			return
+		}
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"authenticated": false})
+			return
+		}
+		role = u.Role
+	} else {
+		role = "admin"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "role": role})
 }
 
 func (a *AdminServer) handleCheckUpdate(w http.ResponseWriter, r *http.Request) {
@@ -499,14 +511,10 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		// SkipDirIDs 是用户在 admin 配置的"扫描跳过目录"集合（drive 侧目录 fileID）。
 		// 前端用它在"设置跳过目录"弹窗里回显已选项；JSON 字段名 camelCase 与
 		// catalog.Drive 保持一致。
-		SkipDirIDs []string `json:"skipDirIds"`
-		// LastCrawlAt 是 spider91 上次成功爬取的 unix 秒（来自 credentials.last_crawl_at）。
-		// 其它 kind 留 0；前端用它显示"上次抓取: N 小时前"。
-		Spider91Proxy           string            `json:"spider91Proxy,omitempty"`
-		SpiderCrawlerConfig     map[string]string `json:"spiderCrawlerConfig,omitempty"`
-		LastCrawlAt             int64             `json:"lastCrawlAt,omitempty"`
-		GoogleDriveUseOnlineAPI *bool             `json:"googleDriveUseOnlineAPI,omitempty"`
-		GoogleDriveOpenListAPIURL string `json:"googleDriveOpenListApiUrl,omitempty"`
+		SkipDirIDs                []string `json:"skipDirIds"`
+		LastCrawlAt               int64    `json:"lastCrawlAt,omitempty"`
+		GoogleDriveUseOnlineAPI   *bool    `json:"googleDriveUseOnlineAPI,omitempty"`
+		GoogleDriveOpenListAPIURL string   `json:"googleDriveOpenListApiUrl,omitempty"`
 		// STRMAllowOutsideRoot 是 localstorage 的 .strm 越root开关；其它 kind 省略。
 		STRMAllowOutsideRoot          *bool            `json:"strmAllowOutsideRoot,omitempty"`
 		ScanGenerationStatus          GenerationStatus `json:"scanGenerationStatus"`
@@ -554,7 +562,6 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		if generation.Transcode.State == "" {
 			generation.Transcode.State = "idle"
 		}
-		// spider91 没有用户凭证概念；只要存在 drive 行就视为"已配置"。
 		// last_crawl_at 是后端自动写入的运行状态字段，不计入 hasCredential 判定。
 		hasCred := false
 		userCredKeys := 0
@@ -564,7 +571,7 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 			}
 			userCredKeys++
 		}
-		hasCred = userCredKeys > 0 || d.Kind == "spider91" || d.Kind == "spiderxvideos"
+		hasCred = userCredKeys > 0
 
 		var lastCrawlAt int64
 		if d.Credentials != nil {
@@ -582,8 +589,6 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 			HasCredential:                 hasCred,
 			TeaserEnabled:                 d.TeaserEnabled,
 			SkipDirIDs:                    append([]string{}, d.SkipDirIDs...),
-			Spider91Proxy:                 spider91ProxyForDrive(d),
-			SpiderCrawlerConfig:           spiderCrawlerConfigForDrive(d),
 			LastCrawlAt:                   lastCrawlAt,
 			GoogleDriveUseOnlineAPI:       googleDriveUseOnlineAPIForDrive(d),
 			GoogleDriveOpenListAPIURL:     googleDriveOpenListAPIURLForDrive(d),
@@ -645,18 +650,12 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 	if existingDrive, err := a.Catalog.GetDrive(r.Context(), body.ID); err == nil {
 		existing = existingDrive
 	}
-	if body.Kind == "spider91" {
-		http.Error(w, "91Spider 已不再支持通过网盘添加，请在爬虫管理页面添加爬虫脚本", http.StatusBadRequest)
+	if !isSupportedDriveKind(body.Kind) {
+		http.Error(w, "unsupported drive kind", http.StatusBadRequest)
 		return
-	} else if body.Kind == scriptcrawler.Kind {
+	}
+	if body.Kind == scriptcrawler.Kind {
 		credentials, err := mergeScriptCrawlerCredentials(existing, body.Credentials)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		body.Credentials = credentials
-	} else if isSpiderCrawlerKind(body.Kind) {
-		credentials, err := mergeSpiderCrawlerCredentials(body.Kind, existing, body.Credentials)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -665,8 +664,8 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 	} else if body.Kind == "googledrive" {
 		body.Credentials = mergeGoogleDriveCredentials(existing, body.Credentials)
 	} else if body.Kind == "localstorage" || body.Kind == "guangyapan" {
-		// 按键合并、空值沿用旧值：localstorage 编辑表单里 path 留空表示不改，
-		// 光鸭编辑表单里各 token/path 字段也允许只改其中一部分；因此两类都按键合并。
+		// 按键合并、空值沿用旧值：这些网盘的编辑表单允许只改某几个字段，
+		// 其它 token / 路径 / 开关字段应保留旧值。
 		body.Credentials = mergeNonEmptyCredentials(existing, body.Credentials)
 	} else if len(body.Credentials) == 0 && existing != nil && len(existing.Credentials) > 0 {
 		body.Credentials = existing.Credentials
@@ -846,7 +845,6 @@ func crawlerVideoIDPrefixes(d *catalog.Drive) []string {
 	}
 	return []string{
 		scriptcrawler.Kind + "-" + d.ID + "-",
-		spider91.Kind + "-" + d.ID + "-",
 	}
 }
 
@@ -1469,6 +1467,15 @@ func isCrawlerDriveKind(kind string) bool {
 	return kind == scriptcrawler.Kind
 }
 
+func isSupportedDriveKind(kind string) bool {
+	switch kind {
+	case "quark", "p115", "p123", "pikpak", "wopan", "guangyapan", "onedrive", "googledrive", "localstorage", scriptcrawler.Kind:
+		return true
+	default:
+		return false
+	}
+}
+
 func isConfiguredCrawlerDrive(d *catalog.Drive) bool {
 	return d != nil &&
 		isCrawlerDriveKind(d.Kind) &&
@@ -1502,97 +1509,6 @@ func (a *AdminServer) removeImportedCrawlerScript(d *catalog.Drive) (bool, error
 		return false, err
 	}
 	return true, nil
-}
-
-func spider91ProxyForDrive(d *catalog.Drive) string {
-	if d == nil || d.Kind != "spider91" || d.Credentials == nil {
-		return ""
-	}
-	return strings.TrimSpace(d.Credentials["proxy"])
-}
-
-func isSpiderCrawlerKind(kind string) bool {
-	return kind == "spiderxvideos"
-}
-
-func spiderCrawlerEditableKeys(kind string) map[string]struct{} {
-	keys := map[string]struct{}{"proxy": {}}
-	if kind != "spiderxvideos" {
-		return keys
-	}
-	for _, key := range []string{
-		"start_url",
-		"keyword",
-		"quality",
-		"min_duration",
-		"max_duration",
-		"min_size",
-		"max_size",
-		"merge_hls",
-		"proxy",
-		"cookie",
-		"script_path",
-		"target_new",
-	} {
-		keys[key] = struct{}{}
-	}
-	return keys
-}
-
-func spiderCrawlerConfigForDrive(d *catalog.Drive) map[string]string {
-	if d == nil || d.Credentials == nil || !isSpiderCrawlerKind(d.Kind) {
-		return nil
-	}
-	keys := spiderCrawlerEditableKeys(d.Kind)
-	out := map[string]string{}
-	for key := range keys {
-		value := strings.TrimSpace(d.Credentials[key])
-		if value != "" {
-			out[key] = value
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-func mergeSpiderCrawlerCredentials(kind string, existing *catalog.Drive, incoming map[string]string) (map[string]string, error) {
-	merged := map[string]string{}
-	if existing != nil {
-		for k, v := range existing.Credentials {
-			merged[k] = v
-		}
-	}
-	editable := spiderCrawlerEditableKeys(kind)
-	for k, v := range incoming {
-		key := strings.TrimSpace(k)
-		if key == "" {
-			continue
-		}
-		if _, ok := editable[key]; !ok {
-			continue
-		}
-		value := strings.TrimSpace(v)
-		if key == "proxy" {
-			proxy, err := normalizeSpider91ProxyURL(value)
-			if err != nil {
-				return nil, err
-			}
-			if proxy == "" {
-				delete(merged, "proxy")
-			} else {
-				merged["proxy"] = proxy
-			}
-			continue
-		}
-		if value == "" {
-			delete(merged, key)
-		} else {
-			merged[key] = value
-		}
-	}
-	return merged, nil
 }
 
 // strmAllowOutsideRootForDrive 返回 localstorage 的 .strm 越root开关；
@@ -1669,38 +1585,6 @@ func mergeNonEmptyCredentials(existing *catalog.Drive, incoming map[string]strin
 	return merged
 }
 
-func mergeSpider91Credentials(existing *catalog.Drive, incoming map[string]string) (map[string]string, error) {
-	return mergeSpiderCrawlerCredentials("spider91", existing, incoming)
-}
-
-func mergeSpider91CredentialsLegacy(existing *catalog.Drive, incoming map[string]string) (map[string]string, error) {
-	merged := map[string]string{}
-	if existing != nil {
-		for k, v := range existing.Credentials {
-			merged[k] = v
-		}
-	}
-	for k, v := range incoming {
-		if strings.TrimSpace(k) == "" {
-			continue
-		}
-		if k == "proxy" {
-			proxy, err := normalizeSpider91ProxyURL(v)
-			if err != nil {
-				return nil, err
-			}
-			if proxy == "" {
-				delete(merged, "proxy")
-			} else {
-				merged["proxy"] = proxy
-			}
-			continue
-		}
-		merged[k] = v
-	}
-	return merged, nil
-}
-
 func mergeScriptCrawlerCredentials(existing *catalog.Drive, incoming map[string]string) (map[string]string, error) {
 	merged := map[string]string{}
 	if existing != nil {
@@ -1760,10 +1644,6 @@ func mergeScriptCrawlerCredentials(existing *catalog.Drive, incoming map[string]
 	delete(merged, "python_path")
 	delete(merged, "config_json")
 	return merged, nil
-}
-
-func normalizeSpider91ProxyURL(raw string) (string, error) {
-	return normalizeCrawlerProxyURL(raw, "91Spider")
 }
 
 func normalizeCrawlerProxyURL(raw, label string) (string, error) {
@@ -1843,21 +1723,6 @@ func (a *AdminServer) handleRescan(w http.ResponseWriter, r *http.Request) {
 		resp["message"] = driveTaskBusyMessage
 	}
 	writeJSON(w, http.StatusAccepted, resp)
-}
-
-func (a *AdminServer) handleDriveCrawlStatus(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	status := CrawlStatus{DriveID: id, State: "idle"}
-	if a.GetDriveCrawlStatus != nil {
-		status = a.GetDriveCrawlStatus(id)
-		if status.DriveID == "" {
-			status.DriveID = id
-		}
-		if status.State == "" {
-			status.State = "idle"
-		}
-	}
-	writeJSON(w, http.StatusOK, status)
 }
 
 func (a *AdminServer) handleStopDriveTasks(w http.ResponseWriter, r *http.Request) {
@@ -2193,7 +2058,7 @@ func (a *AdminServer) handleAdminListVideos(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"items": items,
+		"items": mapAdminVideos(items),
 		"total": total,
 		"page":  page,
 		"size":  size,
@@ -2224,7 +2089,12 @@ func (a *AdminServer) handleListBlacklist(w http.ResponseWriter, r *http.Request
 	if size <= 0 || size > 100 {
 		size = 100
 	}
-	items, total, err := a.Catalog.ListDeletedVideos(r.Context(), q.Get("keyword"), page, size)
+	items, total, err := a.Catalog.ListDeletedVideos(r.Context(), catalog.ListParams{
+		Keyword:  q.Get("keyword"),
+		DriveID:  q.Get("driveId"),
+		Page:     page,
+		PageSize: size,
+	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -2243,6 +2113,272 @@ func (a *AdminServer) handleRemoveBlacklist(w http.ResponseWriter, r *http.Reque
 	if err := a.Catalog.RemoveDeletedVideo(r.Context(), id); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeErr(w, http.StatusNotFound, err)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// ---------- User Management ----------
+
+type createUserReq struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Role     string `json:"role"`
+}
+
+type userDTO struct {
+	ID        int64  `json:"id"`
+	Username  string `json:"username"`
+	Role      string `json:"role"`
+	Banned    bool   `json:"banned"`
+	CreatedAt int64  `json:"createdAt"`
+}
+
+func (a *AdminServer) handleListUsers(w http.ResponseWriter, r *http.Request) {
+	users, err := a.Catalog.ListUsers(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	out := make([]userDTO, 0, len(users))
+	for _, u := range users {
+		out = append(out, userDTO{
+			ID: u.ID, Username: u.Username, Role: u.Role,
+			Banned: u.Banned, CreatedAt: u.CreatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (a *AdminServer) handleCreateUser(w http.ResponseWriter, r *http.Request) {
+	var body createUserReq
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	username := strings.TrimSpace(body.Username)
+	if username == "" {
+		http.Error(w, "username is required", http.StatusBadRequest)
+		return
+	}
+	if len(body.Password) < 6 {
+		http.Error(w, "password must be at least 6 characters", http.StatusBadRequest)
+		return
+	}
+	role := body.Role
+	if role == "" {
+		role = "user"
+	}
+	if role != "admin" && role != "user" {
+		http.Error(w, "role must be admin or user", http.StatusBadRequest)
+		return
+	}
+
+	hashed, err := auth.HashPassword(body.Password)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	id, err := a.Catalog.CreateUser(r.Context(), username, hashed, role)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			http.Error(w, "username already exists", http.StatusConflict)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "id": id})
+}
+
+func (a *AdminServer) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "invalid user id", http.StatusBadRequest)
+		return
+	}
+	target, err := a.Catalog.GetUserByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "user not found", http.StatusNotFound)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if currentSessionUserID(r.Context(), a.Catalog, r) == id {
+		http.Error(w, "cannot delete yourself", http.StatusBadRequest)
+		return
+	}
+	if target.Role == "admin" {
+		admins, err := a.Catalog.CountAdmins(r.Context())
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		if admins <= 1 {
+			http.Error(w, "cannot delete the last admin", http.StatusBadRequest)
+			return
+		}
+	}
+	if err := a.Catalog.DeleteUser(r.Context(), id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "user not found", http.StatusNotFound)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := a.Catalog.DeleteSessionsForUser(r.Context(), id); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *AdminServer) handleBanUser(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "invalid user id", http.StatusBadRequest)
+		return
+	}
+	target, err := a.Catalog.GetUserByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "user not found", http.StatusNotFound)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if currentSessionUserID(r.Context(), a.Catalog, r) == id {
+		http.Error(w, "cannot ban yourself", http.StatusBadRequest)
+		return
+	}
+	if target.Role == "admin" && !target.Banned {
+		activeAdmins, err := a.Catalog.CountActiveAdmins(r.Context())
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		if activeAdmins <= 1 {
+			http.Error(w, "cannot ban the last active admin", http.StatusBadRequest)
+			return
+		}
+	}
+	if err := a.Catalog.SetUserBanned(r.Context(), id, true); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "user not found", http.StatusNotFound)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := a.Catalog.DeleteSessionsForUser(r.Context(), id); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *AdminServer) handleUnbanUser(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "invalid user id", http.StatusBadRequest)
+		return
+	}
+	if err := a.Catalog.SetUserBanned(r.Context(), id, false); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "user not found", http.StatusNotFound)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *AdminServer) handleResetPassword(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "invalid user id", http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if len(body.Password) < 6 {
+		http.Error(w, "password must be at least 6 characters", http.StatusBadRequest)
+		return
+	}
+	hashed, err := auth.HashPassword(body.Password)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := a.Catalog.UpdateUserPassword(r.Context(), id, hashed); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "user not found", http.StatusNotFound)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := a.Catalog.DeleteSessionsForUser(r.Context(), id); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func currentSessionUserID(ctx context.Context, cat *catalog.Catalog, r *http.Request) int64 {
+	if cat == nil || r == nil {
+		return 0
+	}
+	c, err := r.Cookie("vs_admin")
+	if err != nil {
+		return 0
+	}
+	ok, userID, err := cat.ValidateSession(ctx, c.Value)
+	if err != nil || !ok {
+		return 0
+	}
+	return userID
+}
+
+// ---------- IP Ban Management ----------
+
+type bannedIPDTO struct {
+	IP        string `json:"ip"`
+	Reason    string `json:"reason"`
+	CreatedAt int64  `json:"createdAt"`
+}
+
+func (a *AdminServer) handleListBannedIPs(w http.ResponseWriter, r *http.Request) {
+	ips, err := a.Catalog.ListBannedLoginIPs(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	out := make([]bannedIPDTO, 0, len(ips))
+	for _, ip := range ips {
+		out = append(out, bannedIPDTO{IP: ip.IP, Reason: ip.Reason, CreatedAt: ip.CreatedAt})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (a *AdminServer) handleUnbanIP(w http.ResponseWriter, r *http.Request) {
+	ip := chi.URLParam(r, "ip")
+	if err := a.Catalog.UnbanLoginIP(r.Context(), ip); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "IP not found", http.StatusNotFound)
 			return
 		}
 		writeErr(w, http.StatusInternalServerError, err)
@@ -2307,12 +2443,102 @@ type updateVideoReq struct {
 	Title       string   `json:"title"`
 	Author      string   `json:"author"`
 	Tags        []string `json:"tags"`
-	Category    string   `json:"category"`
 	Badges      []string `json:"badges"`
 	Description string   `json:"description"`
 	Thumbnail   string   `json:"thumbnail"`
 	Quality     string   `json:"quality"`
 	DurationSec int      `json:"durationSeconds"`
+}
+
+type adminVideoDTO struct {
+	ID                string    `json:"id"`
+	DriveID           string    `json:"driveId"`
+	FileID            string    `json:"fileId"`
+	FileName          string    `json:"fileName"`
+	ContentHash       string    `json:"contentHash"`
+	SampledSHA256     string    `json:"sampledSha256"`
+	FingerprintStatus string    `json:"fingerprintStatus"`
+	FingerprintError  string    `json:"fingerprintError"`
+	ParentID          string    `json:"parentId"`
+	Title             string    `json:"title"`
+	Author            string    `json:"author"`
+	Tags              []string  `json:"tags"`
+	DurationSeconds   int       `json:"durationSeconds"`
+	Size              int64     `json:"size"`
+	Ext               string    `json:"ext"`
+	Quality           string    `json:"quality"`
+	ThumbnailURL      string    `json:"thumbnailUrl"`
+	PreviewFileID     string    `json:"previewFileId"`
+	PreviewLocal      string    `json:"previewLocal"`
+	PreviewStatus     string    `json:"previewStatus"`
+	TranscodeStatus   string    `json:"transcodeStatus"`
+	TranscodeError    string    `json:"transcodeError"`
+	TranscodedFileID  string    `json:"transcodedFileId"`
+	TranscodedSize    int64     `json:"transcodedSize"`
+	Views             int       `json:"views"`
+	LastViewedAt      time.Time `json:"lastViewedAt"`
+	Favorites         int       `json:"favorites"`
+	Comments          int       `json:"comments"`
+	Likes             int       `json:"likes"`
+	Dislikes          int       `json:"dislikes"`
+	Hidden            bool      `json:"hidden"`
+	Badges            []string  `json:"badges"`
+	Description       string    `json:"description"`
+	PublishedAt       time.Time `json:"publishedAt"`
+	CreatedAt         time.Time `json:"createdAt"`
+	UpdatedAt         time.Time `json:"updatedAt"`
+}
+
+func mapAdminVideo(v *catalog.Video) adminVideoDTO {
+	if v == nil {
+		return adminVideoDTO{}
+	}
+	return adminVideoDTO{
+		ID:                v.ID,
+		DriveID:           v.DriveID,
+		FileID:            v.FileID,
+		FileName:          v.FileName,
+		ContentHash:       v.ContentHash,
+		SampledSHA256:     v.SampledSHA256,
+		FingerprintStatus: v.FingerprintStatus,
+		FingerprintError:  v.FingerprintError,
+		ParentID:          v.ParentID,
+		Title:             v.Title,
+		Author:            v.Author,
+		Tags:              v.Tags,
+		DurationSeconds:   v.DurationSeconds,
+		Size:              v.Size,
+		Ext:               v.Ext,
+		Quality:           v.Quality,
+		ThumbnailURL:      v.ThumbnailURL,
+		PreviewFileID:     v.PreviewFileID,
+		PreviewLocal:      v.PreviewLocal,
+		PreviewStatus:     v.PreviewStatus,
+		TranscodeStatus:   v.TranscodeStatus,
+		TranscodeError:    v.TranscodeError,
+		TranscodedFileID:  v.TranscodedFileID,
+		TranscodedSize:    v.TranscodedSize,
+		Views:             v.Views,
+		LastViewedAt:      v.LastViewedAt,
+		Favorites:         v.Favorites,
+		Comments:          v.Comments,
+		Likes:             v.Likes,
+		Dislikes:          v.Dislikes,
+		Hidden:            v.Hidden,
+		Badges:            v.Badges,
+		Description:       v.Description,
+		PublishedAt:       v.PublishedAt,
+		CreatedAt:         v.CreatedAt,
+		UpdatedAt:         v.UpdatedAt,
+	}
+}
+
+func mapAdminVideos(vs []*catalog.Video) []adminVideoDTO {
+	out := make([]adminVideoDTO, 0, len(vs))
+	for _, v := range vs {
+		out = append(out, mapAdminVideo(v))
+	}
+	return out
 }
 
 func (a *AdminServer) handleUpdateVideo(w http.ResponseWriter, r *http.Request) {
@@ -2332,9 +2558,6 @@ func (a *AdminServer) handleUpdateVideo(w http.ResponseWriter, r *http.Request) 
 	}
 	if body.Author != "" {
 		v.Author = body.Author
-	}
-	if body.Category != "" {
-		v.Category = body.Category
 	}
 	if body.Badges != nil {
 		v.Badges = body.Badges
@@ -2370,7 +2593,7 @@ func (a *AdminServer) handleUpdateVideo(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, v)
+	writeJSON(w, http.StatusOK, mapAdminVideo(v))
 }
 
 func (a *AdminServer) handleDeleteVideo(w http.ResponseWriter, r *http.Request) {
@@ -2464,10 +2687,9 @@ func (a *AdminServer) handleRegenFailedFingerprints(w http.ResponseWriter, r *ht
 //
 // 注意：早期的全局 previewEnabled 字段已经下沉为每盘 teaser_enabled，
 // 不再出现在这里；前端要切换某个盘的预览视频生成请用 POST /admin/api/drives 上传
-// teaserEnabled 字段。保留 settings 用作主题、spider91 上传目标这类全局配置。
+// teaserEnabled 字段。settings 目前只保留全站主题。
 type settingsDTO struct {
-	Theme                 string `json:"theme"`
-	Spider91UploadDriveID string `json:"spider91UploadDriveId"`
+	Theme string `json:"theme"`
 }
 
 func (a *AdminServer) handleGetSettings(w http.ResponseWriter, r *http.Request) {
@@ -2477,19 +2699,12 @@ func (a *AdminServer) handleGetSettings(w http.ResponseWriter, r *http.Request) 
 			theme = v
 		}
 	}
-	spider91UploadID := ""
-	if a.GetSpider91UploadDriveID != nil {
-		spider91UploadID = a.GetSpider91UploadDriveID()
-	}
 	writeJSON(w, http.StatusOK, settingsDTO{
-		Theme:                 theme,
-		Spider91UploadDriveID: spider91UploadID,
+		Theme: theme,
 	})
 }
 
 func (a *AdminServer) handlePutSettings(w http.ResponseWriter, r *http.Request) {
-	// 用 map 区分"没传"和"传了空字符串"两种语义；空 spider91 上传 ID 表示
-	// 本地保存不上传。
 	var raw map[string]json.RawMessage
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -2510,25 +2725,10 @@ func (a *AdminServer) handlePutSettings(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	if v, ok := raw["spider91UploadDriveId"]; ok && a.SetSpider91UploadDriveID != nil {
-		var driveID string
-		if err := json.Unmarshal(v, &driveID); err != nil {
-			writeErr(w, http.StatusBadRequest, err)
-			return
-		}
-		if err := a.SetSpider91UploadDriveID(driveID); err != nil {
-			writeErr(w, http.StatusBadRequest, err)
-			return
-		}
-	}
-
 	// 回显当前值
 	resp := settingsDTO{}
 	if a.GetTheme != nil {
 		resp.Theme = a.GetTheme()
-	}
-	if a.GetSpider91UploadDriveID != nil {
-		resp.Spider91UploadDriveID = a.GetSpider91UploadDriveID()
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

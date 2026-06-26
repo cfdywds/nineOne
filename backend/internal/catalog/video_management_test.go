@@ -69,38 +69,71 @@ func TestBlacklistListAndRemove(t *testing.T) {
 	t.Cleanup(func() { _ = cat.Close() })
 
 	now := time.Now()
-	seed := []struct{ id, file string }{
-		{"d1", "movie-alpha.avi"},
-		{"d2", "movie-beta.mp4"},
-		{"d3", "clip-gamma.wmv"},
+	seed := []struct{ id, drive, file string }{
+		{"d1", "drive", "movie-alpha.avi"},
+		{"d2", "drive", "movie-beta.mp4"},
+		{"d3", "archive", "clip-gamma.wmv"},
 	}
 	for _, s := range seed {
 		if err := cat.UpsertVideo(ctx, &Video{
-			ID: s.id, DriveID: "drive", FileID: "f-" + s.id, FileName: s.file,
+			ID: s.id, DriveID: s.drive, FileID: "f-" + s.id, FileName: s.file,
 			Title: s.id, PublishedAt: now, CreatedAt: now, UpdatedAt: now,
 		}); err != nil {
 			t.Fatalf("seed %s: %v", s.id, err)
 		}
-		if err := cat.DeleteVideoWithTombstone(ctx, s.id); err != nil {
+		var err error
+		if s.id == "d2" {
+			err = cat.DeleteVideoWithTombstoneReason(ctx, s.id, DeletedVideoReasonDuplicate)
+		} else {
+			err = cat.DeleteVideoWithTombstone(ctx, s.id)
+		}
+		if err != nil {
 			t.Fatalf("tombstone %s: %v", s.id, err)
 		}
 	}
 
-	items, total, err := cat.ListDeletedVideos(ctx, "", 1, 50)
+	items, total, err := cat.ListDeletedVideos(ctx, ListParams{Page: 1, PageSize: 50})
 	if err != nil {
 		t.Fatalf("list deleted: %v", err)
 	}
 	if total != 3 || len(items) != 3 {
 		t.Fatalf("deleted total/len = %d/%d, want 3/3", total, len(items))
 	}
+	reasons := map[string]string{}
+	for _, item := range items {
+		reasons[item.ID] = item.Reason
+	}
+	if reasons["d1"] != "" || reasons["d3"] != "" {
+		t.Fatalf("manual tombstone reasons = %#v, want empty", reasons)
+	}
+	if reasons["d2"] != DeletedVideoReasonDuplicate {
+		t.Fatalf("duplicate tombstone reason = %q, want %q", reasons["d2"], DeletedVideoReasonDuplicate)
+	}
 
 	// 关键字过滤
-	filtered, ftotal, err := cat.ListDeletedVideos(ctx, "movie", 1, 50)
+	filtered, ftotal, err := cat.ListDeletedVideos(ctx, ListParams{Keyword: "movie", Page: 1, PageSize: 50})
 	if err != nil {
 		t.Fatalf("list deleted filtered: %v", err)
 	}
 	if ftotal != 2 || len(filtered) != 2 {
 		t.Fatalf("filtered total/len = %d/%d, want 2/2", ftotal, len(filtered))
+	}
+
+	// 网盘过滤
+	driveFiltered, driveTotal, err := cat.ListDeletedVideos(ctx, ListParams{DriveID: "archive", Page: 1, PageSize: 50})
+	if err != nil {
+		t.Fatalf("list deleted drive filtered: %v", err)
+	}
+	if driveTotal != 1 || len(driveFiltered) != 1 || driveFiltered[0].ID != "d3" {
+		t.Fatalf("drive filtered = total %d items %#v, want only d3", driveTotal, driveFiltered)
+	}
+
+	combined, combinedTotal, err := cat.ListDeletedVideos(ctx, ListParams{Keyword: "movie", DriveID: "archive", Page: 1, PageSize: 50})
+	if err != nil {
+		t.Fatalf("list deleted combined filtered: %v", err)
+	}
+	if combinedTotal != 0 || len(combined) != 0 {
+		t.Fatalf("combined filtered total/len = %d/%d, want 0/0", combinedTotal, len(combined))
 	}
 
 	// 移出黑名单
@@ -110,7 +143,7 @@ func TestBlacklistListAndRemove(t *testing.T) {
 	if deleted, err := cat.IsVideoDeleted(ctx, "d1"); err != nil || deleted {
 		t.Fatalf("d1 should no longer be blacklisted (deleted=%v err=%v)", deleted, err)
 	}
-	_, total, err = cat.ListDeletedVideos(ctx, "", 1, 50)
+	_, total, err = cat.ListDeletedVideos(ctx, ListParams{Page: 1, PageSize: 50})
 	if err != nil {
 		t.Fatalf("list deleted after remove: %v", err)
 	}

@@ -14,8 +14,7 @@ export function DeleteDriveModal({
   onConfirm: () => void;
 }) {
   const name = drive?.name || drive?.id || "";
-  const isSpider91 = drive?.kind === "spider91";
-  const title = isSpider91 ? "删除 91Spider" : "删除存储";
+  const title = "删除存储";
   const primaryText = deleting ? "删除中..." : "确认删除";
 
   return (

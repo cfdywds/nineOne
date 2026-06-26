@@ -1,16 +1,18 @@
 import { useEffect, useId, useRef, ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 
 type Props = {
   open: boolean;
-  title: string;
+  title?: string;
+  ariaLabel?: string;
   onClose: () => void;
   children: ReactNode;
   footer?: ReactNode;
   className?: string;
 };
 
-export function Modal({ open, title, onClose, children, footer, className = "" }: Props) {
+export function Modal({ open, title, ariaLabel, onClose, children, footer, className = "" }: Props) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
   const titleId = useId();
@@ -74,18 +76,19 @@ export function Modal({ open, title, onClose, children, footer, className = "" }
   }, [open]);
 
   if (!open) return null;
-  return (
+  return createPortal(
     <div className="admin-modal-backdrop">
       <div
         ref={dialogRef}
         className={`admin-modal${className ? ` ${className}` : ""}`}
         role="dialog"
         aria-modal="true"
-        aria-labelledby={titleId}
+        aria-labelledby={title ? titleId : undefined}
+        aria-label={title ? undefined : ariaLabel ?? "对话框"}
         tabIndex={-1}
       >
-        <div className="admin-modal__header">
-          <span id={titleId}>{title}</span>
+        <div className={`admin-modal__header${title ? "" : " is-titleless"}`}>
+          {title && <span id={titleId}>{title}</span>}
           <button
             type="button"
             className="admin-btn"
@@ -99,7 +102,8 @@ export function Modal({ open, title, onClose, children, footer, className = "" }
         <div className="admin-modal__body">{children}</div>
         {footer && <div className="admin-modal__footer">{footer}</div>}
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
 

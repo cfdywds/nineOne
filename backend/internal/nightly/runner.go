@@ -1,19 +1,19 @@
 // Package nightly orchestrates the single nightly maintenance pipeline that
-// replaces the legacy scanLoop / crawlerLoop / spider91 migrator periodic loop.
+// replaces the legacy scanLoop / crawlerLoop / crawler upload periodic loop.
 //
 // Pipeline (fired once per day at cron_hour, also via TriggerNow for admin
 // "扫描所有网盘"):
 //
-//	Phase 1: for each non-spider91 cloud drive
+//	Phase 1: for each non-crawler cloud drive
 //	           scan + delete-detection + enqueue thumb + enqueue preview video
 //	         wait until all thumb / preview-video queues are idle
-//	Phase 2: if any spider91 drive configured
+//	Phase 2: if any script crawler configured
 //	           crawl + enqueue preview video for new videos
 //	         wait until preview-video queues are idle
-//	Phase 3: spider91 → cloud migration (single sweep, captcha cooldown still
+//	Phase 3: crawler local video → cloud upload (single sweep, captcha cooldown still
 //	         honored within this call)
-//	Phase 4: cleanup duplicate local preview/thumbnail assets after sampled
-//	         fingerprints have identified canonical videos
+//	Phase 4: full-library duplicate video maintenance:
+//	         exact size+sampled_sha256 dedupe, then title/duration/thumbnail dedupe
 //
 // A 6h soft deadline guards each pipeline run; phases check deadline at their
 // boundaries and exit cleanly if exceeded (no in-flight ffmpeg / upload is
@@ -64,38 +64,32 @@ type Config struct {
 	MaxDuration time.Duration
 
 	// ListScanTargets returns the drive IDs to run Phase 1 on, in deterministic
-	// order. Should exclude spider91 and localupload drives.
+	// order. Should exclude crawler and localupload drives.
 	ListScanTargets func(ctx context.Context) []string
 
 	// RunScan synchronously runs scan + cleanup + enqueueDriveGeneration for
 	// one drive. Errors are expected to be logged inside, not surfaced.
 	RunScan func(ctx context.Context, driveID string)
 
-	// ListSpider91Drives returns spider91 drive IDs to crawl in Phase 2.
-	// Returns empty slice when no spider91 drive is configured.
-	ListSpider91Drives func(ctx context.Context) []string
+	// ListCrawlerDrives returns script crawler drive IDs to crawl in Phase 2.
+	// Returns empty slice when no crawler is configured.
+	ListCrawlerDrives func(ctx context.Context) []string
 
-	// RunSpider91Crawl synchronously runs one crawl cycle (downloads + thumbs +
-	// preview-video enqueue) for a single spider91 drive.
-	RunSpider91Crawl func(ctx context.Context, driveID string)
-
-	// ListSpiderXVideosDrives returns spiderxvideos drive IDs to crawl in Phase 2.
-	ListSpiderXVideosDrives func(ctx context.Context) []string
-
-	// RunSpiderXVideosCrawl synchronously runs one crawl cycle for a spiderxvideos drive.
-	RunSpiderXVideosCrawl func(ctx context.Context, driveID string)
+	// RunCrawlerCrawl synchronously runs one crawl cycle (downloads + thumbs +
+	// preview-video enqueue) for a single crawler drive.
+	RunCrawlerCrawl func(ctx context.Context, driveID string)
 
 	// WaitPreviewQueuesIdle blocks until both the thumbnail and preview-video queues
 	// across all drives are drained (queue empty + no in-flight task). It must
 	// honor ctx cancellation.
 	WaitPreviewQueuesIdle func(ctx context.Context) error
 
-	// RunMigration runs spider91migrate.Migrator.RunOnce for Phase 3.
+	// RunMigration runs crawlerupload.Migrator.RunOnce for Phase 3.
 	RunMigration func(ctx context.Context) error
 
-	// RunDedupeAssetCleanup removes generated local assets from non-canonical
-	// videos in size+sampled_sha256 duplicate groups. It must not delete cloud
-	// files or catalog rows.
+	// RunDedupeAssetCleanup runs full-library duplicate video maintenance. It
+	// removes duplicate catalog rows and local generated assets, but never
+	// deletes cloud source files.
 	RunDedupeAssetCleanup func(ctx context.Context) error
 
 	// Now is injected for tests; nil → time.Now.
@@ -357,39 +351,23 @@ func (r *Runner) runPipeline(ctx context.Context) {
 	if r.checkDeadline(ctx, "phase 2") {
 		return
 	}
-	spiderIDs := []string{}
-	if r.cfg.ListSpider91Drives != nil {
-		spiderIDs = r.cfg.ListSpider91Drives(ctx)
+	crawlerIDs := []string{}
+	if r.cfg.ListCrawlerDrives != nil {
+		crawlerIDs = r.cfg.ListCrawlerDrives(ctx)
 	}
-	spiderXVideosIDs := []string{}
-	if r.cfg.ListSpiderXVideosDrives != nil {
-		spiderXVideosIDs = r.cfg.ListSpiderXVideosDrives(ctx)
-	}
-	if len(spiderIDs) == 0 && len(spiderXVideosIDs) == 0 {
-		log.Printf("[nightly] phase 2/3 skipped: no crawler drive configured")
+	if len(crawlerIDs) == 0 {
+		log.Printf("[nightly] phase 2/3 skipped: no crawler configured")
 		r.runDedupeAssetCleanupPhase(ctx)
 		return
 	}
-	log.Printf("[nightly] phase 2: crawling %d spider91 drive(s), %d spiderxvideos drive(s)", len(spiderIDs), len(spiderXVideosIDs))
-	for _, id := range spiderIDs {
+	log.Printf("[nightly] phase 2: crawling %d crawler drive(s)", len(crawlerIDs))
+	for _, id := range crawlerIDs {
 		if ctx.Err() != nil {
 			log.Printf("[nightly] phase 2 aborted by ctx: %v", ctx.Err())
 			return
 		}
 		log.Printf("[nightly] phase 2: crawling drive=%s", id)
-		if r.cfg.RunSpider91Crawl != nil {
-			r.cfg.RunSpider91Crawl(ctx, id)
-		}
-	}
-	for _, id := range spiderXVideosIDs {
-		if ctx.Err() != nil {
-			log.Printf("[nightly] phase 2 aborted by ctx: %v", ctx.Err())
-			return
-		}
-		log.Printf("[nightly] phase 2: crawling drive=%s", id)
-		if r.cfg.RunSpiderXVideosCrawl != nil {
-			r.cfg.RunSpiderXVideosCrawl(ctx, id)
-		}
+		r.cfg.RunCrawlerCrawl(ctx, id)
 	}
 	log.Printf("[nightly] phase 2: waiting for teaser queue to drain")
 	if err := r.waitIdle(ctx, "phase 2"); err != nil {
@@ -400,7 +378,7 @@ func (r *Runner) runPipeline(ctx context.Context) {
 	if r.checkDeadline(ctx, "phase 3") {
 		return
 	}
-	log.Printf("[nightly] phase 3: spider91 migration")
+	log.Printf("[nightly] phase 3: crawler upload")
 	if r.cfg.RunMigration != nil {
 		if err := r.cfg.RunMigration(ctx); err != nil {
 			log.Printf("[nightly] phase 3 migration: %v", err)
@@ -440,9 +418,9 @@ func (r *Runner) runDedupeAssetCleanupPhase(ctx context.Context) {
 	if r.cfg.RunDedupeAssetCleanup == nil {
 		return
 	}
-	log.Printf("[nightly] phase 4: duplicate asset cleanup")
+	log.Printf("[nightly] phase 4: duplicate video maintenance")
 	if err := r.cfg.RunDedupeAssetCleanup(ctx); err != nil {
-		log.Printf("[nightly] phase 4 duplicate asset cleanup: %v", err)
+		log.Printf("[nightly] phase 4 duplicate video maintenance: %v", err)
 	}
 }
 

@@ -3,35 +3,32 @@
 package api
 
 import (
+	"fmt"
+	"path/filepath"
 	"syscall"
 	"unsafe"
 
 	"github.com/video-site/backend/internal/storageusage"
 )
 
-var procGetDiskFreeSpaceExW = syscall.NewLazyDLL("kernel32.dll").NewProc("GetDiskFreeSpaceExW")
-
 func localDiskStats(path string) (storageusage.DiskStats, error) {
-	pathPtr, err := syscall.UTF16PtrFromString(path)
+	path, err := filepath.Abs(path)
 	if err != nil {
 		return storageusage.DiskStats{}, err
 	}
-	var availableBytes uint64
-	var capacityBytes uint64
-	r1, _, callErr := procGetDiskFreeSpaceExW.Call(
-		uintptr(unsafe.Pointer(pathPtr)),
-		uintptr(unsafe.Pointer(&availableBytes)),
-		uintptr(unsafe.Pointer(&capacityBytes)),
-		0,
-	)
-	if r1 == 0 {
-		if callErr != syscall.Errno(0) {
-			return storageusage.DiskStats{}, callErr
-		}
-		return storageusage.DiskStats{}, syscall.EINVAL
+	h, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return storageusage.DiskStats{}, err
+	}
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+	proc := kernel32.NewProc("GetDiskFreeSpaceExW")
+	var freeBytesAvailable, totalBytes uint64
+	r, _, _ := proc.Call(uintptr(unsafe.Pointer(h)), uintptr(unsafe.Pointer(&freeBytesAvailable)), uintptr(unsafe.Pointer(&totalBytes)), 0)
+	if r == 0 {
+		return storageusage.DiskStats{}, fmt.Errorf("GetDiskFreeSpaceEx failed")
 	}
 	return storageusage.DiskStats{
-		AvailableBytes: int64(availableBytes),
-		CapacityBytes:  int64(capacityBytes),
+		AvailableBytes: int64(freeBytesAvailable),
+		CapacityBytes:  int64(totalBytes),
 	}, nil
 }

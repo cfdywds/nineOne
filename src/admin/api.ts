@@ -37,7 +37,7 @@ async function request<T>(
 }
 
 export function login(username: string, password: string) {
-  return request<{ ok: boolean }>("/login", {
+  return request<{ ok: boolean; role?: string }>("/login", {
     method: "POST",
     body: JSON.stringify({ username, password }),
   });
@@ -59,7 +59,7 @@ export function logout() {
 }
 
 export function me() {
-  return request<{ authenticated: boolean }>("/me");
+  return request<{ authenticated: boolean; role?: string }>("/me");
 }
 
 export type UpdateCheck = {
@@ -78,7 +78,7 @@ export function checkUpdate() {
 
 export type AdminDrive = {
   id: string;
-  kind: "quark" | "p115" | "p123" | "pikpak" | "wopan" | "guangyapan" | "onedrive" | "googledrive" | "localstorage" | "spider91" | "spiderxvideos";
+  kind: "quark" | "p115" | "p123" | "pikpak" | "wopan" | "guangyapan" | "onedrive" | "googledrive" | "localstorage";
   name: string;
   rootId: string;
   status: string;
@@ -92,12 +92,6 @@ export type AdminDrive = {
    * 替代旧版硬编码 p115 "影视" 目录例外分支。
    */
   skipDirIds: string[];
-  // spider91 上次成功爬取时间（unix 秒）；其它 kind 留空。
-  lastCrawlAt?: number;
-  // spider91 专用代理地址；仅后台管理接口返回，用于编辑表单回显。
-  spider91Proxy?: string;
-  // spider crawler editable config returned for edit form rehydration.
-  spiderCrawlerConfig?: Record<string, string>;
   // Google Drive 是否使用 OpenList 在线续期 API；未配置时后端按 true 返回。
   googleDriveUseOnlineAPI?: boolean;
   // Google Drive OpenList 在线续期 API 地址；为空时后端使用驱动默认值。
@@ -159,7 +153,7 @@ export function getDriveStorage() {
 
 export type UpsertDriveInput = {
   id: string;
-  kind: "quark" | "p115" | "p123" | "pikpak" | "wopan" | "guangyapan" | "onedrive" | "googledrive" | "localstorage" | "spider91" | "spiderxvideos";
+  kind: "quark" | "p115" | "p123" | "pikpak" | "wopan" | "guangyapan" | "onedrive" | "googledrive" | "localstorage";
   name: string;
   rootId: string;
   credentials: Record<string, string>;
@@ -203,37 +197,12 @@ export function stopDriveTasks(id: string) {
   );
 }
 
-export type DriveCrawlStatus = {
-  driveId: string;
-  kind?: string;
-  state: "idle" | "running" | "ok" | "error" | "canceled" | string;
-  message?: string;
-  lastError?: string;
-  targetNew?: number;
-  totalEntries?: number;
-  newVideos?: number;
-  skipped?: number;
-  failed?: number;
-  seenSnapshot?: number;
-  outputJson?: string;
-  seenFile?: string;
-  startedAt?: string;
-  finishedAt?: string;
-  logs?: string[];
-};
-
-export function getDriveCrawlStatus(id: string) {
-  return request<DriveCrawlStatus>(
-    `/drives/${encodeURIComponent(id)}/crawl/status`
-  );
-}
-
 // ---------- Crawlers ----------
 
 export type AdminCrawler = {
   id: string;
   name: string;
-  kind: "scriptcrawler" | "spider91";
+  kind: "scriptcrawler";
   status: string;
   lastError?: string;
   scriptPath: string;
@@ -560,7 +529,6 @@ export type AdminVideo = {
   favorites: number;
   comments: number;
   likes: number;
-  category: string;
   badges: string[];
   description: string;
   publishedAt: string;
@@ -604,6 +572,7 @@ export type AdminDeletedVideo = {
   fileId: string;
   fileName: string;
   size: number;
+  reason?: string;
   deletedAt: number;
 };
 
@@ -614,8 +583,11 @@ export type AdminBlacklistList = {
   size: number;
 };
 
-export function listBlacklist(params: { page?: number; size?: number; keyword?: string } = {}) {
+export function listBlacklist(
+  params: { driveId?: string; page?: number; size?: number; keyword?: string } = {}
+) {
   const qs = new URLSearchParams();
+  if (params.driveId) qs.set("driveId", params.driveId);
   if (params.page) qs.set("page", String(params.page));
   if (params.size) qs.set("size", String(params.size));
   if (params.keyword) qs.set("keyword", params.keyword);
@@ -634,7 +606,6 @@ export type UpdateVideoInput = Partial<{
   title: string;
   author: string;
   tags: string[];
-  category: string;
   badges: string[];
   description: string;
   thumbnail: string;
@@ -700,12 +671,6 @@ export type Theme = "dark" | "pink" | "sky";
 
 export type Settings = {
   theme: Theme;
-  /**
-   * spider91 视频迁移到云盘时的目标 drive ID（必须是已挂载的 pikpak、p115、p123、onedrive、googledrive 或 wopan drive）。
-   * - 空字符串：本地保存，不上传到云盘。
-   * - 非空：显式指定。后端会校验 drive 存在且 kind ∈ {pikpak, p115, p123, onedrive, googledrive, wopan}。
-   */
-  spider91UploadDriveId: string;
 };
 
 export function getSettings() {
@@ -758,4 +723,62 @@ export function stopAllTasks() {
     "/tasks/stop",
     { method: "POST" }
   );
+}
+
+// ---------- Users ----------
+
+export type AdminUser = {
+  id: number;
+  username: string;
+  role: string;
+  banned: boolean;
+  createdAt: number;
+};
+
+export function listUsers() {
+  return request<AdminUser[]>("/users");
+}
+
+export function createUser(body: { username: string; password: string; role: string }) {
+  return request<{ ok: boolean; id: number }>("/users", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function deleteUser(id: number) {
+  return request<{ ok: boolean }>(`/users/${id}`, { method: "DELETE" });
+}
+
+export function banUser(id: number) {
+  return request<{ ok: boolean }>(`/users/${id}/ban`, { method: "POST" });
+}
+
+export function unbanUser(id: number) {
+  return request<{ ok: boolean }>(`/users/${id}/unban`, { method: "POST" });
+}
+
+export function resetPassword(id: number, password: string) {
+  return request<{ ok: boolean }>(`/users/${id}/password`, {
+    method: "PUT",
+    body: JSON.stringify({ password }),
+  });
+}
+
+// ---------- Banned IPs ----------
+
+export type BannedIP = {
+  ip: string;
+  reason: string;
+  createdAt: number;
+};
+
+export function listBannedIPs() {
+  return request<BannedIP[]>("/banned-ips");
+}
+
+export function unbanIP(ip: string) {
+  return request<{ ok: boolean }>(`/banned-ips/${encodeURIComponent(ip)}`, {
+    method: "DELETE",
+  });
 }

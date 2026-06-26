@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -133,9 +132,6 @@ func DryRun(ctx context.Context, cfg DryRunConfig) *DryRunResult {
 	pythonPath := strings.TrimSpace(cfg.PythonPath)
 	if pythonPath == "" {
 		pythonPath = "python3"
-		if runtime.GOOS == "windows" {
-			pythonPath = "python"
-		}
 	}
 	maxItems := cfg.MaxItems
 	if maxItems <= 0 {
@@ -199,7 +195,7 @@ func DryRun(ctx context.Context, cfg DryRunConfig) *DryRunResult {
 
 	cmd := exec.CommandContext(runCtx, pythonPath, scriptPath, "--job", jobPath)
 	cmd.Dir = filepath.Dir(scriptPath)
-	configureDryRunProcess(cmd)
+	setDryRunProcAttr(cmd)
 	cmd.Cancel = func() error {
 		return killDryRunProcess(cmd)
 	}

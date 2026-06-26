@@ -1,0 +1,280 @@
+package crawlerupload
+
+import (
+	"context"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/video-site/backend/internal/catalog"
+	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/drives/scriptcrawler"
+)
+
+type fakeRegistry struct {
+	byID map[string]drives.Drive
+}
+
+func newFakeRegistry() *fakeRegistry {
+	return &fakeRegistry{byID: make(map[string]drives.Drive)}
+}
+
+func (r *fakeRegistry) Add(d drives.Drive) {
+	r.byID[d.ID()] = d
+}
+
+func (r *fakeRegistry) Get(id string) (drives.Drive, bool) {
+	d, ok := r.byID[id]
+	return d, ok
+}
+
+func (r *fakeRegistry) All() []drives.Drive {
+	out := make([]drives.Drive, 0, len(r.byID))
+	for _, d := range r.byID {
+		out = append(out, d)
+	}
+	return out
+}
+
+type fakeUploadDrive struct {
+	id          string
+	kind        string
+	rootID      string
+	mu          sync.Mutex
+	uploadCalls int
+	gotBodies   map[string][]byte
+	gotParents  map[string]string
+	ensureCalls []string
+}
+
+func newFakeUploadDrive(id, kind, rootID string) *fakeUploadDrive {
+	return &fakeUploadDrive{
+		id:         id,
+		kind:       kind,
+		rootID:     rootID,
+		gotBodies:  make(map[string][]byte),
+		gotParents: make(map[string]string),
+	}
+}
+
+func (d *fakeUploadDrive) Kind() string { return d.kind }
+func (d *fakeUploadDrive) ID() string   { return d.id }
+func (d *fakeUploadDrive) RootID() string {
+	return d.rootID
+}
+func (d *fakeUploadDrive) Init(context.Context) error { return nil }
+func (d *fakeUploadDrive) List(context.Context, string) ([]drives.Entry, error) {
+	return nil, nil
+}
+func (d *fakeUploadDrive) Stat(context.Context, string) (*drives.Entry, error) {
+	return nil, drives.ErrNotSupported
+}
+func (d *fakeUploadDrive) StreamURL(context.Context, string) (*drives.StreamLink, error) {
+	return nil, drives.ErrNotSupported
+}
+func (d *fakeUploadDrive) Upload(context.Context, string, string, io.Reader, int64) (string, error) {
+	return "", drives.ErrNotSupported
+}
+func (d *fakeUploadDrive) EnsureDir(_ context.Context, pathFromRoot string) (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.ensureCalls = append(d.ensureCalls, pathFromRoot)
+	return d.rootID + "/" + pathFromRoot, nil
+}
+func (d *fakeUploadDrive) Rename(context.Context, string, string) error {
+	return nil
+}
+func (d *fakeUploadDrive) UploadAndReportHash(_ context.Context, parentID, name string, r io.Reader, _ int64) (UploadResult, error) {
+	body, _ := io.ReadAll(r)
+	d.mu.Lock()
+	d.uploadCalls++
+	d.gotBodies[name] = body
+	d.gotParents[name] = parentID
+	d.mu.Unlock()
+	return UploadResult{FileID: "remote-" + name, Hash: strings.Repeat("a", 40), Size: int64(len(body))}, nil
+}
+
+var _ drives.Drive = (*fakeUploadDrive)(nil)
+var _ uploadTarget = (*fakeUploadDrive)(nil)
+
+func TestRunOnceUploadsScriptCrawlerLocalVideo(t *testing.T) {
+	ctx := context.Background()
+	cat := setupCatalog(t)
+	src := setupScriptCrawler(t, "crawler-one")
+	target := newFakeUploadDrive("target-drive", "pikpak", "target-root")
+	reg := newFakeRegistry()
+	reg.Add(src)
+	reg.Add(target)
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:            src.ID(),
+		Kind:          scriptcrawler.Kind,
+		Name:          "Example Crawler",
+		RootID:        "/",
+		Credentials:   map[string]string{"script_path": "/tmp/example.py", "upload_drive_id": target.ID()},
+		TeaserEnabled: true,
+	}); err != nil {
+		t.Fatalf("upsert crawler drive: %v", err)
+	}
+
+	videoID := writeCrawlerVideo(t, cat, src, "source-001", ".mp4", []byte("video payload"), true)
+	commonThumbDir := filepath.Join(t.TempDir(), "thumbs")
+	m := New(Config{Catalog: cat, Registry: reg, CommonThumbDir: commonThumbDir})
+
+	if err := m.RunOnce(ctx); err != nil {
+		t.Fatalf("run once: %v", err)
+	}
+
+	wantName := desiredUploadName("Sample source-001", "source-001", "mp4")
+	if target.uploadCalls != 1 {
+		t.Fatalf("upload calls = %d, want 1", target.uploadCalls)
+	}
+	if got := string(target.gotBodies[wantName]); got != "video payload" {
+		t.Fatalf("uploaded body = %q, want payload", got)
+	}
+	if got := target.gotParents[wantName]; got != "target-root/Script Crawlers/crawler-one" {
+		t.Fatalf("upload parent = %q, want crawler folder", got)
+	}
+	if len(target.ensureCalls) != 1 || target.ensureCalls[0] != "Script Crawlers/crawler-one" {
+		t.Fatalf("ensure calls = %#v, want crawler upload folder", target.ensureCalls)
+	}
+
+	got, err := cat.GetVideo(ctx, videoID)
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if got.DriveID != target.ID() || !strings.HasPrefix(got.FileID, "remote-") {
+		t.Fatalf("catalog target = drive %q file %q, want target drive", got.DriveID, got.FileID)
+	}
+	if got.FileName != wantName {
+		t.Fatalf("file_name = %q, want %q", got.FileName, wantName)
+	}
+	if _, err := os.Stat(filepath.Join(src.VideosDir(), "source-001.mp4")); !os.IsNotExist(err) {
+		t.Fatalf("local video still exists or stat failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(src.ThumbsDir(), "source-001.jpg")); !os.IsNotExist(err) {
+		t.Fatalf("local thumb still exists or stat failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(commonThumbDir, videoID+".jpg")); err != nil {
+		t.Fatalf("common thumbnail missing: %v", err)
+	}
+}
+
+func TestRunOnceRequiresPerCrawlerUploadTarget(t *testing.T) {
+	ctx := context.Background()
+	cat := setupCatalog(t)
+	src := setupScriptCrawler(t, "crawler-local-only")
+	target := newFakeUploadDrive("target-drive", "pikpak", "target-root")
+	reg := newFakeRegistry()
+	reg.Add(src)
+	reg.Add(target)
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:            src.ID(),
+		Kind:          scriptcrawler.Kind,
+		Name:          "Local Only",
+		RootID:        "/",
+		Credentials:   map[string]string{"script_path": "/tmp/example.py"},
+		TeaserEnabled: true,
+	}); err != nil {
+		t.Fatalf("upsert crawler drive: %v", err)
+	}
+	videoID := writeCrawlerVideo(t, cat, src, "source-002", ".mp4", []byte("video payload"), true)
+
+	m := New(Config{Catalog: cat, Registry: reg})
+	if err := m.RunOnce(ctx); err != nil {
+		t.Fatalf("run once: %v", err)
+	}
+	if target.uploadCalls != 0 {
+		t.Fatalf("upload calls = %d, want 0", target.uploadCalls)
+	}
+	got, err := cat.GetVideo(ctx, videoID)
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if got.DriveID != src.ID() {
+		t.Fatalf("drive_id = %q, want local crawler drive", got.DriveID)
+	}
+}
+
+func TestAdaptUploadTargetRejectsUnsupportedTarget(t *testing.T) {
+	src := scriptcrawler.New(scriptcrawler.Config{ID: "crawler", RootDir: t.TempDir()})
+	_, err := adaptUploadTarget(src)
+	if err == nil || !strings.Contains(err.Error(), "does not support crawler upload") {
+		t.Fatalf("err = %v, want unsupported crawler upload target", err)
+	}
+}
+
+func setupCatalog(t *testing.T) *catalog.Catalog {
+	t.Helper()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "video-site.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+	return cat
+}
+
+func setupScriptCrawler(t *testing.T, id string) *scriptcrawler.Driver {
+	t.Helper()
+	d := scriptcrawler.New(scriptcrawler.Config{ID: id, RootDir: t.TempDir()})
+	if err := d.Init(context.Background()); err != nil {
+		t.Fatalf("scriptcrawler init: %v", err)
+	}
+	return d
+}
+
+func writeCrawlerVideo(t *testing.T, cat *catalog.Catalog, d *scriptcrawler.Driver, sourceID, ext string, content []byte, readyAssets bool) string {
+	t.Helper()
+	ctx := context.Background()
+	fileID := sourceID + ext
+	videoPath, err := d.VideoPath(fileID)
+	if err != nil {
+		t.Fatalf("video path: %v", err)
+	}
+	if err := os.WriteFile(videoPath, content, 0o644); err != nil {
+		t.Fatalf("write video: %v", err)
+	}
+	thumbPath, err := d.ThumbPath(sourceID + ".jpg")
+	if err != nil {
+		t.Fatalf("thumb path: %v", err)
+	}
+	if err := os.WriteFile(thumbPath, []byte("thumb"), 0o644); err != nil {
+		t.Fatalf("write thumb: %v", err)
+	}
+
+	now := time.Now()
+	videoID := scriptcrawler.BuildVideoID(d.ID(), sourceID)
+	previewStatus := "pending"
+	fingerprintStatus := "pending"
+	sampled := ""
+	if readyAssets {
+		previewStatus = "ready"
+		fingerprintStatus = "ready"
+		sampled = strings.Repeat("b", 64)
+	}
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:                videoID,
+		DriveID:           d.ID(),
+		FileID:            fileID,
+		FileName:          fileID,
+		Title:             "Sample " + sourceID,
+		Author:            "tester",
+		Ext:               strings.TrimPrefix(ext, "."),
+		Quality:           "HD",
+		Size:              int64(len(content)),
+		PreviewStatus:     previewStatus,
+		FingerprintStatus: fingerprintStatus,
+		SampledSHA256:     sampled,
+		PublishedAt:       now,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}); err != nil {
+		t.Fatalf("upsert video: %v", err)
+	}
+	return videoID
+}

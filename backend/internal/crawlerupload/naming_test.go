@@ -1,4 +1,4 @@
-package spider91migrate
+package crawlerupload
 
 import (
 	"strings"
@@ -13,11 +13,11 @@ func TestSanitizeTitleHandlesCommonCases(t *testing.T) {
 		{"hello", "hello"},
 		{"  hello  ", "hello"},
 		{"hello\nworld", "hello world"},
-		{"hello / world", "hello world"},          // 单 forbidden 折叠成空格
+		{"hello / world", "hello world"}, // 单 forbidden 折叠成空格
 		{"a/b\\c:d*e?f\"g<h>i|j", "a b c d e f g h i j"},
-		{"a   b", "a b"},                          // 多空格折叠
+		{"a   b", "a b"}, // 多空格折叠
 		{"a\t\nb", "a b"},
-		{"...trim.dots...", "trim.dots"},          // 首尾点号被 trim 掉
+		{"...trim.dots...", "trim.dots"},           // 首尾点号被 trim 掉
 		{"control\x01char\x1f\x7f", "controlchar"}, // 控制字符直接丢弃
 		{"", "video"},                              // 空串回退
 		{"  /  ", "video"},                         // 全是 forbidden+空白 → 回退
@@ -51,22 +51,22 @@ func TestSanitizeTitleKeepsCJKAndUnicode(t *testing.T) {
 	}
 }
 
-func TestExtractViewKey(t *testing.T) {
+func TestExtractSourceID(t *testing.T) {
 	cases := []struct{ in, want string }{
-		{"spider91-91Spider-476fa8bf4b47e672d2fa", "476fa8bf4b47e672d2fa"},
-		{"spider91-91Spider-1587338723", "1587338723"},
-		{"spider91-some-drive-with-dashes-vk001", "vk001"}, // LastIndex 拿尾段
+		{"scriptcrawler-demo-476fa8bf4b47e672d2fa", "476fa8bf4b47e672d2fa"},
+		{"scriptcrawler-demo-1587338723", "1587338723"},
+		{"scriptcrawler-some-drive-with-dashes-vk001", "vk001"}, // LastIndex 拿尾段
 		{"no-dashes-after-prefix", "prefix"},
 		{"single", "single"}, // 没 dash → 原样返回
 	}
 	for _, c := range cases {
-		if got := extractViewKey(c.in); got != c.want {
-			t.Errorf("extractViewKey(%q) = %q, want %q", c.in, got, c.want)
+		if got := extractSourceID(c.in); got != c.want {
+			t.Errorf("extractSourceID(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }
 
-func TestViewKeySuffix(t *testing.T) {
+func TestSourceIDSuffix(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"476fa8bf4b47e672d2fa", "e672d2fa"},
 		{"1587338723", "87338723"},
@@ -76,15 +76,15 @@ func TestViewKeySuffix(t *testing.T) {
 		{"123456789", "23456789"},
 	}
 	for _, c := range cases {
-		if got := viewKeySuffix(c.in); got != c.want {
-			t.Errorf("viewKeySuffix(%q) = %q, want %q", c.in, got, c.want)
+		if got := sourceIDSuffix(c.in); got != c.want {
+			t.Errorf("sourceIDSuffix(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }
 
-func TestDesiredPikPakName(t *testing.T) {
+func TestDesiredUploadName(t *testing.T) {
 	cases := []struct {
-		title, viewkey, ext, want string
+		title, sourceID, ext, want string
 	}{
 		{
 			"超白大奶律师约炮第一季",
@@ -112,7 +112,7 @@ func TestDesiredPikPakName(t *testing.T) {
 		},
 		{
 			"title",
-			"", // 空 viewkey → 退化成 "<title>.<ext>"
+			"", // 空 sourceID → 退化成 "<title>.<ext>"
 			"webm",
 			"title.webm",
 		},
@@ -130,9 +130,9 @@ func TestDesiredPikPakName(t *testing.T) {
 		},
 	}
 	for _, c := range cases {
-		got := desiredPikPakName(c.title, c.viewkey, c.ext)
+		got := desiredUploadName(c.title, c.sourceID, c.ext)
 		if got != c.want {
-			t.Errorf("desiredPikPakName(%q,%q,%q) = %q, want %q", c.title, c.viewkey, c.ext, got, c.want)
+			t.Errorf("desiredUploadName(%q,%q,%q) = %q, want %q", c.title, c.sourceID, c.ext, got, c.want)
 		}
 	}
 }

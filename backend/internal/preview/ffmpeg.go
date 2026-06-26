@@ -1589,11 +1589,6 @@ func (w *ThumbWorker) process(ctx context.Context, v *catalog.Video) bool {
 		return false
 	}
 	_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{ThumbnailStatus: "pending"})
-	if isSpider91OriginVideo(v) {
-		log.Printf("[thumb] skip %s: spider91-origin video must use crawled thumbnail", v.Title)
-		_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{ThumbnailStatus: "failed"})
-		return false
-	}
 	link, err := w.streamLink(ctx, v)
 	if err != nil {
 		if w.pauseForRecoverableError(ctx, v, err, "streamURL") {
@@ -1673,10 +1668,6 @@ func (w *ThumbWorker) generateThumbnailFromLink(ctx context.Context, v *catalog.
 	}
 	log.Printf("[thumb] ready %s", v.Title)
 	return nil
-}
-
-func isSpider91OriginVideo(v *catalog.Video) bool {
-	return v != nil && strings.HasPrefix(v.ID, "spider91-")
 }
 
 func localPreviewLink(v *catalog.Video) (*drives.StreamLink, bool) {

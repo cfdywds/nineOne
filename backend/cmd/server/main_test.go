@@ -1,68 +1,78 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"io"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
+	"github.com/video-site/backend/internal/auth"
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/drives"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
-	"github.com/video-site/backend/internal/drives/spider91"
-	"github.com/video-site/backend/internal/drives/spiderxvideos"
 	"github.com/video-site/backend/internal/fingerprint"
 	"github.com/video-site/backend/internal/preview"
 	"github.com/video-site/backend/internal/proxy"
 )
 
-func TestDefaultCrawlerPythonPathMatchesPlatform(t *testing.T) {
-	got := defaultCrawlerPythonPath()
-	want := "python3"
-	if runtime.GOOS == "windows" {
-		want = "python"
+func TestHashPasswordCommandProducesBcryptHash(t *testing.T) {
+	var out bytes.Buffer
+	if err := runHashPasswordCommand(strings.NewReader("secret123"), &out); err != nil {
+		t.Fatalf("hash password: %v", err)
 	}
-	if got != want {
-		t.Fatalf("defaultCrawlerPythonPath() = %q, want %q", got, want)
+	hash := strings.TrimSpace(out.String())
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte("secret123")); err != nil {
+		t.Fatalf("hash does not verify: %v", err)
 	}
 }
 
-func TestDriveCrawlStatusTracksCrawlerProgressAndLogs(t *testing.T) {
-	app := &App{}
-	started := time.Date(2026, 6, 6, 1, 2, 3, 0, time.UTC)
-
-	app.updateSpiderXVideosCrawlProgress("xv-main", spiderxvideos.CrawlResult{
-		TargetNew:    10,
-		TotalEntries: 7,
-		NewVideos:    3,
-		Skipped:      2,
-		Failed:       1,
-		SeenSnapshot: 42,
-		OutputJSON:   "D:/data/spiderxvideos/xv-main/.crawl/target-10.json",
-		SeenFile:     "D:/data/spiderxvideos/xv-main/.crawl/seen.txt",
-		StartedAt:    started,
+func TestEnsureConfigAdminUserMigratesCustomConfigAdmin(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
 	})
-	app.appendDriveCrawlLog("xv-main", "python parsed page 1")
 
-	got := app.driveCrawlStatus("xv-main")
-	if got.DriveID != "xv-main" || got.Kind != spiderxvideos.Kind || got.State != "running" {
-		t.Fatalf("status identity = %#v, want running xvideos status", got)
+	cfg := &config.Config{}
+	cfg.Server.Admin.Username = "owner"
+	cfg.Server.Admin.Password = "secret123"
+
+	if err := ensureConfigAdminUser(ctx, cat, cfg); err != nil {
+		t.Fatalf("ensure config admin: %v", err)
 	}
-	if got.TargetNew != 10 || got.TotalEntries != 7 || got.NewVideos != 3 || got.Skipped != 2 || got.Failed != 1 || got.SeenSnapshot != 42 {
-		t.Fatalf("status counters = %#v, want live crawler counters", got)
+	u, err := cat.GetUserByUsername(ctx, "owner")
+	if err != nil {
+		t.Fatalf("get migrated user: %v", err)
 	}
-	if got.OutputJSON == "" || got.SeenFile == "" || got.StartedAt != started.Format(time.RFC3339) {
-		t.Fatalf("status result paths/time = %#v, want paths and startedAt", got)
+	if u.Role != "admin" {
+		t.Fatalf("role = %q, want admin", u.Role)
 	}
-	if len(got.Logs) != 1 || !strings.Contains(got.Logs[0], "python parsed page 1") {
-		t.Fatalf("logs = %#v, want script log line", got.Logs)
+
+	authr := &auth.Authenticator{Catalog: cat}
+	role, err := authr.UserLogin(httptest.NewRecorder(), httptest.NewRequest("POST", "/admin/api/login", nil), "owner", "secret123")
+	if err != nil {
+		t.Fatalf("login migrated user: %v", err)
+	}
+	if role != "admin" {
+		t.Fatalf("role = %q, want admin", role)
 	}
 }
 
@@ -514,31 +524,54 @@ func TestGuangYaPanGenerationCooldowns(t *testing.T) {
 	}
 }
 
-func TestRunSpider91MigrationAfterManualCrawlRequiresConfiguredUploadTarget(t *testing.T) {
+func TestRunCrawlerMigrationAfterManualCrawlRequiresCrawlerUploadTarget(t *testing.T) {
 	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:     "crawler-main",
+		Kind:   scriptcrawler.Kind,
+		Name:   "Crawler",
+		RootID: "/",
+		Credentials: map[string]string{
+			"script_path": "/tmp/crawler.py",
+		},
+	}); err != nil {
+		t.Fatalf("seed crawler: %v", err)
+	}
+
 	registry := proxy.NewRegistry()
-	migrator := &serverFakeSpider91MigrationRunner{}
+	migrator := &serverFakeCrawlerUploadRunner{}
 	app := &App{
+		cat:                cat,
 		registry:           registry,
-		spider91Migrator:   migrator,
+		crawlerUploader:    migrator,
 		workers:            map[string]*preview.Worker{},
 		thumbWorkers:       map[string]*preview.ThumbWorker{},
 		fingerprintWorkers: map[string]*fingerprint.Worker{},
 	}
 
-	app.runSpider91MigrationAfterManualCrawl(ctx, "91spider")
+	app.runCrawlerMigrationAfterManualCrawl(ctx, "crawler-main")
 	if migrator.called != 0 {
 		t.Fatalf("migration called without upload target")
 	}
 
-	app.spider91UploadDriveID = "pikpak"
-	app.runSpider91MigrationAfterManualCrawl(ctx, "91spider")
-	if migrator.called != 0 {
-		t.Fatalf("migration called when upload target is not attached")
+	d, err := cat.GetDrive(ctx, "crawler-main")
+	if err != nil {
+		t.Fatalf("get crawler: %v", err)
 	}
-
-	registry.Set("pikpak", &serverFakeKindDrive{id: "pikpak", kind: "pikpak"})
-	app.runSpider91MigrationAfterManualCrawl(ctx, "91spider")
+	d.Credentials["upload_drive_id"] = "pikpak"
+	if err := cat.UpsertDrive(ctx, d); err != nil {
+		t.Fatalf("set upload target: %v", err)
+	}
+	app.runCrawlerMigrationAfterManualCrawl(ctx, "crawler-main")
 	if migrator.called != 1 {
 		t.Fatalf("migration calls = %d, want 1", migrator.called)
 	}
@@ -569,11 +602,11 @@ func TestScheduleCrawlerUploadMigrationRunsForConfiguredCrawler(t *testing.T) {
 	}
 	registry := proxy.NewRegistry()
 	registry.Set("crawler-truvaze", &serverFakeKindDrive{id: "crawler-truvaze", kind: scriptcrawler.Kind})
-	migrator := &serverFakeSpider91MigrationRunner{}
+	migrator := &serverFakeCrawlerUploadRunner{}
 	app := &App{
 		cat:                cat,
 		registry:           registry,
-		spider91Migrator:   migrator,
+		crawlerUploader:    migrator,
 		workers:            map[string]*preview.Worker{},
 		thumbWorkers:       map[string]*preview.ThumbWorker{},
 		fingerprintWorkers: map[string]*fingerprint.Worker{},
@@ -612,8 +645,8 @@ func TestScheduleCrawlerUploadMigrationSkipsWithoutUploadTarget(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed crawler: %v", err)
 	}
-	migrator := &serverFakeSpider91MigrationRunner{}
-	app := &App{cat: cat, registry: proxy.NewRegistry(), spider91Migrator: migrator}
+	migrator := &serverFakeCrawlerUploadRunner{}
+	app := &App{cat: cat, registry: proxy.NewRegistry(), crawlerUploader: migrator}
 
 	if app.scheduleCrawlerUploadMigration(ctx, "crawler-local") {
 		t.Fatal("scheduleCrawlerUploadMigration returned true without upload target")
@@ -667,11 +700,11 @@ func TestScheduleManualCrawlerUploadMigrationRunsWhenAssetsReady(t *testing.T) {
 	registry := proxy.NewRegistry()
 	registry.Set("crawler-ready", &serverFakeKindDrive{id: "crawler-ready", kind: scriptcrawler.Kind})
 	registry.Set("pikpak-target", &serverFakeKindDrive{id: "pikpak-target", kind: "pikpak"})
-	migrator := &serverFakeSpider91MigrationRunner{}
+	migrator := &serverFakeCrawlerUploadRunner{}
 	app := &App{
 		cat:                cat,
 		registry:           registry,
-		spider91Migrator:   migrator,
+		crawlerUploader:    migrator,
 		workers:            map[string]*preview.Worker{},
 		thumbWorkers:       map[string]*preview.ThumbWorker{},
 		fingerprintWorkers: map[string]*fingerprint.Worker{},
@@ -730,8 +763,8 @@ func TestScheduleManualCrawlerUploadMigrationRejectsPendingFingerprint(t *testin
 	}); err != nil {
 		t.Fatalf("seed video: %v", err)
 	}
-	migrator := &serverFakeSpider91MigrationRunner{}
-	app := &App{cat: cat, registry: proxy.NewRegistry(), spider91Migrator: migrator}
+	migrator := &serverFakeCrawlerUploadRunner{}
+	app := &App{cat: cat, registry: proxy.NewRegistry(), crawlerUploader: migrator}
 
 	accepted, message := app.scheduleManualCrawlerUploadMigration(ctx, "crawler-pending")
 	if accepted {
@@ -932,9 +965,8 @@ func TestNightlyTargetsComeFromCatalogBeforeDriveAttach(t *testing.T) {
 	for _, d := range []*catalog.Drive{
 		{ID: "115", Kind: "p115", Name: "115", RootID: "0", TeaserEnabled: true},
 		{ID: "pikpak", Kind: "pikpak", Name: "PikPak", RootID: "0", TeaserEnabled: true},
-		{ID: "91-legacy", Kind: "spider91", Name: "91 Legacy", RootID: "0", TeaserEnabled: true},
-		{ID: "91-crawler", Kind: scriptcrawler.Kind, Name: "91 Spider", RootID: "/", Credentials: map[string]string{"script_path": "/tmp/crawler.py"}, TeaserEnabled: true},
-		{ID: "91-crawler-deleted", Kind: scriptcrawler.Kind, Name: "Deleted Spider", RootID: "/", Credentials: map[string]string{}, TeaserEnabled: true},
+		{ID: "crawler-main", Kind: scriptcrawler.Kind, Name: "Crawler", RootID: "/", Credentials: map[string]string{"script_path": "/tmp/crawler.py"}, TeaserEnabled: true},
+		{ID: "crawler-deleted", Kind: scriptcrawler.Kind, Name: "Deleted Crawler", RootID: "/", Credentials: map[string]string{}, TeaserEnabled: true},
 	} {
 		if err := cat.UpsertDrive(ctx, d); err != nil {
 			t.Fatalf("seed drive %s: %v", d.ID, err)
@@ -946,13 +978,13 @@ func TestNightlyTargetsComeFromCatalogBeforeDriveAttach(t *testing.T) {
 	if len(scanIDs) != 2 || scanIDs[0] != "115" || scanIDs[1] != "pikpak" {
 		t.Fatalf("scan target ids = %#v, want 115 and pikpak from catalog", scanIDs)
 	}
-	spiderIDs := app.listSpider91DriveIDs(ctx)
-	if len(spiderIDs) != 1 || spiderIDs[0] != "91-crawler" {
-		t.Fatalf("spider91 ids = %#v, want crawler-page script drive", spiderIDs)
+	crawlerIDs := app.listCrawlerDriveIDs(ctx)
+	if len(crawlerIDs) != 1 || crawlerIDs[0] != "crawler-main" {
+		t.Fatalf("crawler ids = %#v, want crawler-page script drive", crawlerIDs)
 	}
 }
 
-func TestAttachDriveRejectsLegacySpider91Storage(t *testing.T) {
+func TestAttachDriveRejectsUnknownKind(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -964,9 +996,9 @@ func TestAttachDriveRejectsLegacySpider91Storage(t *testing.T) {
 		}
 	})
 	d := &catalog.Drive{
-		ID:            "91-legacy",
-		Kind:          spider91.Kind,
-		Name:          "91 Legacy",
+		ID:            "unknown-main",
+		Kind:          "unknown",
+		Name:          "Unknown",
 		RootID:        "/",
 		TeaserEnabled: true,
 	}
@@ -976,18 +1008,11 @@ func TestAttachDriveRejectsLegacySpider91Storage(t *testing.T) {
 
 	app := &App{cat: cat, registry: proxy.NewRegistry()}
 	err = app.attachDrive(ctx, d)
-	if err == nil || !strings.Contains(err.Error(), "爬虫管理") {
-		t.Fatalf("attach err = %v, want crawler management guidance", err)
+	if err == nil || !strings.Contains(err.Error(), "unknown drive kind: unknown") {
+		t.Fatalf("attach err = %v, want unknown kind error", err)
 	}
 	if _, ok := app.registry.Get(d.ID); ok {
-		t.Fatal("legacy spider91 drive should not be registered")
-	}
-	got, err := cat.GetDrive(ctx, d.ID)
-	if err != nil {
-		t.Fatalf("get drive: %v", err)
-	}
-	if got.Status != "error" || !strings.Contains(got.LastError, "爬虫管理") {
-		t.Fatalf("status/error = %q/%q, want deprecated error", got.Status, got.LastError)
+		t.Fatal("unknown drive should not be registered")
 	}
 }
 
@@ -1223,9 +1248,6 @@ func TestEnqueueUploadedVideoQueuesLocalGenerationByDefault(t *testing.T) {
 func TestShouldScanDriveSkipsLocalUpload(t *testing.T) {
 	if shouldScanDrive(&serverLocalUploadFakeDrive{}) {
 		t.Fatal("local upload drive should not be scanned")
-	}
-	if shouldScanDrive(&serverSpiderXVideosFakeDrive{}) {
-		t.Fatal("spiderxvideos drive should not be scanned")
 	}
 	if !shouldScanDrive(&serverFakeDrive{}) {
 		t.Fatal("normal drive should be scanned")
@@ -1638,7 +1660,7 @@ func TestDeleteVideoUsesSourceRemoverWithCatalogMetadata(t *testing.T) {
 	}
 }
 
-func TestDeleteVideoRemovesSpider91SourceFile(t *testing.T) {
+func TestDeleteVideoRemovesScriptCrawlerSourceFile(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	localDir := filepath.Join(root, "previews")
@@ -1649,23 +1671,28 @@ func TestDeleteVideoRemovesSpider91SourceFile(t *testing.T) {
 	t.Cleanup(func() { _ = cat.Close() })
 
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
-		ID:            "spider-main",
-		Kind:          spider91.Kind,
-		Name:          "Spider",
+		ID:            "crawler-main",
+		Kind:          scriptcrawler.Kind,
+		Name:          "Crawler",
 		RootID:        "/",
 		TeaserEnabled: true,
 	}); err != nil {
 		t.Fatalf("seed drive: %v", err)
 	}
 	app := &App{
-		cfg: &config.Config{Storage: config.Storage{LocalPreviewDir: localDir}},
-		cat: cat,
+		cfg:      &config.Config{Storage: config.Storage{LocalPreviewDir: localDir}},
+		cat:      cat,
+		registry: proxy.NewRegistry(),
 	}
-	sourceDir := app.spider91DriveDir("spider-main")
+	sourceDir := app.scriptCrawlerDriveDir("crawler-main")
+	app.registry.Set("crawler-main", scriptcrawler.New(scriptcrawler.Config{
+		ID:      "crawler-main",
+		RootDir: sourceDir,
+	}))
 	sourceVideo := filepath.Join(sourceDir, "videos", "source.mp4")
 	sourceThumb := filepath.Join(sourceDir, "thumbs", "source.jpg")
-	previewPath := filepath.Join(localDir, "spider91-spider-main-source.mp4")
-	commonThumb := filepath.Join(localDir, "thumbs", "spider91-spider-main-source.jpg")
+	previewPath := filepath.Join(localDir, "scriptcrawler-crawler-main-source.mp4")
+	commonThumb := filepath.Join(localDir, "thumbs", "scriptcrawler-crawler-main-source.jpg")
 	for _, path := range []string{sourceVideo, sourceThumb, previewPath, commonThumb} {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", path, err)
@@ -1677,15 +1704,15 @@ func TestDeleteVideoRemovesSpider91SourceFile(t *testing.T) {
 
 	now := time.Now()
 	if err := cat.UpsertVideo(ctx, &catalog.Video{
-		ID:            "spider91-spider-main-source",
-		DriveID:       "spider-main",
+		ID:            "scriptcrawler-crawler-main-source",
+		DriveID:       "crawler-main",
 		FileID:        "source.mp4",
 		FileName:      "source.mp4",
 		Ext:           "mp4",
-		Title:         "Spider Source",
+		Title:         "Crawler Source",
 		PreviewLocal:  previewPath,
 		PreviewStatus: "ready",
-		ThumbnailURL:  "/p/thumb/spider91-spider-main-source",
+		ThumbnailURL:  "/p/thumb/scriptcrawler-crawler-main-source",
 		Size:          456,
 		PublishedAt:   now,
 		CreatedAt:     now,
@@ -1694,9 +1721,9 @@ func TestDeleteVideoRemovesSpider91SourceFile(t *testing.T) {
 		t.Fatalf("seed video: %v", err)
 	}
 
-	result, err := app.deleteVideo(ctx, "spider91-spider-main-source", true)
+	result, err := app.deleteVideo(ctx, "scriptcrawler-crawler-main-source", true)
 	if err != nil {
-		t.Fatalf("delete spider video: %v", err)
+		t.Fatalf("delete crawler video: %v", err)
 	}
 	if !result.OK || !result.DeletedSource {
 		t.Fatalf("delete result = %#v, want source deleted", result)
@@ -1706,23 +1733,23 @@ func TestDeleteVideoRemovesSpider91SourceFile(t *testing.T) {
 			t.Fatalf("deleted file %s still exists, stat err=%v", path, err)
 		}
 	}
-	if _, err := cat.GetVideo(ctx, "spider91-spider-main-source"); err != sql.ErrNoRows {
+	if _, err := cat.GetVideo(ctx, "scriptcrawler-crawler-main-source"); err != sql.ErrNoRows {
 		t.Fatalf("deleted video lookup error = %v, want sql.ErrNoRows", err)
 	}
-	deleted, err := cat.IsVideoDeleted(ctx, "spider91-spider-main-source")
+	deleted, err := cat.IsVideoDeleted(ctx, "scriptcrawler-crawler-main-source")
 	if err != nil {
 		t.Fatalf("check tombstone: %v", err)
 	}
 	if !deleted {
-		t.Fatal("deleted spider91 video tombstone missing")
+		t.Fatal("deleted crawler video tombstone missing")
 	}
 }
 
-func TestCleanupDriveVideosForDeleteSpider91RemovesCrawledDirAndOriginRecords(t *testing.T) {
+func TestCleanupDriveVideosForDeleteScriptCrawlerRemovesOnlyLocalRows(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	localDir := filepath.Join(root, "previews")
-	driveID := "spider-main"
+	driveID := "crawler-main"
 	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
 	if err != nil {
 		t.Fatalf("open catalog: %v", err)
@@ -1735,22 +1762,19 @@ func TestCleanupDriveVideosForDeleteSpider91RemovesCrawledDirAndOriginRecords(t 
 
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
 		ID:            driveID,
-		Kind:          "spider91",
-		Name:          "91 Spider",
+		Kind:          scriptcrawler.Kind,
+		Name:          "Crawler",
 		RootID:        "/",
 		TeaserEnabled: true,
 	}); err != nil {
-		t.Fatalf("seed spider91 drive: %v", err)
+		t.Fatalf("seed crawler drive: %v", err)
 	}
 
-	spiderDriveDir := filepath.Join(root, "spider91", driveID)
-	sourceVideo := filepath.Join(spiderDriveDir, "videos", "source.mp4")
-	sourceThumb := filepath.Join(spiderDriveDir, "thumbs", "source.jpg")
-	localPreview := filepath.Join(localDir, "spider91-spider-main-source.mp4")
-	localThumb := filepath.Join(localDir, "thumbs", "spider91-spider-main-source.jpg")
-	migratedPreview := filepath.Join(localDir, "spider91-spider-main-migrated.mp4")
-	migratedThumb := filepath.Join(localDir, "thumbs", "spider91-spider-main-migrated.jpg")
-	for _, path := range []string{sourceVideo, sourceThumb, localPreview, localThumb, migratedPreview, migratedThumb} {
+	localPreview := filepath.Join(localDir, "scriptcrawler-crawler-main-source.mp4")
+	localThumb := filepath.Join(localDir, "thumbs", "scriptcrawler-crawler-main-source.jpg")
+	migratedPreview := filepath.Join(localDir, "scriptcrawler-crawler-main-migrated.mp4")
+	migratedThumb := filepath.Join(localDir, "thumbs", "scriptcrawler-crawler-main-migrated.jpg")
+	for _, path := range []string{localPreview, localThumb, migratedPreview, migratedThumb} {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", path, err)
 		}
@@ -1762,22 +1786,22 @@ func TestCleanupDriveVideosForDeleteSpider91RemovesCrawledDirAndOriginRecords(t 
 	now := time.Now()
 	for _, v := range []*catalog.Video{
 		{
-			ID:            "spider91-spider-main-source",
+			ID:            "scriptcrawler-crawler-main-source",
 			DriveID:       driveID,
 			FileID:        "source.mp4",
 			Title:         "Source",
 			PreviewLocal:  localPreview,
 			PreviewStatus: "ready",
-			ThumbnailURL:  "/p/thumb/spider91-spider-main-source",
+			ThumbnailURL:  "/p/thumb/scriptcrawler-crawler-main-source",
 		},
 		{
-			ID:            "spider91-spider-main-migrated",
+			ID:            "scriptcrawler-crawler-main-migrated",
 			DriveID:       "PikPak",
 			FileID:        "pikpak-file-id",
 			Title:         "Migrated",
 			PreviewLocal:  migratedPreview,
 			PreviewStatus: "ready",
-			ThumbnailURL:  "/p/thumb/spider91-spider-main-migrated",
+			ThumbnailURL:  "/p/thumb/scriptcrawler-crawler-main-migrated",
 		},
 		{
 			ID:            "pikpak-PikPak-other",
@@ -1805,22 +1829,28 @@ func TestCleanupDriveVideosForDeleteSpider91RemovesCrawledDirAndOriginRecords(t 
 	}
 	removed, err := app.cleanupDriveVideosForDelete(ctx, driveID)
 	if err != nil {
-		t.Fatalf("cleanup spider91 videos: %v", err)
+		t.Fatalf("cleanup crawler videos: %v", err)
 	}
-	if removed != 2 {
-		t.Fatalf("removed = %d, want 2", removed)
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
 	}
-	for _, id := range []string{"spider91-spider-main-source", "spider91-spider-main-migrated"} {
-		if _, err := cat.GetVideo(ctx, id); err != sql.ErrNoRows {
-			t.Fatalf("%s lookup error = %v, want sql.ErrNoRows", id, err)
-		}
+	if _, err := cat.GetVideo(ctx, "scriptcrawler-crawler-main-source"); err != sql.ErrNoRows {
+		t.Fatalf("local crawler video lookup error = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := cat.GetVideo(ctx, "scriptcrawler-crawler-main-migrated"); err != nil {
+		t.Fatalf("migrated crawler video missing: %v", err)
 	}
 	if _, err := cat.GetVideo(ctx, "pikpak-PikPak-other"); err != nil {
 		t.Fatalf("unrelated pikpak video missing: %v", err)
 	}
-	for _, path := range []string{spiderDriveDir, localPreview, localThumb, migratedPreview, migratedThumb} {
+	for _, path := range []string{localPreview, localThumb} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("%s still exists, stat err=%v", path, err)
+		}
+	}
+	for _, path := range []string{migratedPreview, migratedThumb} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("%s missing, stat err=%v", path, err)
 		}
 	}
 }
@@ -1913,7 +1943,7 @@ func TestCleanupOrphanDriveVideosRemovesRowsAndGeneratedAssets(t *testing.T) {
 	}
 }
 
-func TestCleanupDuplicateVideoAssetsRemovesOnlyDuplicateLocalAssets(t *testing.T) {
+func TestCleanupDuplicateVideoAssetsDeletesExactDuplicateRows(t *testing.T) {
 	ctx := context.Background()
 	localDir := t.TempDir()
 	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
@@ -1994,15 +2024,22 @@ func TestCleanupDuplicateVideoAssetsRemovesOnlyDuplicateLocalAssets(t *testing.T
 			t.Fatalf("duplicate asset %s still exists, stat err=%v", path, err)
 		}
 	}
-	dup, err := cat.GetVideo(ctx, "duplicate-video")
+	if _, err := cat.GetVideo(ctx, "duplicate-video"); err != sql.ErrNoRows {
+		t.Fatalf("duplicate lookup error = %v, want sql.ErrNoRows", err)
+	}
+	deleted, err := cat.IsVideoDeleted(ctx, "duplicate-video")
 	if err != nil {
-		t.Fatalf("get duplicate: %v", err)
+		t.Fatalf("check duplicate tombstone: %v", err)
 	}
-	if dup.PreviewLocal != "" || dup.PreviewStatus != "pending" {
-		t.Fatalf("duplicate preview local=%q status=%q, want empty pending", dup.PreviewLocal, dup.PreviewStatus)
+	if !deleted {
+		t.Fatalf("duplicate tombstone missing")
 	}
-	if dup.ThumbnailURL != "" {
-		t.Fatalf("duplicate thumbnail url = %q, want empty", dup.ThumbnailURL)
+	deletedItems, _, err := cat.ListDeletedVideos(ctx, catalog.ListParams{Page: 1, PageSize: 10})
+	if err != nil {
+		t.Fatalf("list deleted videos: %v", err)
+	}
+	if len(deletedItems) != 1 || deletedItems[0].ID != "duplicate-video" || deletedItems[0].Reason != catalog.DeletedVideoReasonDuplicate {
+		t.Fatalf("duplicate tombstone = %#v, want reason %q", deletedItems, catalog.DeletedVideoReasonDuplicate)
 	}
 	canon, err := cat.GetVideo(ctx, "canonical-video")
 	if err != nil {
@@ -2010,6 +2047,137 @@ func TestCleanupDuplicateVideoAssetsRemovesOnlyDuplicateLocalAssets(t *testing.T
 	}
 	if canon.PreviewLocal != canonicalPreview || canon.ThumbnailURL != "/p/thumb/canonical-video" {
 		t.Fatalf("canonical changed: preview=%q thumb=%q", canon.PreviewLocal, canon.ThumbnailURL)
+	}
+}
+
+func TestCleanupDuplicateVideoAssetsDeletesNearDuplicateRowsKeepingLargest(t *testing.T) {
+	ctx := context.Background()
+	localDir := t.TempDir()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	smallPreview := filepath.Join(localDir, "small-video.mp4")
+	largePreview := filepath.Join(localDir, "large-video.mp4")
+	smallThumb := filepath.Join(localDir, "thumbs", "small-video.jpg")
+	largeThumb := filepath.Join(localDir, "thumbs", "large-video.jpg")
+	for _, path := range []string{smallPreview, largePreview} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.WriteFile(path, []byte("preview"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	writeSolidJPEG(t, smallThumb, color.RGBA{R: 180, G: 80, B: 40, A: 255})
+	writeSolidJPEG(t, largeThumb, color.RGBA{R: 180, G: 80, B: 40, A: 255})
+
+	now := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
+	for _, v := range []*catalog.Video{
+		{
+			ID:              "small-video",
+			DriveID:         "scriptcrawler-a",
+			FileID:          "file-small",
+			FileName:        "small.mp4",
+			Title:           "反差极品大二女友，叫声可射～，“射进小骚逼里面～” - 91porn",
+			DurationSeconds: 313,
+			Size:            1024,
+			ThumbnailURL:    "/p/thumb/small-video",
+			PreviewLocal:    smallPreview,
+			PreviewStatus:   "ready",
+			PublishedAt:     now,
+			CreatedAt:       now,
+			UpdatedAt:       now,
+		},
+		{
+			ID:              "large-video",
+			DriveID:         "scriptcrawler-b",
+			FileID:          "file-large",
+			FileName:        "large.mp4",
+			Title:           "反差极品大二女友，叫声可射～，“射进小骚逼里面～”_91pinse",
+			DurationSeconds: 313,
+			Size:            4096,
+			ThumbnailURL:    "/p/thumb/large-video",
+			PreviewLocal:    largePreview,
+			PreviewStatus:   "ready",
+			PublishedAt:     now.Add(time.Second),
+			CreatedAt:       now.Add(time.Second),
+			UpdatedAt:       now.Add(time.Second),
+		},
+	} {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed %s: %v", v.ID, err)
+		}
+	}
+
+	app := &App{
+		cfg: &config.Config{Storage: config.Storage{LocalPreviewDir: localDir}},
+		cat: cat,
+	}
+	if err := app.cleanupDuplicateVideoAssets(ctx); err != nil {
+		t.Fatalf("cleanup duplicate video assets: %v", err)
+	}
+
+	if _, err := cat.GetVideo(ctx, "small-video"); err != sql.ErrNoRows {
+		t.Fatalf("small duplicate lookup error = %v, want sql.ErrNoRows", err)
+	}
+	deleted, err := cat.IsVideoDeleted(ctx, "small-video")
+	if err != nil {
+		t.Fatalf("check small tombstone: %v", err)
+	}
+	if !deleted {
+		t.Fatalf("small duplicate tombstone missing")
+	}
+	deletedItems, _, err := cat.ListDeletedVideos(ctx, catalog.ListParams{Page: 1, PageSize: 10})
+	if err != nil {
+		t.Fatalf("list deleted videos: %v", err)
+	}
+	if len(deletedItems) != 1 || deletedItems[0].ID != "small-video" || deletedItems[0].Reason != catalog.DeletedVideoReasonDuplicate {
+		t.Fatalf("small duplicate tombstone = %#v, want reason %q", deletedItems, catalog.DeletedVideoReasonDuplicate)
+	}
+	large, err := cat.GetVideo(ctx, "large-video")
+	if err != nil {
+		t.Fatalf("large canonical missing: %v", err)
+	}
+	if large.Size != 4096 {
+		t.Fatalf("large canonical size = %d, want 4096", large.Size)
+	}
+	for _, path := range []string{smallPreview, smallThumb} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("small duplicate asset %s still exists, stat err=%v", path, err)
+		}
+	}
+	for _, path := range []string{largePreview, largeThumb} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("large canonical asset %s missing: %v", path, err)
+		}
+	}
+}
+
+func writeSolidJPEG(t *testing.T, path string, c color.RGBA) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", path, err)
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create %s: %v", path, err)
+	}
+	defer f.Close()
+	img := image.NewRGBA(image.Rect(0, 0, 64, 64))
+	for y := 0; y < 64; y++ {
+		for x := 0; x < 64; x++ {
+			img.SetRGBA(x, y, c)
+		}
+	}
+	if err := jpeg.Encode(f, img, &jpeg.Options{Quality: 95}); err != nil {
+		t.Fatalf("encode %s: %v", path, err)
 	}
 }
 
@@ -2148,11 +2316,11 @@ func (d *serverSourceRemovableFakeDrive) Remove(ctx context.Context, fileID stri
 	return nil
 }
 
-type serverFakeSpider91MigrationRunner struct {
+type serverFakeCrawlerUploadRunner struct {
 	called int
 }
 
-func (r *serverFakeSpider91MigrationRunner) RunOnce(context.Context) error {
+func (r *serverFakeCrawlerUploadRunner) RunOnce(context.Context) error {
 	r.called++
 	return nil
 }
@@ -2219,12 +2387,6 @@ type serverLocalUploadFakeDrive struct {
 }
 
 func (d *serverLocalUploadFakeDrive) ID() string { return "local-upload" }
-
-type serverSpiderXVideosFakeDrive struct {
-	serverFakeDrive
-}
-
-func (d *serverSpiderXVideosFakeDrive) Kind() string { return "spiderxvideos" }
 
 // seedDriveWithTeaser 在 catalog 里 upsert 一个测试用的 drive 行，把 TeaserEnabled
 // 设为 enabled。teaser 入队判断现在按 per-drive 而不是全局 setting，所以涉及到

@@ -99,19 +99,12 @@ func TestRunPipelineHonoursPhaseOrder(t *testing.T) {
 		RunScan: func(_ context.Context, id string) {
 			rec.push("scan:" + id)
 		},
-		ListSpider91Drives: func(context.Context) []string {
-			rec.push("list-spider")
+		ListCrawlerDrives: func(context.Context) []string {
+			rec.push("list-crawler")
 			return []string{"sp-1"}
 		},
-		RunSpider91Crawl: func(_ context.Context, id string) {
+		RunCrawlerCrawl: func(_ context.Context, id string) {
 			rec.push("crawl:" + id)
-		},
-		ListSpiderXVideosDrives: func(context.Context) []string {
-			rec.push("list-xvideos")
-			return []string{"xv-1"}
-		},
-		RunSpiderXVideosCrawl: func(_ context.Context, id string) {
-			rec.push("crawl-xvideos:" + id)
 		},
 		WaitPreviewQueuesIdle: func(context.Context) error {
 			rec.push("wait-idle")
@@ -135,10 +128,8 @@ func TestRunPipelineHonoursPhaseOrder(t *testing.T) {
 		"scan:drive-a",
 		"scan:drive-b",
 		"wait-idle", // after phase 1
-		"list-spider",
-		"list-xvideos",
+		"list-crawler",
 		"crawl:sp-1",
-		"crawl-xvideos:xv-1",
 		"wait-idle", // after phase 2
 		"migrate",
 		"dedupe-cleanup",
@@ -153,15 +144,15 @@ func TestRunPipelineHonoursPhaseOrder(t *testing.T) {
 	}
 }
 
-func TestRunPipelineSkipsMigrationWhenNoSpider91(t *testing.T) {
+func TestRunPipelineSkipsMigrationWhenNoCrawler(t *testing.T) {
 	rec := &recorder{}
 
 	r := New(Config{
-		Settings:           newStubSettings(),
-		ListScanTargets:    func(context.Context) []string { return []string{"drive-a"} },
-		RunScan:            func(_ context.Context, id string) { rec.push("scan:" + id) },
-		ListSpider91Drives: func(context.Context) []string { return nil },
-		RunSpider91Crawl:   func(_ context.Context, id string) { rec.push("crawl:" + id) },
+		Settings:          newStubSettings(),
+		ListScanTargets:   func(context.Context) []string { return []string{"drive-a"} },
+		RunScan:           func(_ context.Context, id string) { rec.push("scan:" + id) },
+		ListCrawlerDrives: func(context.Context) []string { return nil },
+		RunCrawlerCrawl:   func(_ context.Context, id string) { rec.push("crawl:" + id) },
 		WaitPreviewQueuesIdle: func(context.Context) error {
 			rec.push("wait-idle")
 			return nil
@@ -180,7 +171,7 @@ func TestRunPipelineSkipsMigrationWhenNoSpider91(t *testing.T) {
 
 	for _, c := range rec.snapshot() {
 		if c == "migrate" || c == "crawl:sp-1" {
-			t.Fatalf("phase 2/3 should be skipped when no spider91 drive, got call %q", c)
+			t.Fatalf("phase 2/3 should be skipped when no crawler, got call %q", c)
 		}
 	}
 	foundCleanup := false
@@ -190,7 +181,7 @@ func TestRunPipelineSkipsMigrationWhenNoSpider91(t *testing.T) {
 		}
 	}
 	if !foundCleanup {
-		t.Fatalf("dedupe cleanup should still run when spider91 is absent; calls=%v", rec.snapshot())
+		t.Fatalf("dedupe cleanup should still run when crawler is absent; calls=%v", rec.snapshot())
 	}
 }
 
@@ -209,8 +200,8 @@ func TestRunPipelineExitsWhenContextCancelledMidPhase(t *testing.T) {
 				cancel()
 			}
 		},
-		ListSpider91Drives:    func(context.Context) []string { return []string{"x"} },
-		RunSpider91Crawl:      func(context.Context, string) { rec.push("crawl") },
+		ListCrawlerDrives:     func(context.Context) []string { return []string{"x"} },
+		RunCrawlerCrawl:       func(context.Context, string) { rec.push("crawl") },
 		WaitPreviewQueuesIdle: func(context.Context) error { rec.push("wait-idle"); return nil },
 		RunMigration:          func(context.Context) error { rec.push("migrate"); return nil },
 		RunDedupeAssetCleanup: func(context.Context) error { rec.push("dedupe-cleanup"); return nil },
@@ -298,12 +289,12 @@ func TestCtxCancelPreventsLaterPhases(t *testing.T) {
 		WaitPreviewQueuesIdle: func(ctx context.Context) error {
 			return ctx.Err()
 		},
-		ListSpider91Drives: func(context.Context) []string {
-			rec.push("list-spider")
+		ListCrawlerDrives: func(context.Context) []string {
+			rec.push("list-crawler")
 			return []string{"x"}
 		},
-		RunSpider91Crawl: func(context.Context, string) { rec.push("crawl") },
-		RunMigration:     func(context.Context) error { rec.push("migrate"); return nil },
+		RunCrawlerCrawl: func(context.Context, string) { rec.push("crawl") },
+		RunMigration:    func(context.Context) error { rec.push("migrate"); return nil },
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -312,7 +303,7 @@ func TestCtxCancelPreventsLaterPhases(t *testing.T) {
 	r.runPipeline(ctx)
 
 	for _, c := range rec.snapshot() {
-		if c == "crawl" || c == "migrate" || c == "list-spider" {
+		if c == "crawl" || c == "migrate" || c == "list-crawler" {
 			t.Fatalf("later phase should not run after ctx done; got %q", c)
 		}
 	}

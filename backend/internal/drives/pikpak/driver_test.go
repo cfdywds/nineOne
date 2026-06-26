@@ -110,7 +110,7 @@ func TestEnsureDirReusesExistingFolder(t *testing.T) {
 				"files": []map[string]any{{
 					"id":   "existing-folder-id",
 					"kind": "drive#folder",
-					"name": "91 Spider",
+					"name": "Crawler Uploads",
 				}},
 			})
 		case http.MethodPost:
@@ -124,7 +124,7 @@ func TestEnsureDirReusesExistingFolder(t *testing.T) {
 	defer srv.Close()
 
 	d := newTestDriver(t, srv)
-	got, err := d.EnsureDir(context.Background(), "91 Spider")
+	got, err := d.EnsureDir(context.Background(), "Crawler Uploads")
 	if err != nil {
 		t.Fatalf("ensure dir: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestEnsureDirCreatesMissingFolder(t *testing.T) {
 			writePikPakJSON(t, w, map[string]any{
 				"id":   "new-folder-id",
 				"kind": "drive#folder",
-				"name": "91 Spider",
+				"name": "Crawler Uploads",
 			})
 		default:
 			t.Fatalf("unexpected method %s", r.Method)
@@ -160,14 +160,14 @@ func TestEnsureDirCreatesMissingFolder(t *testing.T) {
 	defer srv.Close()
 
 	d := newTestDriver(t, srv)
-	id, err := d.EnsureDir(context.Background(), "91 Spider")
+	id, err := d.EnsureDir(context.Background(), "Crawler Uploads")
 	if err != nil {
 		t.Fatalf("ensure dir: %v", err)
 	}
 	if id != "new-folder-id" {
 		t.Fatalf("dir id = %q, want new-folder-id", id)
 	}
-	if got.Kind != "drive#folder" || got.ParentID != "root-id" || got.Name != "91 Spider" {
+	if got.Kind != "drive#folder" || got.ParentID != "root-id" || got.Name != "Crawler Uploads" {
 		t.Fatalf("create folder body = %#v", got)
 	}
 }

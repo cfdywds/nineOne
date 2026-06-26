@@ -62,7 +62,7 @@ func TestUpsertDriveDefaultsRootIDByKind(t *testing.T) {
 		{id: "onedrive", kind: "onedrive", want: "root"},
 		{id: "googledrive", kind: "googledrive", want: "root"},
 		{id: "localstorage", kind: "localstorage", want: "/"},
-		{id: "spider91", kind: "spider91", want: "/"},
+		{id: "scriptcrawler", kind: "scriptcrawler", want: "/"},
 	}
 	for _, tc := range cases {
 		if err := cat.UpsertDrive(ctx, &Drive{
@@ -85,7 +85,7 @@ func TestUpsertDriveDefaultsRootIDByKind(t *testing.T) {
 	}
 }
 
-func TestUpsertDriveIgnoresRootIDForLocalStorageAndSpider91(t *testing.T) {
+func TestUpsertDriveIgnoresRootIDForLocalStorageAndScriptCrawler(t *testing.T) {
 	ctx := context.Background()
 	cat, err := Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -102,7 +102,7 @@ func TestUpsertDriveIgnoresRootIDForLocalStorageAndSpider91(t *testing.T) {
 		kind string
 	}{
 		{id: "localstorage", kind: "localstorage"},
-		{id: "spider91", kind: "spider91"},
+		{id: "scriptcrawler", kind: "scriptcrawler"},
 	} {
 		if err := cat.UpsertDrive(ctx, &Drive{
 			ID:         tc.id,

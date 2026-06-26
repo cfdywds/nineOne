@@ -1,18 +1,16 @@
-// Package spider91migrate 周期性把 spider91 drive 下载到本地的视频
-// 上传到一个指定的目标 drive 目录（PikPak、115、123、OneDrive、Google Drive、联通网盘或光鸭网盘），上传成功后：
+// Package crawlerupload uploads videos saved by script crawlers to a configured
+// target drive. Each crawler drive chooses its own upload target.
 //
 //   - 改写 catalog 行：drive_id / file_id / content_hash 改成目标盘的；
-//     视频自身的 id 不变（仍是 spider91-<driveID>-<viewkey>），video_tags、
-//     收藏、点赞、views 等关联数据全部保留
-//   - 删除本地 mp4（spider91/<id>/videos/<viewkey>.<ext>）和源 thumb
-//     （spider91/<id>/thumbs/<viewkey>.jpg）；公共 /p/thumb/<videoID> 副本会保留
+//     视频自身的 id 不变，video_tags、收藏、点赞、views 等关联数据全部保留
+//   - 删除爬虫本地 mp4 和源 thumb；公共 /p/thumb/<videoID> 副本会保留
 //
 // 之后回放时，videoSource() 自动落到 /p/stream/<target>/<file_id>，
 // proxy 层走对应盘的直链 / 302 直连。
 //
 // 下次目标盘扫盘时，scanner 通过 (content_hash) / (file_name+size)
 // 已有的 findDuplicate 兜底逻辑，不会为同一物理文件再建一行。
-package spider91migrate
+package crawlerupload
 
 import (
 	"context"
@@ -37,13 +35,11 @@ import (
 	"github.com/video-site/backend/internal/drives/p123"
 	"github.com/video-site/backend/internal/drives/pikpak"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
-	"github.com/video-site/backend/internal/drives/spider91"
-	"github.com/video-site/backend/internal/drives/spiderxvideos"
 	"github.com/video-site/backend/internal/drives/wopan"
 	"github.com/video-site/backend/internal/mediaasset"
 )
 
-// uploadTarget 是 migrator 调用目标 drive 的最小接口。任何一种"接收 spider91 上传"的
+// uploadTarget 是 migrator 调用目标 drive 的最小接口。任何一种"接收爬虫上传"的
 // 网盘都要实现它；当前 PikPak、115、123、OneDrive、Google Drive、联通网盘和光鸭网盘各自通过适配器满足。
 //
 // 这一层抽象把"迁移调用方"和"具体盘的 SDK 协议"解耦：
@@ -65,10 +61,10 @@ type uploadTarget interface {
 	Rename(ctx context.Context, fileID, newName string) error
 }
 
-// Spider91LocalSource is the local source interface used by the migration
-// worker. Legacy spider91.Driver and the new scriptcrawler.Driver both satisfy
-// it when they are mounted for the Spider91 built-in crawler.
-type Spider91LocalSource interface {
+// LocalSource is the local source interface used by the migration
+// worker. scriptcrawler.Driver satisfies it when mounted for a crawler that
+// keeps videos in local storage before uploading them to a target drive.
+type LocalSource interface {
 	drives.Drive
 	VideosDir() string
 	ThumbsDir() string
@@ -96,22 +92,17 @@ type UploadProgress struct {
 	TotalCount   int
 }
 
-const (
-	spider91UploadDirName          = "91 Spider"
-	scriptCrawlerUploadRootDirName = "Script Crawlers"
-)
+const scriptCrawlerUploadRootDirName = "Script Crawlers"
 
 type migrationPlan struct {
-	source              Spider91LocalSource
+	source              LocalSource
 	row                 *catalog.Drive
-	sourceKinds         []string
 	targetDriveID       string
 	target              uploadTarget
 	uploadDir           string
 	keepLatestN         int
 	requireAssetsReady  bool
 	requirePreviewReady bool
-	legacyBackfill      bool
 }
 
 // pikpakAdapter / p115Adapter / p123Adapter / onedriveAdapter / googledriveAdapter / wopanAdapter / guangyapanAdapter 把具体 driver 包装成 uploadTarget。
@@ -120,7 +111,7 @@ type migrationPlan struct {
 //
 //  1. 各 driver 的 UploadAndReportXxx 返回的是各自包内的 UploadResult 类型，
 //     直接共用同名同签名方法会引入循环依赖；
-//  2. driver 包不应该感知 spider91migrate 这一层业务定义。
+//  2. driver 包不应该感知 crawlerupload 这一层业务定义。
 type pikpakAdapter struct {
 	d *pikpak.Driver
 }
@@ -290,7 +281,7 @@ func adaptUploadTarget(d drives.Drive) (uploadTarget, error) {
 		// 测试或自定义实现可以直接传入；优先使用具体类型分支以拿到适配器。
 		return v, nil
 	default:
-		return nil, fmt.Errorf("drive %q kind=%s does not support spider91 upload", d.ID(), d.Kind())
+		return nil, fmt.Errorf("drive %q kind=%s does not support crawler upload", d.ID(), d.Kind())
 	}
 }
 
@@ -301,16 +292,15 @@ type Registry interface {
 }
 
 type Config struct {
-	Catalog          *catalog.Catalog
-	Registry         Registry
-	GetTargetDriveID func() string // 通常对应 App.Spider91UploadDriveID()
+	Catalog  *catalog.Catalog
+	Registry Registry
 	// Interval 已废弃 —— 旧版迁移 worker 是周期 ticker，新版只通过 nightly
 	// pipeline 调用 RunOnce，不再有内置定时器。保留字段不删是为了兼容外
 	// 部 yaml / 测试代码里仍传值的场景。
 	Interval   time.Duration
 	BatchLimit int // 单轮最多迁多少个，0 时默认 50
-	// KeepLatestN 是每个 spider91 drive 在本地保留的最新视频数。
-	// 超过的部分中"已迁移"的会被清理；未迁移的不动。0 时默认 15；< 0 关闭清理。
+	// KeepLatestN is deprecated. Script crawler uploads use 0 internally so all
+	// local videos that satisfy asset requirements are eligible for upload.
 	KeepLatestN int
 	// CaptchaCooldown 是迁移 worker 在遇到 PikPak captcha 错误（error_code
 	// 4002 / 9）后整体进入冷却的时长。冷却期间 runOnce 直接返回，不再发起任何
@@ -402,9 +392,8 @@ func (m *Migrator) markCooldownLogged() bool {
 	return false
 }
 
-// Trigger 安排一次"立即跑"。多次调用会被合并成一次（channel buffer=1）。
-// RunOnce 跑一次完整迁移：列出所有 spider91 drive，对每个超过 KeepLatestN 的旧
-// 视频上传到目标 drive，事务性改写 catalog 行，删本地文件。
+// RunOnce 跑一次完整迁移：列出所有配置了 upload_drive_id 的 scriptcrawler
+// drive，把本地视频上传到目标 drive，事务性改写 catalog 行，删本地文件。
 //
 // 这是上层 nightly 流水线 Phase 3 的入口；不再有周期 ticker / Trigger 通道。
 // captcha cooldown 状态在单次 RunOnce 内仍生效（多 drive 时遇到 4002 立即停整轮）；
@@ -418,7 +407,7 @@ func (m *Migrator) RunOnce(ctx context.Context) error {
 	return nil
 }
 
-// runOnce 单轮：扫所有 spider91 drive，对每条还有本地文件的视频做迁移。
+// runOnce 单轮：扫所有 scriptcrawler drive，对每条还有本地文件的视频做迁移。
 //
 // 互斥保证：同一 Migrator 内不会并发跑两轮（避免重复上传）。
 func (m *Migrator) runOnce(ctx context.Context) {
@@ -440,11 +429,11 @@ func (m *Migrator) runOnce(ctx context.Context) {
 	// 结束自然恢复。避免之前每秒一条 4002 的日志雪崩。
 	if active, until, resumed := m.cooldownState(); active {
 		if !m.markCooldownLogged() {
-			log.Printf("[spider91migrate] captcha cooldown active until %s, skipping run", until.Format(time.RFC3339))
+			log.Printf("[crawlerupload] captcha cooldown active until %s, skipping run", until.Format(time.RFC3339))
 		}
 		return
 	} else if resumed {
-		log.Printf("[spider91migrate] captcha cooldown ended at %s, resuming migration", until.Format(time.RFC3339))
+		log.Printf("[crawlerupload] captcha cooldown ended at %s, resuming migration", until.Format(time.RFC3339))
 	}
 
 	plans := m.migrationPlans(ctx)
@@ -454,54 +443,39 @@ func (m *Migrator) runOnce(ctx context.Context) {
 	}
 
 	migrated := 0
-	backfillTargets := map[string]uploadTarget{}
 	for _, plan := range plans {
 		if err := ctx.Err(); err != nil {
 			return
 		}
 		n, err := m.migrateDrive(ctx, plan)
 		if err != nil {
-			log.Printf("[spider91migrate] drive=%s migrate batch error: %v", plan.source.ID(), err)
+			log.Printf("[crawlerupload] drive=%s migrate batch error: %v", plan.source.ID(), err)
 		}
 		migrated += n
 		if active, _ := m.inCooldown(); active {
 			if migrated > 0 {
-				log.Printf("[spider91migrate] migrated %d video(s)", migrated)
+				log.Printf("[crawlerupload] migrated %d video(s)", migrated)
 			}
 			return
 		}
-		if plan.legacyBackfill {
-			backfillTargets[plan.targetDriveID] = plan.target
-		}
 	}
 	if migrated > 0 {
-		log.Printf("[spider91migrate] migrated %d video(s)", migrated)
+		log.Printf("[crawlerupload] migrated %d video(s)", migrated)
 	}
 
 	// 收尾：扫每个本地爬虫 drive 的 videos 目录，把 catalog 已经迁到别处但本地
 	// 仍有残留的孤儿文件清掉。这是纯防御性兜底——正常路径下 migrateDrive
-	// 已经在迁移成功后立刻 CleanupSpider91Local，不会留孤儿。
+	// 已经在迁移成功后立刻 CleanupLocal，不会留孤儿。
 	for _, plan := range plans {
 		if err := ctx.Err(); err != nil {
 			return
 		}
 		deleted, err := m.cleanupOldLocalVideos(ctx, plan)
 		if err != nil {
-			log.Printf("[spider91migrate] cleanup drive=%s: %v", plan.source.ID(), err)
+			log.Printf("[crawlerupload] cleanup drive=%s: %v", plan.source.ID(), err)
 		}
 		if deleted > 0 {
-			log.Printf("[spider91migrate] cleanup drive=%s deleted %d orphan local file(s)", plan.source.ID(), deleted)
-		}
-	}
-
-	// 回填：把已迁移到 PikPak 的 spider91-* 视频里文件名仍是旧格式
-	// （比如刚迁完没改、或人工导入）的统一改成方案 B 期望的格式。
-	// 这一步幂等：已经是期望格式的不会再调 Rename。
-	for targetDriveID, pp := range backfillTargets {
-		if renamed, err := m.backfillFileNames(ctx, targetDriveID, pp); err != nil {
-			log.Printf("[spider91migrate] backfill names: %v", err)
-		} else if renamed > 0 {
-			log.Printf("[spider91migrate] backfilled %d %s file name(s) to desired format", renamed, pp.Kind())
+			log.Printf("[crawlerupload] cleanup drive=%s deleted %d orphan local file(s)", plan.source.ID(), deleted)
 		}
 	}
 }
@@ -518,33 +492,6 @@ func (m *Migrator) reportUploadProgress(progress UploadProgress) {
 		progress.State = "idle"
 	}
 	m.cfg.OnUploadProgress(progress)
-}
-
-// targetKindForLog 把当前目标盘 kind 转成对人友好的简称，用于日志。
-// 解析失败时回退 "target"。
-func (m *Migrator) targetKindForLog() string {
-	if m.cfg.GetTargetDriveID == nil || m.cfg.Registry == nil {
-		return "target"
-	}
-	id := m.cfg.GetTargetDriveID()
-	if id == "" {
-		return "target"
-	}
-	d, ok := m.cfg.Registry.Get(id)
-	if !ok {
-		return "target"
-	}
-	return d.Kind()
-}
-
-// resolveTarget 返回 (target drive ID, target uploadTarget, err)。
-// 没设置、drive 找不到，或 drive 类型不支持上传时返回 err（调用方静默跳过）。
-func (m *Migrator) resolveTarget() (string, uploadTarget, error) {
-	if m.cfg.GetTargetDriveID == nil {
-		return "", nil, errors.New("no target getter")
-	}
-	id := m.cfg.GetTargetDriveID()
-	return m.resolveTargetID(id)
 }
 
 func (m *Migrator) resolveTargetID(id string) (string, uploadTarget, error) {
@@ -576,93 +523,35 @@ func (m *Migrator) migrationPlans(ctx context.Context) []migrationPlan {
 		if d == nil {
 			continue
 		}
-		src, ok := d.(Spider91LocalSource)
+		src, ok := d.(LocalSource)
 		if !ok {
 			continue
 		}
 		row, err := m.cfg.Catalog.GetDrive(ctx, d.ID())
-		if (err != nil || row == nil) && d.Kind() == spider91.Kind {
-			row = &catalog.Drive{ID: d.ID(), Kind: spider91.Kind, RootID: "/"}
-		}
-		if row == nil {
+		if err != nil || row == nil || row.Kind != scriptcrawler.Kind {
 			continue
 		}
-		switch row.Kind {
-		case scriptcrawler.Kind:
-			targetID := strings.TrimSpace(row.Credentials["upload_drive_id"])
-			if targetID == "" {
-				continue
-			}
-			resolvedID, target, err := m.resolveTargetID(targetID)
-			if err != nil {
-				log.Printf("[spider91migrate] crawler=%s upload target=%q unavailable: %v", row.ID, targetID, err)
-				continue
-			}
-			out = append(out, migrationPlan{
-				source:              src,
-				row:                 row,
-				sourceKinds:         crawlerSourceKindsForRow(row),
-				targetDriveID:       resolvedID,
-				target:              target,
-				uploadDir:           scriptCrawlerUploadDir(row.ID),
-				keepLatestN:         0,
-				requireAssetsReady:  true,
-				requirePreviewReady: row.TeaserEnabled,
-			})
-		case spiderxvideos.Kind:
-			if m.cfg.GetTargetDriveID == nil {
-				continue
-			}
-			targetID := strings.TrimSpace(m.cfg.GetTargetDriveID())
-			if targetID == "" {
-				continue
-			}
-			resolvedID, target, err := m.resolveTargetID(targetID)
-			if err != nil {
-				continue
-			}
-			out = append(out, migrationPlan{
-				source:        src,
-				row:           row,
-				sourceKinds:   []string{spiderxvideos.Kind},
-				targetDriveID: resolvedID,
-				target:        target,
-				uploadDir:     scriptCrawlerUploadDir(row.ID),
-				keepLatestN:   m.cfg.KeepLatestN,
-			})
-		case spider91.Kind:
-			if m.cfg.GetTargetDriveID == nil {
-				continue
-			}
-			targetID := strings.TrimSpace(m.cfg.GetTargetDriveID())
-			if targetID == "" {
-				continue
-			}
-			resolvedID, target, err := m.resolveTargetID(targetID)
-			if err != nil {
-				continue
-			}
-			out = append(out, migrationPlan{
-				source:         src,
-				row:            row,
-				sourceKinds:    []string{spider91.Kind},
-				targetDriveID:  resolvedID,
-				target:         target,
-				uploadDir:      spider91UploadDirName,
-				keepLatestN:    m.cfg.KeepLatestN,
-				legacyBackfill: true,
-			})
+		targetID := strings.TrimSpace(row.Credentials["upload_drive_id"])
+		if targetID == "" {
+			continue
 		}
+		resolvedID, target, err := m.resolveTargetID(targetID)
+		if err != nil {
+			log.Printf("[crawlerupload] crawler=%s upload target=%q unavailable: %v", row.ID, targetID, err)
+			continue
+		}
+		out = append(out, migrationPlan{
+			source:              src,
+			row:                 row,
+			targetDriveID:       resolvedID,
+			target:              target,
+			uploadDir:           scriptCrawlerUploadDir(row.ID),
+			keepLatestN:         0,
+			requireAssetsReady:  true,
+			requirePreviewReady: row.TeaserEnabled,
+		})
 	}
 	return out
-}
-
-func crawlerSourceKindsForRow(d *catalog.Drive) []string {
-	kinds := []string{scriptcrawler.Kind}
-	if d != nil && strings.EqualFold(strings.TrimSpace(d.Credentials["builtin"]), spider91.Kind) {
-		kinds = append(kinds, spider91.Kind)
-	}
-	return kinds
 }
 
 func scriptCrawlerUploadDir(driveID string) string {
@@ -680,41 +569,6 @@ func sanitizeUploadDirSegment(raw string) string {
 		return ""
 	}
 	return clean
-}
-
-// spider91Drives 返回当前注册的所有 Spider91 来源本地爬虫 driver。
-func (m *Migrator) spider91Drives(ctx context.Context) []Spider91LocalSource {
-	all := m.cfg.Registry.All()
-	out := make([]Spider91LocalSource, 0, len(all))
-	for _, d := range all {
-		if !m.isSpider91SourceDrive(ctx, d) {
-			continue
-		}
-		if sd, ok := d.(Spider91LocalSource); ok {
-			out = append(out, sd)
-		}
-	}
-	return out
-}
-
-func (m *Migrator) isSpider91SourceDrive(ctx context.Context, d drives.Drive) bool {
-	if d == nil {
-		return false
-	}
-	if d.Kind() == spider91.Kind {
-		return true
-	}
-	if d.Kind() != scriptcrawler.Kind || m.cfg.Catalog == nil {
-		return false
-	}
-	row, err := m.cfg.Catalog.GetDrive(ctx, d.ID())
-	if err != nil || row == nil {
-		return false
-	}
-	if row.Kind == spider91.Kind {
-		return true
-	}
-	return row.Kind == scriptcrawler.Kind && strings.EqualFold(strings.TrimSpace(row.Credentials["builtin"]), spider91.Kind)
 }
 
 // migrateDrive 对单个本地爬虫 drive 跑一批迁移；返回成功迁移的条数。
@@ -822,7 +676,7 @@ func (m *Migrator) migrateDrive(ctx context.Context, plan migrationPlan) (int, e
 		})
 
 		if v.DriveID != src.ID() {
-			CleanupSpider91Local(src, f.name)
+			CleanupLocal(src, f.name)
 			processed++
 			m.reportUploadProgress(UploadProgress{
 				DriveID:     src.ID(),
@@ -836,12 +690,12 @@ func (m *Migrator) migrateDrive(ctx context.Context, plan migrationPlan) (int, e
 
 		if targetDuplicate, err := m.cfg.Catalog.FindEquivalentVideoOnDrive(ctx, v, plan.targetDriveID); err != nil {
 			if !errors.Is(err, sql.ErrNoRows) {
-				log.Printf("[spider91migrate] %s find target duplicate: %v", v.ID, err)
+				log.Printf("[crawlerupload] %s find target duplicate: %v", v.ID, err)
 			}
 		} else if targetDuplicate != nil {
 			ok, err := m.bindToExistingTarget(ctx, v, targetDuplicate, plan)
 			if err != nil {
-				log.Printf("[spider91migrate] %s: %v", v.ID, err)
+				log.Printf("[crawlerupload] %s: %v", v.ID, err)
 				continue
 			}
 			if ok {
@@ -864,7 +718,7 @@ func (m *Migrator) migrateDrive(ctx context.Context, plan migrationPlan) (int, e
 		if plan.requireAssetsReady {
 			ready, err := m.crawlerVideoAssetsReady(ctx, v, plan.requirePreviewReady)
 			if err != nil {
-				log.Printf("[spider91migrate] %s check generated assets: %v", v.ID, err)
+				log.Printf("[crawlerupload] %s check generated assets: %v", v.ID, err)
 				continue
 			}
 			if !ready {
@@ -882,14 +736,14 @@ func (m *Migrator) migrateDrive(ctx context.Context, plan migrationPlan) (int, e
 
 		ok, err := m.migrateOne(ctx, v, plan)
 		if err != nil {
-			log.Printf("[spider91migrate] %s: %v", v.ID, err)
+			log.Printf("[crawlerupload] %s: %v", v.ID, err)
 			// captcha 错误（4002 / 9）说明 PikPak 当前正拒绝我们；继续在
 			// 同一轮里尝试其它文件大概率会拿到同样的 4002，并且每多一次
 			// 失败就多一份"被风控加深"的风险。立即中止当前 batch 并
 			// 打开冷却窗口，等 cfg.CaptchaCooldown 之后再重试。
 			if pikpak.IsCaptchaError(err) {
 				until := m.setCooldown()
-				log.Printf("[spider91migrate] drive=%s captcha-blocked, cooling down until %s", src.ID(), until.Format(time.RFC3339))
+				log.Printf("[crawlerupload] drive=%s captcha-blocked, cooling down until %s", src.ID(), until.Format(time.RFC3339))
 				return migrated, nil
 			}
 			continue
@@ -928,12 +782,10 @@ func (m *Migrator) findVideoForLocalFile(ctx context.Context, plan migrationPlan
 	if plan.source != nil {
 		driveID = plan.source.ID()
 	}
-	for _, kind := range plan.sourceKinds {
-		id := scriptcrawler.BuildVideoIDForKind(kind, driveID, sourceID)
-		v, err := m.cfg.Catalog.GetVideo(ctx, id)
-		if err == nil && v != nil {
-			return v
-		}
+	id := scriptcrawler.BuildVideoID(driveID, sourceID)
+	v, err := m.cfg.Catalog.GetVideo(ctx, id)
+	if err == nil && v != nil {
+		return v
 	}
 	return nil
 }
@@ -968,8 +820,8 @@ func (m *Migrator) migrateOne(ctx context.Context, v *catalog.Video, plan migrat
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// 本地文件被人手动删了，但 catalog 还显示 spider91 drive；
-			// 这种状态没法迁移。跳过即可（保留行让管理员可见，避免数据丢失）。
+			// 本地文件被人手动删了，但 catalog 还指向该爬虫；
+			// 这种状态没法上传。跳过即可（保留行让管理员可见，避免数据丢失）。
 			return false, nil
 		}
 		return false, fmt.Errorf("stat local: %w", err)
@@ -988,7 +840,7 @@ func (m *Migrator) migrateOne(ctx context.Context, v *catalog.Video, plan migrat
 	if err != nil {
 		return false, fmt.Errorf("%s ensure %q dir: %w", pp.Kind(), plan.uploadDir, err)
 	}
-	uploadName := desiredPikPakName(v.Title, sourceIDForUploadName(v, plan), v.Ext)
+	uploadName := desiredUploadName(v.Title, sourceIDForUploadName(v, plan), v.Ext)
 	res, err := pp.UploadAndReportHash(ctx, parent, uploadName, f, info.Size())
 	if err != nil {
 		return false, fmt.Errorf("%s upload: %w", pp.Kind(), err)
@@ -1004,13 +856,13 @@ func (m *Migrator) migrateOne(ctx context.Context, v *catalog.Video, plan migrat
 	m.preserveCrawledThumbnail(ctx, src, v)
 	// 同步 catalog 里的 file_name，让下次目标盘扫盘时 (file_name, size) 也能匹配上
 	if err := m.cfg.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{FileName: uploadName}); err != nil {
-		log.Printf("[spider91migrate] %s update file_name after migrate: %v", v.ID, err)
+		log.Printf("[crawlerupload] %s update file_name after migrate: %v", v.ID, err)
 	}
 
 	// 删除本地 mp4 和源 thumb（公共 /p/thumb 副本已在 preserveCrawledThumbnail 中保留）。
-	CleanupSpider91Local(src, v.FileID)
+	CleanupLocal(src, v.FileID)
 
-	log.Printf("[spider91migrate] %s migrated to drive=%s(kind=%s) file=%s name=%q", v.ID, plan.targetDriveID, pp.Kind(), res.FileID, uploadName)
+	log.Printf("[crawlerupload] %s migrated to drive=%s(kind=%s) file=%s name=%q", v.ID, plan.targetDriveID, pp.Kind(), res.FileID, uploadName)
 	return true, nil
 }
 
@@ -1026,12 +878,12 @@ func (m *Migrator) bindToExistingTarget(ctx context.Context, v, target *catalog.
 	}
 	if target.FileName != "" {
 		if err := m.cfg.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{FileName: target.FileName}); err != nil {
-			log.Printf("[spider91migrate] %s update file_name after duplicate bind: %v", v.ID, err)
+			log.Printf("[crawlerupload] %s update file_name after duplicate bind: %v", v.ID, err)
 		}
 	}
 	m.preserveCrawledThumbnail(ctx, plan.source, v)
-	CleanupSpider91Local(plan.source, v.FileID)
-	log.Printf("[spider91migrate] %s bound to existing drive=%s(kind=%s) file=%s duplicate=%s", v.ID, plan.targetDriveID, plan.target.Kind(), target.FileID, target.ID)
+	CleanupLocal(plan.source, v.FileID)
+	log.Printf("[crawlerupload] %s bound to existing drive=%s(kind=%s) file=%s duplicate=%s", v.ID, plan.targetDriveID, plan.target.Kind(), target.FileID, target.ID)
 	return true, nil
 }
 
@@ -1048,22 +900,17 @@ func sourceIDForUploadName(v *catalog.Video, plan migrationPlan) string {
 	if v == nil {
 		return ""
 	}
-	if plan.legacyBackfill {
-		return extractViewKey(v.ID)
-	}
-	for _, kind := range plan.sourceKinds {
-		prefix := kind + "-" + plan.source.ID() + "-"
-		if strings.HasPrefix(v.ID, prefix) {
-			return strings.TrimPrefix(v.ID, prefix)
-		}
+	prefix := scriptcrawler.Kind + "-" + plan.source.ID() + "-"
+	if strings.HasPrefix(v.ID, prefix) {
+		return strings.TrimPrefix(v.ID, prefix)
 	}
 	if v.FileID != "" {
 		return stripExt(v.FileID)
 	}
-	return extractViewKey(v.ID)
+	return extractSourceID(v.ID)
 }
 
-func (m *Migrator) preserveCrawledThumbnail(ctx context.Context, src Spider91LocalSource, v *catalog.Video) {
+func (m *Migrator) preserveCrawledThumbnail(ctx context.Context, src LocalSource, v *catalog.Video) {
 	if m == nil || m.cfg.Catalog == nil || src == nil || v == nil || v.ID == "" || v.FileID == "" {
 		return
 	}
@@ -1071,38 +918,38 @@ func (m *Migrator) preserveCrawledThumbnail(ctx context.Context, src Spider91Loc
 	if commonDir == "" {
 		return
 	}
-	thumbPath, ok := findSpider91ThumbPath(src, v.FileID)
+	thumbPath, ok := findCrawlerThumbPath(src, v.FileID)
 	if !ok {
 		if v.ThumbnailURL == "" {
-			log.Printf("[spider91migrate] %s crawled thumbnail missing before migration cleanup", v.ID)
+			log.Printf("[crawlerupload] %s crawled thumbnail missing before migration cleanup", v.ID)
 		}
 		return
 	}
 	if err := os.MkdirAll(commonDir, 0o755); err != nil {
-		log.Printf("[spider91migrate] %s mkdir common thumbs: %v", v.ID, err)
+		log.Printf("[crawlerupload] %s mkdir common thumbs: %v", v.ID, err)
 		return
 	}
 	dst := mediaasset.ThumbnailPathInDir(commonDir, v.ID)
 	if _, err := os.Stat(dst); err != nil {
 		if !os.IsNotExist(err) {
-			log.Printf("[spider91migrate] %s stat common thumb: %v", v.ID, err)
+			log.Printf("[crawlerupload] %s stat common thumb: %v", v.ID, err)
 			return
 		}
 		if err := copyFileAtomic(thumbPath, dst); err != nil {
-			log.Printf("[spider91migrate] %s preserve crawled thumbnail: %v", v.ID, err)
+			log.Printf("[crawlerupload] %s preserve crawled thumbnail: %v", v.ID, err)
 			return
 		}
 	}
 	if err := m.cfg.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
 		ThumbnailURL: "/p/thumb/" + v.ID,
 	}); err != nil {
-		log.Printf("[spider91migrate] %s update crawled thumbnail url: %v", v.ID, err)
+		log.Printf("[crawlerupload] %s update crawled thumbnail url: %v", v.ID, err)
 		return
 	}
 	v.ThumbnailURL = "/p/thumb/" + v.ID
 }
 
-func findSpider91ThumbPath(src Spider91LocalSource, fileID string) (string, bool) {
+func findCrawlerThumbPath(src LocalSource, fileID string) (string, bool) {
 	thumbBase := stripExt(fileID)
 	for _, ext := range []string{".jpg", ".jpeg", ".png", ".webp"} {
 		thumbPath, err := src.ThumbPath(thumbBase + ext)
@@ -1142,20 +989,19 @@ func copyFileAtomic(src, dst string) error {
 	return os.Rename(tmp, dst)
 }
 
-// CleanupSpider91Local 删除已迁移视频的本地 mp4 和 thumb。
+// CleanupLocal 删除已上传视频的本地 mp4 和 thumb。
 //
-// thumb 删除是 best-effort —— 找不到就算了（spider91 thumb 文件名带后缀，
-// 我们不知道具体是 .jpg 还是别的，逐个尝试常见后缀）。
+// thumb 删除是 best-effort —— 找不到就算了；逐个尝试常见后缀。
 //
-// 暴露成包级函数方便 cleanup 模块复用（任务 6）。
-func CleanupSpider91Local(src Spider91LocalSource, fileID string) {
+// 暴露成包级函数方便 cleanup 模块复用。
+func CleanupLocal(src LocalSource, fileID string) {
 	videoPath, err := src.VideoPath(fileID)
 	if err == nil {
 		if err := os.Remove(videoPath); err != nil && !os.IsNotExist(err) {
-			log.Printf("[spider91migrate] remove local mp4 %s: %v", videoPath, err)
+			log.Printf("[crawlerupload] remove local mp4 %s: %v", videoPath, err)
 		}
 	}
-	// thumb 文件名是 <viewkey>.<ext>；fileID 是 <viewkey>.<videoExt>，
+	// thumb 文件名是 <sourceID>.<ext>；fileID 是 <sourceID>.<videoExt>，
 	// 不一定相同。尝试用 fileID 去掉视频扩展名后拼 thumb 常见后缀。
 	thumbBase := stripExt(fileID)
 	for _, ext := range []string{".jpg", ".jpeg", ".png", ".webp"} {
@@ -1167,16 +1013,12 @@ func CleanupSpider91Local(src Spider91LocalSource, fileID string) {
 	}
 }
 
-func CleanupSpiderXVideosLocal(src *spiderxvideos.Driver, fileID string) {
-	CleanupSpider91Local(src, fileID)
-}
-
 func stripExt(name string) string {
 	ext := filepath.Ext(name)
 	return name[:len(name)-len(ext)]
 }
 
-// cleanupOldLocalVideos 是防御性兜底：扫 spider91 drive 本地 videos/ 目录，
+// cleanupOldLocalVideos 是防御性兜底：扫爬虫本地 videos/ 目录，
 // 删除所有 catalog 中已经迁移到别处（drive_id != src.ID()）的本地残留。
 //
 // 与 migrateDrive 的区别：
@@ -1184,7 +1026,7 @@ func stripExt(name string) string {
 //   - 不依赖 KeepLatestN —— 哪怕这个孤儿在"最新 N"窗口内，已迁移就该删
 //   - 只看 catalog 状态，不看 mtime
 //
-// 正常路径下 migrateDrive 迁移成功后立刻 CleanupSpider91Local，所以这里
+// 正常路径下 migrateDrive 迁移成功后立刻 CleanupLocal，所以这里
 // 应该不会有任何工作。极端情况（手工改 catalog、迁移过程中 crash）才会
 // 找到孤儿。
 //
@@ -1222,7 +1064,7 @@ func (m *Migrator) cleanupOldLocalVideos(ctx context.Context, plan migrationPlan
 			continue
 		}
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			log.Printf("[spider91migrate] cleanup remove %s: %v", path, err)
+			log.Printf("[crawlerupload] cleanup remove %s: %v", path, err)
 			continue
 		}
 		// thumb 一并删（best-effort）
@@ -1237,45 +1079,4 @@ func (m *Migrator) cleanupOldLocalVideos(ctx context.Context, plan migrationPlan
 		deleted++
 	}
 	return deleted, nil
-}
-
-// backfillFileNames 扫描目标 drive（PikPak、115、123、OneDrive、Google Drive、联通网盘或光鸭网盘）下所有 spider91-* 起始 ID 的视频，
-// 对文件名不是 desiredPikPakName(...) 期望格式的，调 target.Rename 修正，
-// 并把 catalog.file_name 同步到新名字。
-//
-// 幂等：已经是期望格式的视频不会触发任何调用。
-//
-// 返回成功改名的条数。
-func (m *Migrator) backfillFileNames(ctx context.Context, targetDriveID string, pp uploadTarget) (int, error) {
-	videos, err := m.cfg.Catalog.ListVideosByDriveID(ctx, targetDriveID, 10000)
-	if err != nil {
-		return 0, fmt.Errorf("list videos: %w", err)
-	}
-	renamed := 0
-	for _, v := range videos {
-		if err := ctx.Err(); err != nil {
-			return renamed, err
-		}
-		if !isCrawlerVideoID(v.ID) {
-			continue
-		}
-		want := desiredMigratedName(v.Title, v.ID, v.Ext)
-		if v.FileName == want {
-			continue
-		}
-		if v.FileID == "" {
-			continue
-		}
-		if err := pp.Rename(ctx, v.FileID, want); err != nil {
-			log.Printf("[spider91migrate] rename %s -> %q: %v", v.ID, want, err)
-			continue
-		}
-		if err := m.cfg.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{FileName: want}); err != nil {
-			log.Printf("[spider91migrate] %s update file_name after rename: %v", v.ID, err)
-			// 目标盘已经改名成功，但 catalog 更新失败 —— 下轮会重试。继续。
-		}
-		log.Printf("[spider91migrate] renamed %s on %s: %q -> %q", v.ID, pp.Kind(), v.FileName, want)
-		renamed++
-	}
-	return renamed, nil
 }

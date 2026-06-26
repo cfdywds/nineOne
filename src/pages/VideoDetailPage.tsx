@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { AppShell } from "@/components/AppShell";
 import { VideoPlayer } from "@/components/VideoPlayer";
 import { VideoActions } from "@/components/VideoActions";
@@ -13,11 +13,16 @@ import {
   recordView,
   updateVideoTags,
 } from "@/data/videos";
+import { useAuth } from "@/admin/AuthContext";
+import { resolveVideoReturnPath } from "@/lib/videoReturnPath";
 import type { TagItem, VideoDetail } from "@/types";
 
 export default function VideoDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
+  const { isAdmin } = useAuth();
+  const locationState = location.state as { from?: unknown } | null;
   const [detail, setDetail] = useState<VideoDetail | null>(null);
   const [tags, setTags] = useState<TagItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -67,7 +72,7 @@ export default function VideoDetailPage() {
   }
 
   function handleOpenDelete() {
-    if (!detail || deleteSaving) return;
+    if (!isAdmin || !detail || deleteSaving) return;
     setDeleteSource(false);
     setDeleteError("");
     setDeleteOpen(true);
@@ -85,7 +90,8 @@ export default function VideoDetailPage() {
     setDeleteError("");
     try {
       await deleteVideo(detail.id, { deleteSource });
-      navigate("/list", { replace: true });
+      const from = typeof locationState?.from === "string" ? locationState.from : null;
+      navigate(resolveVideoReturnPath(from), { replace: true });
     } catch {
       setDeleteError(
         deleteSource
@@ -220,6 +226,7 @@ export default function VideoDetailPage() {
                   video={detail}
                   onDeleteVideo={handleOpenDelete}
                   deleteSaving={deleteSaving}
+                  canDelete={isAdmin}
                 />
               </section>
 
@@ -227,7 +234,7 @@ export default function VideoDetailPage() {
                 video={detail}
                 availableTags={tags}
                 tagSaving={tagSaving}
-                onTagsChange={handleTagsChange}
+                onTagsChange={isAdmin ? handleTagsChange : undefined}
               />
             </div>
 
@@ -236,7 +243,7 @@ export default function VideoDetailPage() {
         </div>
       </div>
 
-      {deleteOpen && (
+      {deleteOpen && isAdmin && (
         <div className="vd-delete-modal" role="presentation">
           <div
             className="vd-delete-dialog"

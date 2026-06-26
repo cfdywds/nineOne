@@ -64,7 +64,7 @@ func isCaptchaTokenRejectedCode(code int64) bool {
 }
 
 // APIError is the public alias for the PikPak API error response. Callers
-// outside this package (e.g. the spider91→PikPak migrator, tests) can either
+// outside this package (e.g. crawler upload workers and tests) can either
 // construct it for fakes or unwrap it via errors.As. Prefer IsCaptchaError
 // over hard-coding the numeric error codes.
 type APIError = errResp

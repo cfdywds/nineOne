@@ -1,15 +1,4 @@
-export type Kind =
-  | "quark"
-  | "p115"
-  | "p123"
-  | "pikpak"
-  | "wopan"
-  | "guangyapan"
-  | "onedrive"
-  | "googledrive"
-  | "localstorage"
-  | "spider91"
-  | "spiderxvideos";
+export type Kind = "quark" | "p115" | "p123" | "pikpak" | "wopan" | "guangyapan" | "onedrive" | "googledrive" | "localstorage";
 
 export const kindAbbr: Record<string, string> = {
   quark: "Qk",
@@ -21,8 +10,6 @@ export const kindAbbr: Record<string, string> = {
   onedrive: "OD",
   googledrive: "GD",
   localstorage: "Lo",
-  spider91: "91",
-  spiderxvideos: "XV",
 };
 
 export function driveKindAbbr(kind: string): string {
@@ -45,8 +32,6 @@ export const kindLabel: Record<string, string> = {
   onedrive: "OneDrive",
   googledrive: "Google Drive",
   localstorage: "本地存储",
-  spider91: "91 爬虫",
-  spiderxvideos: "XVideos 爬虫",
 };
 
 export type FormState = {
@@ -55,7 +40,6 @@ export type FormState = {
   name: string;
   rootId: string;
   creds: Record<string, string>;
-  spider91UploadDriveId: string;
 };
 
 export const emptyForm: FormState = {
@@ -64,7 +48,6 @@ export const emptyForm: FormState = {
   name: "",
   rootId: "",
   creds: {},
-  spider91UploadDriveId: "",
 };
 
 export const idleNightlyStatus = {
@@ -72,10 +55,6 @@ export const idleNightlyStatus = {
   running: false,
   queued: false,
 };
-
-export function isSpiderCrawlerKind(kind: string): boolean {
-  return kind === "spider91" || kind === "spiderxvideos";
-}
 
 export function nightlyButtonText(status: { running: boolean; queued: boolean }, triggering: boolean) {
   if (triggering) return "触发中...";
@@ -149,12 +128,11 @@ export function defaultRootId(kind: Kind): string {
   if (kind === "onedrive") return "root";
   if (kind === "googledrive") return "root";
   if (kind === "localstorage") return "/";
-  if (isSpiderCrawlerKind(kind)) return "/";
   return "0";
 }
 
 export function usesRootDirectoryID(kind: Kind): boolean {
-  return kind !== "localstorage" && !isSpiderCrawlerKind(kind);
+  return kind !== "localstorage";
 }
 
 export function rootIdPlaceholder(kind: Kind): string {
@@ -185,10 +163,6 @@ export function credentialHelp(kind: Kind, isEdit: boolean): string {
         : "请参考OpenList文档中关于谷歌云盘的配置方法";
     case "localstorage":
       return `填写服务器可访问的本地目录绝对路径，例如 /mnt/videos。系统会扫描该目录及子目录中的视频文件和 .strm 文件；.strm 可指向 HTTP/HTTPS 直链或本地视频路径（指向目录外需开启下方开关）。Docker 部署时请填写容器内路径。${note}`;
-    case "spider91":
-      return "91Spider 不再支持通过网盘添加或编辑。请到后台爬虫管理页面添加爬虫脚本。";
-    case "spiderxvideos":
-      return "XVideos 爬虫会把定时抓取到的视频和封面先保存到本机，并作为一个视频来源接入站点；可按服务器网络情况单独配置代理和过滤条件。";
     default:
       return "";
   }
@@ -395,84 +369,6 @@ export function credentialFields(kind: Kind, creds: Record<string, string> = {})
             { value: "true", label: "开启（允许任意本地路径）" },
           ],
           help: "开启后 .strm 可指向本目录之外的本地文件（如 rclone 挂载点）。注意：等于允许通过 .strm 读取服务器上任意文件，请只在自己完全掌控媒体目录时开启。Docker 部署时路径必须是容器内路径。",
-        },
-      ];
-    case "spider91":
-      return [
-        {
-          key: "proxy",
-          label: "代理地址（可选）",
-          placeholder: "http://127.0.0.1:7890",
-          help: "支持 http://、https://、socks5://、socks5h://代理",
-        },
-      ];
-    case "spiderxvideos":
-      return [
-        {
-          key: "start_url",
-          label: "起始 URL",
-          placeholder: "https://www.xvideos.com/",
-          help: "首页、搜索页或分类页 URL；为空默认首页。",
-        },
-        {
-          key: "keyword",
-          label: "搜索关键词",
-          placeholder: "可选；填写后优先按关键词搜索",
-        },
-        {
-          key: "quality",
-          label: "清晰度",
-          placeholder: "best",
-          help: "best、hd、high 或 low；默认 best。",
-        },
-        {
-          key: "min_duration",
-          label: "最小时长",
-          placeholder: "例如 5m、300s",
-        },
-        {
-          key: "max_duration",
-          label: "最大时长",
-          placeholder: "例如 30m、1800s",
-        },
-        {
-          key: "min_size",
-          label: "最小文件大小",
-          placeholder: "例如 50MB",
-        },
-        {
-          key: "max_size",
-          label: "最大文件大小",
-          placeholder: "例如 2GB",
-        },
-        {
-          key: "merge_hls",
-          label: "合并 HLS",
-          placeholder: "true / false",
-          help: "需要 ffmpeg；默认 false。",
-        },
-        {
-          key: "target_new",
-          label: "目标新视频数",
-          placeholder: "10",
-          help: "每次抓取的目标新视频数；为空时使用后端默认值。",
-        },
-        {
-          key: "proxy",
-          label: "代理地址（可选）",
-          placeholder: "http://127.0.0.1:7890",
-          help: "支持 http://、https://、socks5://、socks5h://代理",
-        },
-        {
-          key: "cookie",
-          label: "Cookie（可选）",
-          placeholder: "用于需要登录态的页面",
-        },
-        {
-          key: "script_path",
-          label: "脚本路径",
-          placeholder: "/opt/video-site-91/91VideoSpider/spider_xvideos.py",
-          help: "可选；为空时后端自动查找内置脚本。",
         },
       ];
   }

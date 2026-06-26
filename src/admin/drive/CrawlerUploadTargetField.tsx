@@ -3,7 +3,7 @@ import { ChevronDown } from "lucide-react";
 import { kindLabel } from "./constants";
 import * as api from "../api";
 
-export function Spider91UploadTargetField({
+export function CrawlerUploadTargetField({
   value,
   onChange,
   uploadTargets,

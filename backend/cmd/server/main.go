@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +27,7 @@ import (
 	"github.com/video-site/backend/internal/auth"
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
+	"github.com/video-site/backend/internal/crawlerupload"
 	"github.com/video-site/backend/internal/drives"
 	"github.com/video-site/backend/internal/drives/googledrive"
 	"github.com/video-site/backend/internal/drives/guangyapan"
@@ -36,21 +39,25 @@ import (
 	"github.com/video-site/backend/internal/drives/pikpak"
 	"github.com/video-site/backend/internal/drives/quark"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
-	"github.com/video-site/backend/internal/drives/spider91"
 	"github.com/video-site/backend/internal/drives/spiderxvideos"
 	"github.com/video-site/backend/internal/drives/wopan"
 	"github.com/video-site/backend/internal/fingerprint"
 	"github.com/video-site/backend/internal/mediaasset"
+	"github.com/video-site/backend/internal/mediasim"
 	"github.com/video-site/backend/internal/nightly"
 	"github.com/video-site/backend/internal/preview"
 	"github.com/video-site/backend/internal/proxy"
 	"github.com/video-site/backend/internal/scanner"
-	"github.com/video-site/backend/internal/spider91migrate"
 	"github.com/video-site/backend/internal/transcode"
 )
 
-const fingerprintReconcileInterval = time.Minute
-const legacySpider91DriveUnsupported = "91Spider 已不再支持作为网盘配置，请在爬虫管理页面添加爬虫脚本"
+const (
+	fingerprintReconcileInterval = time.Minute
+
+	videoMaintenanceTitleThreshold           = 0.90
+	videoMaintenanceSSIMThreshold            = 0.95
+	videoMaintenanceDurationToleranceSeconds = 2
+)
 
 func defaultCrawlerPythonPath() string {
 	if runtime.GOOS == "windows" {
@@ -60,6 +67,14 @@ func defaultCrawlerPythonPath() string {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "hash-password" {
+		if err := runHashPasswordCommand(os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	cfgPath := "./config.yaml"
 	if v := os.Getenv("VIDEO_CONFIG"); v != "" {
 		cfgPath = v
@@ -93,10 +108,9 @@ func main() {
 		spiderXVideosCrawlers: make(map[string]*spiderxvideos.Crawler),
 	}
 	app.proxy = proxy.New(app.registry)
-	app.spider91Migrator = spider91migrate.New(spider91migrate.Config{
+	app.crawlerUploader = crawlerupload.New(crawlerupload.Config{
 		Catalog:          cat,
 		Registry:         app.registry,
-		GetTargetDriveID: func() string { return app.Spider91UploadDriveID() },
 		CommonThumbDir:   app.commonThumbsDir(),
 		OnUploadProgress: app.updateCrawlerUploadProgress,
 	})
@@ -107,7 +121,6 @@ func main() {
 	defer cancel()
 
 	app.loadTheme(ctx)
-	app.loadSpider91UploadDriveID(ctx)
 	if removed, err := app.cleanupOrphanDriveVideos(ctx); err != nil {
 		log.Printf("[cleanup] orphan drive videos: %v", err)
 	} else if removed > 0 {
@@ -124,6 +137,11 @@ func main() {
 		Catalog:  cat,
 	}
 	setupRequired := config.RequiresAdminSetup(cfg)
+	if !setupRequired {
+		if err := ensureConfigAdminUser(ctx, cat, cfg); err != nil {
+			log.Printf("[auth] migrate config admin: %v", err)
+		}
+	}
 	var setupMu sync.Mutex
 	versionFilePath := strings.TrimSpace(os.Getenv("VIDEO_VERSION_FILE"))
 	if versionFilePath == "" {
@@ -172,6 +190,13 @@ func main() {
 			if err := config.WriteAdminCredentials(cfgPath, username, password); err != nil {
 				return err
 			}
+			hashed, err := auth.HashPassword(password)
+			if err != nil {
+				return err
+			}
+			if _, err := cat.CreateUser(ctx, username, hashed, "admin"); err != nil {
+				return err
+			}
 			cfg.Server.Admin.Username = username
 			cfg.Server.Admin.Password = password
 			authr.SetCredentials(username, password)
@@ -206,21 +231,18 @@ func main() {
 		},
 		OnScanRequested: func(driveID string) bool {
 			// 爬虫类 drive 的"重扫"等同于手动触发一次爬取；其它 drive 走标准 scan
+			isScriptCrawler := false
+			isSpiderXVideos := false
 			if d, err := app.cat.GetDrive(ctx, driveID); err == nil && d != nil {
-				if d.Kind == spider91.Kind {
-					log.Printf("[spider91] drive=%s is a deprecated storage crawler, ignore scan request", driveID)
-					return false
-				}
-				if d.Kind == scriptcrawler.Kind {
-					if scriptCrawlerSourceKindForDrive(d) == spider91.Kind {
-						return app.scheduleSpider91Crawl(ctx, driveID)
-					}
-					return app.scheduleScriptCrawlerCrawl(ctx, driveID)
-				}
-				if d.Kind == spiderxvideos.Kind {
-					go app.runSpiderXVideosCrawl(ctx, driveID)
-					return true
-				}
+				isScriptCrawler = d.Kind == scriptcrawler.Kind
+				isSpiderXVideos = d.Kind == spiderxvideos.Kind
+			}
+			if isScriptCrawler {
+				return app.scheduleScriptCrawlerCrawl(ctx, driveID)
+			}
+			if isSpiderXVideos {
+				go app.runSpiderXVideosCrawl(ctx, driveID)
+				return true
 			}
 			return app.scheduleScan(ctx, driveID)
 		},
@@ -260,9 +282,6 @@ func main() {
 		GetDriveGenerationStatuses: func() map[string]api.DriveGenerationStatuses {
 			return app.driveGenerationStatuses()
 		},
-		GetDriveCrawlStatus: func(driveID string) api.CrawlStatus {
-			return app.driveCrawlStatus(driveID)
-		},
 		GetPreviewGenerationVideoIDs: func() map[string]bool {
 			return app.previewGenerationVideoIDs()
 		},
@@ -281,10 +300,6 @@ func main() {
 		GetTheme: func() string { return app.Theme() },
 		SetTheme: func(theme string) error {
 			return app.SetTheme(ctx, theme)
-		},
-		GetSpider91UploadDriveID: func() string { return app.Spider91UploadDriveID() },
-		SetSpider91UploadDriveID: func(id string) error {
-			return app.SetSpider91UploadDriveID(ctx, id)
 		},
 		OnRunNightlyJob: func() bool {
 			if app.nightlyRunner != nil {
@@ -310,23 +325,22 @@ func main() {
 	mountFrontend(r)
 
 	// 凌晨流水线：每天 cron_hour 触发一次，串行跑
-	//   Phase 1 扫所有非 spider91 / localupload 网盘 + 删除检测 + 入队封面/预览视频
-	//   Phase 2 spider91 爬虫 + 入队预览视频
-	//   Phase 3 spider91 → 云盘迁移
+	//   Phase 1 扫所有非爬虫 / localupload 网盘 + 删除检测 + 入队封面/预览视频
+	//   Phase 2 脚本爬虫 + 入队预览视频
+	//   Phase 3 爬虫本地视频 → 云盘上传
+	//   Phase 4 全库重复视频维护：精确指纹去重 + 标题/时长/封面近似去重
 	// 也响应 admin "扫描所有网盘" 按钮（POST /admin/api/jobs/nightly/run → TriggerNow）。
 	app.nightlyRunner = nightly.New(nightly.Config{
-		Settings:                cat,
-		CronHour:                cfg.Nightly.CronHour,
-		MaxDuration:             cfg.Nightly.MaxDuration,
-		ListScanTargets:         app.listScanTargetIDs,
-		RunScan:                 app.runScan,
-		ListSpider91Drives:      app.listSpider91DriveIDs,
-		RunSpider91Crawl:        app.runSpider91Crawl,
-		ListSpiderXVideosDrives: app.listSpiderXVideosDriveIDs,
-		RunSpiderXVideosCrawl:   app.runSpiderXVideosCrawl,
-		WaitPreviewQueuesIdle:   app.waitAllPreviewQueuesIdle,
-		RunMigration:            app.spider91Migrator.RunOnce,
-		RunDedupeAssetCleanup:   app.cleanupDuplicateVideoAssets,
+		Settings:              cat,
+		CronHour:              cfg.Nightly.CronHour,
+		MaxDuration:           cfg.Nightly.MaxDuration,
+		ListScanTargets:       app.listScanTargetIDs,
+		RunScan:               app.runScan,
+		ListCrawlerDrives:     app.listCrawlerDriveIDs,
+		RunCrawlerCrawl:       app.runScriptCrawlerCrawl,
+		WaitPreviewQueuesIdle: app.waitAllPreviewQueuesIdle,
+		RunMigration:          app.crawlerUploader.RunOnce,
+		RunDedupeAssetCleanup: app.cleanupDuplicateVideoAssets,
 	})
 	go app.nightlyRunner.Run(ctx)
 
@@ -353,6 +367,45 @@ func main() {
 	_ = srv.Shutdown(shutCtx)
 }
 
+func runHashPasswordCommand(r io.Reader, w io.Writer) error {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return fmt.Errorf("read password: %w", err)
+	}
+	password := strings.TrimRight(string(data), "\r\n")
+	if len(password) < 6 {
+		return fmt.Errorf("password must be at least 6 characters")
+	}
+	hashed, err := auth.HashPassword(password)
+	if err != nil {
+		return fmt.Errorf("hash password: %w", err)
+	}
+	_, err = fmt.Fprintln(w, hashed)
+	return err
+}
+
+func ensureConfigAdminUser(ctx context.Context, cat *catalog.Catalog, cfg *config.Config) error {
+	if cat == nil || cfg == nil {
+		return nil
+	}
+	username := strings.TrimSpace(cfg.Server.Admin.Username)
+	password := cfg.Server.Admin.Password
+	if username == "" || password == "" {
+		return nil
+	}
+	if _, err := cat.GetUserByUsername(ctx, username); err == nil {
+		return nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	hashed, err := auth.HashPassword(password)
+	if err != nil {
+		return err
+	}
+	_, err = cat.CreateUser(ctx, username, hashed, "admin")
+	return err
+}
+
 // ---------- App ----------
 
 type App struct {
@@ -367,7 +420,6 @@ type App struct {
 	fingerprintWorkers map[string]*fingerprint.Worker
 	cancels            map[string]context.CancelFunc
 	// scriptCrawlers 按 driveID 索引，每个脚本爬虫 drive 独立一个 Crawler。
-	// 内置 Spider91 也走这里，只是 SourceKind=spider91，以兼容历史 video id。
 	scriptCrawlers map[string]*scriptcrawler.Crawler
 	// spiderXVideosCrawlers 按 driveID 索引，每个 XVideos drive 独立一个 Crawler。
 	spiderXVideosCrawlers map[string]*spiderxvideos.Crawler
@@ -378,20 +430,17 @@ type App struct {
 
 	// 全站主题（"dark" | "pink" | "sky"），从 DB 读
 	theme string
-	// 显式指定的 spider91 上传目标 drive ID。
-	// 空字符串表示本地保存不上传，不再自动挑选 pikpak/p115/p123/onedrive/wopan/guangyapan drive。
-	spider91UploadDriveID string
 
-	// spider91Migrator 把 spider91 视频上传到目标 drive（PikPak、115、123、OneDrive、Google Drive、联通网盘或光鸭网盘）。
-	spider91Migrator spider91MigrationRunner
+	// crawlerUploader 把脚本爬虫保存在本地的视频上传到每个爬虫配置的目标 drive。
+	crawlerUploader crawlerUploadRunner
 
-	// nightlyRunner 是凌晨流水线调度器：每天 cron_hour 串行跑扫盘 → 91 爬虫 → 迁移。
+	// nightlyRunner 是凌晨流水线调度器：每天 cron_hour 串行跑扫盘 → 脚本爬虫 → 上传。
 	// 也响应 admin 「扫描所有网盘」按钮（TriggerNow）。
 	nightlyRunner *nightly.Runner
 
 	// scanQueueMu 保护 scanQueued 和 scanProgress。
 	scanQueueMu sync.Mutex
-	// scanQueued 跟踪哪些 driveID 已经排队或正在跑扫盘/91 爬取，去重后续重复点击。
+	// scanQueued 跟踪哪些 driveID 已经排队或正在跑扫盘/爬取，去重后续重复点击。
 	// 不同 drive 互不等待，可以并行扫；同一个 drive 只能有一个扫盘/抓取任务。
 	scanQueued map[string]bool
 	// scanProgress 跟踪每个正在扫盘/抓取的 drive 当前进度。
@@ -408,12 +457,12 @@ type App struct {
 	fingerprintQueueMu  sync.Mutex
 	fingerprintQueueing map[string]bool
 
-	crawlStatusMu sync.Mutex
-	crawlStatuses map[string]api.CrawlStatus
-
 	// crawlerUploadRunning 去重"保存上传目标后检查本地未上传文件"的后台任务。
 	crawlerUploadMu      sync.Mutex
 	crawlerUploadRunning map[string]bool
+
+	crawlStatusMu sync.Mutex
+	crawlStatuses map[string]api.CrawlStatus
 
 	// uploadProgress 跟踪脚本爬虫迁移到云盘时的实时上传状态。
 	uploadProgressMu sync.Mutex
@@ -441,7 +490,7 @@ type driveUploadProgress struct {
 	TotalCount   int
 }
 
-type spider91MigrationRunner interface {
+type crawlerUploadRunner interface {
 	RunOnce(ctx context.Context) error
 }
 
@@ -506,42 +555,6 @@ func (a *App) loadTheme(ctx context.Context) {
 	a.mu.Unlock()
 }
 
-// Spider91UploadDriveID 返回当前配置的 spider91 上传目标 drive ID。
-// 空字符串表示本地保存不上传；只有管理员显式选择 pikpak/p115/p123/onedrive/googledrive/wopan/guangyapan drive 时才迁移上传。
-func (a *App) Spider91UploadDriveID() string {
-	a.mu.Lock()
-	explicit := a.spider91UploadDriveID
-	a.mu.Unlock()
-	if explicit == "" {
-		return ""
-	}
-	// 验证显式设置的 drive 仍然存在且 kind 合法；不在则视为未配置。
-	if d, ok := a.registry.Get(explicit); ok && isSpider91UploadKind(d.Kind()) {
-		return explicit
-	}
-	return ""
-}
-
-// SetSpider91UploadDriveID 设置 spider91 上传目标 drive ID 并持久化。
-// 接受空字符串（本地保存不上传）。
-// 设置一个不存在或 kind 不是 pikpak / p115 / p123 / onedrive / googledrive / wopan / guangyapan 的 drive 会返回错误。
-func (a *App) SetSpider91UploadDriveID(ctx context.Context, driveID string) error {
-	driveID = strings.TrimSpace(driveID)
-	if driveID != "" {
-		d, ok := a.registry.Get(driveID)
-		if !ok {
-			return fmt.Errorf("drive %q not found", driveID)
-		}
-		if !isSpider91UploadKind(d.Kind()) {
-			return fmt.Errorf("drive %q kind=%s, only pikpak, p115, p123, onedrive, googledrive, wopan or guangyapan can be spider91 upload target", driveID, d.Kind())
-		}
-	}
-	a.mu.Lock()
-	a.spider91UploadDriveID = driveID
-	a.mu.Unlock()
-	return a.cat.SetSetting(ctx, "spider91.upload_drive_id", driveID)
-}
-
 func (a *App) nightlyJobStatus() api.NightlyJobStatus {
 	if a.nightlyRunner == nil {
 		return api.NightlyJobStatus{State: "idle"}
@@ -561,24 +574,6 @@ func formatOptionalRFC3339(t time.Time) string {
 		return ""
 	}
 	return t.Format(time.RFC3339)
-}
-
-// isSpider91UploadKind 是 spider91 迁移目标盘的 allowlist。
-// 与 spider91migrate.adaptUploadTarget 的支持范围保持一致。
-func isSpider91UploadKind(kind string) bool {
-	return kind == "pikpak" || kind == "p115" || kind == "p123" || kind == "onedrive" || kind == "googledrive" || kind == "wopan" || kind == guangyapan.Kind
-}
-
-// loadSpider91UploadDriveID 从 DB 读上传目标 drive ID 设置；不存在时使用空串。
-func (a *App) loadSpider91UploadDriveID(ctx context.Context) {
-	v, err := a.cat.GetSetting(ctx, "spider91.upload_drive_id", "")
-	if err != nil {
-		log.Printf("[spider91] load upload drive setting: %v", err)
-		return
-	}
-	a.mu.Lock()
-	a.spider91UploadDriveID = strings.TrimSpace(v)
-	a.mu.Unlock()
 }
 
 func (a *App) driveGenerationStatuses() map[string]api.DriveGenerationStatuses {
@@ -659,20 +654,6 @@ func (a *App) driveGenerationStatuses() map[string]api.DriveGenerationStatuses {
 		status.Fingerprint = generationStatusFromFingerprint(worker.Status())
 		out[id] = status
 	}
-	for id, worker := range fingerprintWorkers {
-		status := out[id]
-		status.Fingerprint = generationStatusFromFingerprint(worker.Status())
-		pending, err := a.cat.CountVideosNeedingFingerprint(context.Background(), id)
-		if err != nil {
-			log.Printf("[fingerprint] count pending fingerprints %s: %v", id, err)
-		} else {
-			status.Fingerprint.QueueLength = pending
-			if pending > 0 && status.Fingerprint.State == "idle" {
-				status.Fingerprint.State = "queued"
-			}
-		}
-		out[id] = status
-	}
 	for id, progress := range uploadProgresses {
 		state := progress.State
 		if state == "" {
@@ -694,6 +675,74 @@ func (a *App) driveGenerationStatuses() map[string]api.DriveGenerationStatuses {
 		out[id] = status
 	}
 	return out
+}
+
+func (a *App) previewGenerationVideoIDs() map[string]bool {
+	a.mu.Lock()
+	previewWorkers := make([]*preview.Worker, 0, len(a.workers))
+	for _, worker := range a.workers {
+		previewWorkers = append(previewWorkers, worker)
+	}
+	a.mu.Unlock()
+
+	out := make(map[string]bool)
+	for _, worker := range previewWorkers {
+		for _, id := range worker.ActiveVideoIDs() {
+			out[id] = true
+		}
+	}
+	return out
+}
+
+func (a *App) updateCrawlerUploadProgress(progress crawlerupload.UploadProgress) {
+	driveID := strings.TrimSpace(progress.DriveID)
+	if driveID == "" {
+		return
+	}
+	state := strings.TrimSpace(progress.State)
+	if state == "" {
+		state = "idle"
+	}
+	a.uploadProgressMu.Lock()
+	if a.uploadProgress == nil {
+		a.uploadProgress = make(map[string]driveUploadProgress)
+	}
+	if state == "idle" {
+		delete(a.uploadProgress, driveID)
+		a.uploadProgressMu.Unlock()
+		return
+	}
+	a.uploadProgress[driveID] = driveUploadProgress{
+		State:        state,
+		CurrentTitle: strings.TrimSpace(progress.CurrentTitle),
+		QueueLength:  progress.QueueLength,
+		DoneCount:    progress.DoneCount,
+		TotalCount:   progress.TotalCount,
+	}
+	a.uploadProgressMu.Unlock()
+}
+
+func (a *App) clearCrawlerUploadProgress(driveID string) bool {
+	driveID = strings.TrimSpace(driveID)
+	if driveID == "" {
+		return false
+	}
+	a.uploadProgressMu.Lock()
+	_, ok := a.uploadProgress[driveID]
+	delete(a.uploadProgress, driveID)
+	a.uploadProgressMu.Unlock()
+	return ok
+}
+
+func (a *App) clearAllCrawlerUploadProgress() []string {
+	a.uploadProgressMu.Lock()
+	ids := make([]string, 0, len(a.uploadProgress))
+	for id := range a.uploadProgress {
+		ids = append(ids, id)
+	}
+	a.uploadProgress = nil
+	a.uploadProgressMu.Unlock()
+	return ids
 }
 
 func (a *App) driveCrawlStatus(driveID string) api.CrawlStatus {
@@ -775,74 +824,6 @@ func formatCrawlTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339)
 }
 
-func (a *App) previewGenerationVideoIDs() map[string]bool {
-	a.mu.Lock()
-	previewWorkers := make([]*preview.Worker, 0, len(a.workers))
-	for _, worker := range a.workers {
-		previewWorkers = append(previewWorkers, worker)
-	}
-	a.mu.Unlock()
-
-	out := make(map[string]bool)
-	for _, worker := range previewWorkers {
-		for _, id := range worker.ActiveVideoIDs() {
-			out[id] = true
-		}
-	}
-	return out
-}
-
-func (a *App) updateCrawlerUploadProgress(progress spider91migrate.UploadProgress) {
-	driveID := strings.TrimSpace(progress.DriveID)
-	if driveID == "" {
-		return
-	}
-	state := strings.TrimSpace(progress.State)
-	if state == "" {
-		state = "idle"
-	}
-	a.uploadProgressMu.Lock()
-	if a.uploadProgress == nil {
-		a.uploadProgress = make(map[string]driveUploadProgress)
-	}
-	if state == "idle" {
-		delete(a.uploadProgress, driveID)
-		a.uploadProgressMu.Unlock()
-		return
-	}
-	a.uploadProgress[driveID] = driveUploadProgress{
-		State:        state,
-		CurrentTitle: strings.TrimSpace(progress.CurrentTitle),
-		QueueLength:  progress.QueueLength,
-		DoneCount:    progress.DoneCount,
-		TotalCount:   progress.TotalCount,
-	}
-	a.uploadProgressMu.Unlock()
-}
-
-func (a *App) clearCrawlerUploadProgress(driveID string) bool {
-	driveID = strings.TrimSpace(driveID)
-	if driveID == "" {
-		return false
-	}
-	a.uploadProgressMu.Lock()
-	_, ok := a.uploadProgress[driveID]
-	delete(a.uploadProgress, driveID)
-	a.uploadProgressMu.Unlock()
-	return ok
-}
-
-func (a *App) clearAllCrawlerUploadProgress() []string {
-	a.uploadProgressMu.Lock()
-	ids := make([]string, 0, len(a.uploadProgress))
-	for id := range a.uploadProgress {
-		ids = append(ids, id)
-	}
-	a.uploadProgress = nil
-	a.uploadProgressMu.Unlock()
-	return ids
-}
-
 func generationStatusFromPreview(status preview.TaskStatus) api.GenerationStatus {
 	state := status.State
 	if state == "" {
@@ -908,7 +889,7 @@ func (a *App) startDriveTranscode(ctx context.Context, driveID string) (bool, st
 		return false, "存储未挂载或不可用"
 	}
 	switch drv.Kind() {
-	case spider91.Kind, scriptcrawler.Kind:
+	case scriptcrawler.Kind:
 		return false, "爬虫存储不支持转码"
 	}
 	workDir := a.transcodeWorkDir()
@@ -1187,13 +1168,8 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 	case scriptcrawler.Kind:
 		drv = scriptcrawler.New(scriptcrawler.Config{
 			ID:      d.ID,
-			RootDir: a.scriptCrawlerDriveDirForDrive(d),
+			RootDir: a.scriptCrawlerDriveDir(d.ID),
 		})
-	case spider91.Kind:
-		d.Status = "error"
-		d.LastError = legacySpider91DriveUnsupported
-		_ = a.cat.UpsertDrive(ctx, d)
-		return errors.New(legacySpider91DriveUnsupported)
 	case spiderxvideos.Kind:
 		drv = spiderxvideos.New(spiderxvideos.Config{
 			ID:      d.ID,
@@ -1311,24 +1287,6 @@ func fingerprintConfigForDrive(drv drives.Drive) fingerprint.Config {
 	return cfg
 }
 
-// spider91RootDir 是所有 spider91 drive 共享的根目录。
-func (a *App) spider91RootDir() string {
-	return filepath.Join(filepath.Dir(a.cfg.Storage.LocalPreviewDir), "spider91")
-}
-
-// spider91DriveDir 是单个 spider91 drive 的存储目录：<root>/<driveID>。
-func (a *App) spider91DriveDir(driveID string) string {
-	return filepath.Join(a.spider91RootDir(), driveID)
-}
-
-func (a *App) spiderXVideosRootDir() string {
-	return filepath.Join(filepath.Dir(a.cfg.Storage.LocalPreviewDir), "spiderxvideos")
-}
-
-func (a *App) spiderXVideosDriveDir(driveID string) string {
-	return filepath.Join(a.spiderXVideosRootDir(), driveID)
-}
-
 // scriptCrawlerRootDir 是所有通用脚本爬虫 drive 共享的根目录。
 func (a *App) scriptCrawlerRootDir() string {
 	return filepath.Join(filepath.Dir(a.cfg.Storage.LocalPreviewDir), "scriptcrawlers")
@@ -1339,19 +1297,17 @@ func (a *App) scriptCrawlerDriveDir(driveID string) string {
 	return filepath.Join(a.scriptCrawlerRootDir(), driveID)
 }
 
-func (a *App) scriptCrawlerDriveDirForDrive(d *catalog.Drive) string {
-	if d != nil && scriptCrawlerSourceKindForDrive(d) == spider91.Kind {
-		return a.spider91DriveDir(d.ID)
-	}
-	if d == nil {
-		return a.scriptCrawlerDriveDir("")
-	}
-	return a.scriptCrawlerDriveDir(d.ID)
-}
-
 // commonThumbsDir 是所有 drive 共享的封面目录，/p/thumb/{videoID} 路由命中这里。
 func (a *App) commonThumbsDir() string {
 	return filepath.Join(a.cfg.Storage.LocalPreviewDir, "thumbs")
+}
+
+func (a *App) spiderXVideosRootDir() string {
+	return filepath.Join(filepath.Dir(a.cfg.Storage.LocalPreviewDir), "spiderxvideos")
+}
+
+func (a *App) spiderXVideosDriveDir(driveID string) string {
+	return filepath.Join(a.spiderXVideosRootDir(), driveID)
 }
 
 func (a *App) defaultSpiderXVideosScriptPath() string {
@@ -1376,10 +1332,9 @@ func (a *App) defaultSpiderXVideosScriptPath() string {
 func (a *App) attachScriptCrawler(d *catalog.Drive, drv *scriptcrawler.Driver) {
 	pythonPath := strings.TrimSpace(d.Credentials["python_path"])
 	if pythonPath == "" {
-		pythonPath = defaultCrawlerPythonPath()
+		pythonPath = "python3"
 	}
 	scriptPath := strings.TrimSpace(d.Credentials["script_path"])
-	sourceKind := scriptCrawlerSourceKindForDrive(d)
 	proxyURL := strings.TrimSpace(d.Credentials["proxy"])
 	configJSON := strings.TrimSpace(d.Credentials["config_json"])
 	workDir := ""
@@ -1392,7 +1347,6 @@ func (a *App) attachScriptCrawler(d *catalog.Drive, drv *scriptcrawler.Driver) {
 		Driver:         drv,
 		Catalog:        a.cat,
 		CrawlerName:    d.Name,
-		SourceKind:     sourceKind,
 		PythonPath:     pythonPath,
 		FFmpegPath:     a.cfg.Preview.FFmpegPath,
 		FFprobePath:    a.cfg.Preview.FFprobePath,
@@ -1419,33 +1373,23 @@ func (a *App) attachScriptCrawler(d *catalog.Drive, drv *scriptcrawler.Driver) {
 	a.scriptCrawlers[driveID] = c
 	a.mu.Unlock()
 
-	a.ensureScriptCrawlerNameTag(driveID, sourceKind, d.Name)
-	if sourceKind == spider91.Kind {
-		a.ensureSpider91SourceTag(driveID)
-	}
+	a.ensureScriptCrawlerNameTag(driveID, d.Name)
 }
 
-func scriptCrawlerSourceKindForDrive(d *catalog.Drive) string {
-	if d == nil {
-		return scriptcrawler.Kind
+func (a *App) ensureScriptCrawlerNameTag(driveID, crawlerName string) {
+	tagName := strings.TrimSpace(crawlerName)
+	if tagName == "" {
+		tagName = strings.TrimSpace(driveID)
 	}
-	if d.Kind == scriptcrawler.Kind && strings.EqualFold(strings.TrimSpace(d.Credentials["builtin"]), spider91.Kind) {
-		return spider91.Kind
+	if tagName == "" {
+		return
 	}
-	return scriptcrawler.Kind
-}
-
-func isSpider91SourceDrive(d *catalog.Drive) bool {
-	return d != nil && (strings.EqualFold(d.Kind, spider91.Kind) || scriptCrawlerSourceKindForDrive(d) == spider91.Kind)
-}
-
-func (a *App) ensureSpider91SourceTag(driveID string) {
 	bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	go func() {
 		defer cancel()
-		prefix := "spider91-" + driveID + "-"
-		if _, err := a.cat.EnsureTagForVideoIDPrefix(bgCtx, prefix, spider91.DefaultTag, nil, "system"); err != nil {
-			log.Printf("[spider91] ensure %q tag: %v", spider91.DefaultTag, err)
+		prefix := scriptcrawler.BuildVideoID(driveID, "")
+		if _, err := a.cat.EnsureTagForVideoIDPrefix(bgCtx, prefix, tagName, nil, "legacy"); err != nil {
+			log.Printf("[scriptcrawler] drive=%s ensure crawler tag %q: %v", driveID, tagName, err)
 		}
 	}()
 }
@@ -1514,24 +1458,6 @@ func (a *App) attachSpiderXVideosCrawler(d *catalog.Drive, drv *spiderxvideos.Dr
 		defer cancel()
 		if _, err := a.cat.CreateTagAndClassify(bgCtx, spiderxvideos.DefaultTag, nil, "system"); err != nil {
 			log.Printf("[spiderxvideos] ensure %q tag: %v", spiderxvideos.DefaultTag, err)
-		}
-	}()
-}
-
-func (a *App) ensureScriptCrawlerNameTag(driveID, sourceKind, crawlerName string) {
-	tagName := strings.TrimSpace(crawlerName)
-	if tagName == "" {
-		tagName = strings.TrimSpace(driveID)
-	}
-	if tagName == "" {
-		return
-	}
-	bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	go func() {
-		defer cancel()
-		prefix := scriptcrawler.BuildVideoIDForKind(sourceKind, driveID, "")
-		if _, err := a.cat.EnsureTagForVideoIDPrefix(bgCtx, prefix, tagName, nil, "legacy"); err != nil {
-			log.Printf("[scriptcrawler] drive=%s ensure crawler tag %q: %v", driveID, tagName, err)
 		}
 	}()
 }
@@ -2126,8 +2052,8 @@ func (a *App) detachDrive(id string) {
 	delete(a.workers, id)
 	delete(a.thumbWorkers, id)
 	delete(a.fingerprintWorkers, id)
-	delete(a.spiderXVideosCrawlers, id)
 	delete(a.scriptCrawlers, id)
+	delete(a.spiderXVideosCrawlers, id)
 	a.mu.Unlock()
 }
 
@@ -2282,10 +2208,10 @@ func (a *App) runScanWithTaskContext(ctx context.Context, driveID string) {
 	// 名下、且其 parent_id 处在本次扫描走过的目录内（或本次是从根扫的）、却
 	// 不在 SeenFileIDs 中的视频 → 视为已被删除。
 	//
-	// spider91 / localupload 走自己的生命周期管理，不应该参与扫描清理；
+	// scriptcrawler / localupload 走自己的生命周期管理，不应该参与扫描清理；
 	// stats.Errors > 0 时（云盘 API 中途抖动）保守起见跳过这一轮，避免把
 	// "暂时列不出来"误认成"被用户删了"。
-	if !isCrawlerDriveKind(drv.Kind()) && drv.ID() != localupload.DriveID {
+	if drv.Kind() != scriptcrawler.Kind && drv.ID() != localupload.DriveID {
 		if stats.Errors > 0 {
 			log.Printf("[cleanup] skip stale cleanup for drive=%s kind=%s: scan had %d directory errors", driveID, drv.Kind(), stats.Errors)
 		} else {
@@ -2404,19 +2330,6 @@ func (a *App) removeVideoSourceFile(ctx context.Context, v *catalog.Video) (bool
 	if a == nil {
 		return false, fmt.Errorf("remove video source %s: app unavailable: %w", v.ID, drives.ErrNotSupported)
 	}
-	if strings.HasPrefix(v.ID, "spider91-") {
-		deleted, err := a.removeSpider91SourceFile(ctx, v)
-		if err != nil || deleted {
-			return deleted, err
-		}
-		if a.cat != nil {
-			if drive, driveErr := a.cat.GetDrive(ctx, v.DriveID); driveErr == nil && drive.Kind == spider91.Kind {
-				return false, nil
-			}
-		} else if strings.HasPrefix(v.ID, "spider91-"+v.DriveID+"-") {
-			return false, nil
-		}
-	}
 	fileID := strings.TrimSpace(v.FileID)
 	if fileID == "" {
 		return false, fmt.Errorf("remove video source %s: empty file id", v.ID)
@@ -2457,122 +2370,6 @@ func (a *App) removeVideoSourceFile(ctx context.Context, v *catalog.Video) (bool
 	return true, nil
 }
 
-func (a *App) removeSpider91SourceFile(ctx context.Context, v *catalog.Video) (bool, error) {
-	if a == nil || a.cfg == nil || v == nil || !strings.HasPrefix(v.ID, "spider91-") {
-		return false, nil
-	}
-	driveID, sourceID := a.spider91OriginFromVideo(ctx, v)
-	if driveID == "" || sourceID == "" {
-		return false, nil
-	}
-	src := spider91.New(spider91.Config{
-		ID:      driveID,
-		RootDir: a.spider91DriveDir(driveID),
-	})
-	deleted := false
-	for _, fileID := range spider91SourceFileCandidates(v, driveID, sourceID) {
-		videoPath, err := src.VideoPath(fileID)
-		if err != nil {
-			continue
-		}
-		info, err := os.Stat(videoPath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return deleted, fmt.Errorf("stat spider91 source %s: %w", videoPath, err)
-		}
-		if info.IsDir() {
-			continue
-		}
-		if err := os.Remove(videoPath); err != nil && !os.IsNotExist(err) {
-			return deleted, fmt.Errorf("remove spider91 source %s: %w", videoPath, err)
-		}
-		deleted = true
-		removeSpider91ThumbCandidates(src, strings.TrimSuffix(fileID, filepath.Ext(fileID)))
-	}
-	if !deleted {
-		removeSpider91ThumbCandidates(src, sourceID)
-	}
-	return deleted, nil
-}
-
-func (a *App) spider91OriginFromVideo(ctx context.Context, v *catalog.Video) (string, string) {
-	if a == nil || v == nil {
-		return "", ""
-	}
-	if d, err := a.cat.GetDrive(ctx, v.DriveID); err == nil && d != nil && isSpider91SourceDrive(d) {
-		prefix := "spider91-" + d.ID + "-"
-		if strings.HasPrefix(v.ID, prefix) {
-			return d.ID, strings.TrimPrefix(v.ID, prefix)
-		}
-	}
-	drives, err := a.cat.ListDrives(ctx)
-	if err != nil {
-		return "", ""
-	}
-	bestDriveID := ""
-	bestSourceID := ""
-	for _, d := range drives {
-		if d == nil || !isSpider91SourceDrive(d) {
-			continue
-		}
-		prefix := "spider91-" + d.ID + "-"
-		if !strings.HasPrefix(v.ID, prefix) {
-			continue
-		}
-		if len(d.ID) > len(bestDriveID) {
-			bestDriveID = d.ID
-			bestSourceID = strings.TrimPrefix(v.ID, prefix)
-		}
-	}
-	return bestDriveID, bestSourceID
-}
-
-func spider91SourceFileCandidates(v *catalog.Video, originDriveID, sourceID string) []string {
-	candidates := []string{}
-	if v != nil && v.DriveID == originDriveID && strings.TrimSpace(v.FileID) != "" {
-		candidates = append(candidates, strings.TrimSpace(v.FileID))
-	}
-	if ext := strings.Trim(strings.TrimSpace(v.Ext), "."); ext != "" {
-		candidates = append(candidates, sourceID+"."+ext)
-	}
-	for _, ext := range []string{".mp4", ".mkv", ".mov", ".webm", ".avi"} {
-		candidates = append(candidates, sourceID+ext)
-	}
-	seen := make(map[string]struct{}, len(candidates))
-	out := make([]string, 0, len(candidates))
-	for _, candidate := range candidates {
-		candidate = strings.TrimSpace(candidate)
-		if candidate == "" {
-			continue
-		}
-		if _, ok := seen[candidate]; ok {
-			continue
-		}
-		seen[candidate] = struct{}{}
-		out = append(out, candidate)
-	}
-	return out
-}
-
-func removeSpider91ThumbCandidates(src *spider91.Driver, stem string) {
-	if src == nil {
-		return
-	}
-	stem = strings.TrimSpace(stem)
-	if stem == "" {
-		return
-	}
-	for _, ext := range []string{".jpg", ".jpeg", ".png", ".webp"} {
-		thumbPath, err := src.ThumbPath(stem + ext)
-		if err != nil {
-			continue
-		}
-		_ = os.Remove(thumbPath)
-	}
-}
-
 func (a *App) cleanupDriveVideosForDelete(ctx context.Context, driveID string) (int, error) {
 	if a == nil || a.cat == nil {
 		return 0, nil
@@ -2601,12 +2398,6 @@ func (a *App) cleanupDriveVideosForDelete(ctx context.Context, driveID string) (
 		}
 		if err := removeLocalVideoAssets(localDir, v); err != nil {
 			return 0, fmt.Errorf("remove local assets for %s: %w", v.ID, err)
-		}
-	}
-
-	if isSpider91SourceDrive(d) {
-		if err := a.removeSpider91DriveDir(driveID); err != nil {
-			return 0, err
 		}
 	}
 
@@ -2642,21 +2433,12 @@ func (a *App) cleanupOrphanDriveVideos(ctx context.Context) (int, error) {
 	if a.cfg != nil {
 		localDir = a.cfg.Storage.LocalPreviewDir
 	}
-	spider91Dirs := map[string]struct{}{}
 	for _, v := range items {
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
 		if err := removeLocalVideoAssets(localDir, v); err != nil {
 			return 0, fmt.Errorf("remove local assets for orphan %s: %w", v.ID, err)
-		}
-		if strings.HasPrefix(v.ID, "spider91-"+v.DriveID+"-") {
-			spider91Dirs[v.DriveID] = struct{}{}
-		}
-	}
-	for driveID := range spider91Dirs {
-		if err := a.removeSpider91DriveDir(driveID); err != nil {
-			return 0, err
 		}
 	}
 
@@ -2689,42 +2471,11 @@ func (a *App) videosForDriveDelete(ctx context.Context, d *catalog.Drive) ([]*ca
 		byID[v.ID] = v
 	}
 
-	if isSpider91SourceDrive(d) {
-		prefix := "spider91-" + d.ID + "-"
-		originItems, err := a.cat.ListVideosByIDPrefix(ctx, prefix)
-		if err != nil {
-			return nil, err
-		}
-		for _, v := range originItems {
-			byID[v.ID] = v
-		}
-	}
-
 	out := make([]*catalog.Video, 0, len(byID))
 	for _, v := range byID {
 		out = append(out, v)
 	}
 	return out, nil
-}
-
-func (a *App) removeSpider91DriveDir(driveID string) error {
-	if strings.TrimSpace(driveID) == "" {
-		return errors.New("remove spider91 drive dir: empty drive id")
-	}
-	root := a.spider91RootDir()
-	dir := a.spider91DriveDir(driveID)
-	clean, ok := localPathWithin(root, dir)
-	if !ok {
-		return fmt.Errorf("remove spider91 drive dir: unsafe path %s", dir)
-	}
-	rootClean, ok := localPathWithin(root, root)
-	if !ok || clean == rootClean {
-		return fmt.Errorf("remove spider91 drive dir: refusing to remove root %s", root)
-	}
-	if err := os.RemoveAll(clean); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove spider91 drive dir %s: %w", clean, err)
-	}
-	return nil
 }
 
 func removeLocalVideoAssets(localDir string, v *catalog.Video) error {
@@ -2763,13 +2514,35 @@ func removeLocalVideoAssets(localDir string, v *catalog.Video) error {
 	return nil
 }
 
-type duplicateAssetCleanupStats struct {
-	Candidates       int
-	VideosUpdated    int
-	PreviewFiles     int
-	ThumbnailFiles   int
-	MissingFiles     int
-	SkippedUnsafeRef int
+type duplicateVideoMaintenanceStats struct {
+	VideosScanned       int
+	ExactGroups         int
+	ExactDeleted        int
+	NearCandidates      int
+	NearSSIMComparisons int
+	NearGroups          int
+	NearDeleted         int
+}
+
+type nearDuplicateMaintenanceStats struct {
+	Candidates      int
+	SSIMComparisons int
+	Groups          int
+	Deleted         int
+}
+
+type videoMaintenanceCandidate struct {
+	video         *catalog.Video
+	thumbnailPath string
+	assetScore    int
+	titleKeys     []string
+	titleQGrams   map[string]struct{}
+	titleBuckets  []string
+}
+
+type fingerprintDuplicateKey struct {
+	size    int64
+	sampled string
 }
 
 func (a *App) cleanupDuplicateVideoAssets(ctx context.Context) error {
@@ -2778,59 +2551,593 @@ func (a *App) cleanupDuplicateVideoAssets(ctx context.Context) error {
 	}
 	localDir := ""
 	if a.cfg != nil {
-		localDir = a.cfg.Storage.LocalPreviewDir
+		localDir = strings.TrimSpace(a.cfg.Storage.LocalPreviewDir)
 	}
-	if strings.TrimSpace(localDir) == "" {
-		return nil
-	}
-	items, err := a.cat.ListDuplicateAssetCleanupCandidates(ctx, 0)
+	videos, err := a.cat.ListVideoMaintenanceCandidates(ctx)
 	if err != nil {
 		return err
 	}
-	if len(items) == 0 {
-		log.Printf("[dedupe-cleanup] no duplicate local assets to clean")
+	stats := duplicateVideoMaintenanceStats{VideosScanned: len(videos)}
+	if len(videos) == 0 {
+		log.Printf("[dedupe-maintenance] no videos to maintain")
 		return nil
 	}
 
-	stats := duplicateAssetCleanupStats{Candidates: len(items)}
-	for _, item := range items {
+	deleted := make(map[string]struct{})
+	exactGroups, exactDeleted, err := a.cleanupExactDuplicateVideos(ctx, localDir, videos, deleted)
+	if err != nil {
+		return err
+	}
+	stats.ExactGroups = exactGroups
+	stats.ExactDeleted = exactDeleted
+
+	remaining := make([]*catalog.Video, 0, len(videos)-len(deleted))
+	for _, v := range videos {
+		if v == nil {
+			continue
+		}
+		if _, ok := deleted[v.ID]; ok {
+			continue
+		}
+		remaining = append(remaining, v)
+	}
+	nearStats, err := a.cleanupNearDuplicateVideos(ctx, localDir, remaining, deleted)
+	if err != nil {
+		return err
+	}
+	stats.NearCandidates = nearStats.Candidates
+	stats.NearSSIMComparisons = nearStats.SSIMComparisons
+	stats.NearGroups = nearStats.Groups
+	stats.NearDeleted = nearStats.Deleted
+
+	log.Printf("[dedupe-maintenance] videos=%d exact_groups=%d exact_deleted=%d near_candidates=%d near_ssim_comparisons=%d near_groups=%d near_deleted=%d",
+		stats.VideosScanned, stats.ExactGroups, stats.ExactDeleted, stats.NearCandidates, stats.NearSSIMComparisons, stats.NearGroups, stats.NearDeleted)
+	return nil
+}
+
+func (a *App) cleanupExactDuplicateVideos(ctx context.Context, localDir string, videos []*catalog.Video, deleted map[string]struct{}) (int, int, error) {
+	groups := make(map[fingerprintDuplicateKey][]*catalog.Video)
+	for _, v := range videos {
+		if v == nil {
+			continue
+		}
+		if _, ok := deleted[v.ID]; ok {
+			continue
+		}
+		sampled := strings.ToLower(strings.TrimSpace(v.SampledSHA256))
+		if v.Size <= 0 || sampled == "" {
+			continue
+		}
+		key := fingerprintDuplicateKey{size: v.Size, sampled: sampled}
+		groups[key] = append(groups[key], v)
+	}
+
+	keys := make([]fingerprintDuplicateKey, 0, len(groups))
+	for key := range groups {
+		if len(groups[key]) > 1 {
+			keys = append(keys, key)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].size != keys[j].size {
+			return keys[i].size < keys[j].size
+		}
+		return keys[i].sampled < keys[j].sampled
+	})
+
+	groupCount := 0
+	deletedCount := 0
+	for _, key := range keys {
+		group := groups[key]
+		canonical := selectExactDuplicateCanonical(localDir, group)
+		if canonical == nil {
+			continue
+		}
+		groupCount++
+		for _, v := range group {
+			if v == nil || v.ID == canonical.ID {
+				continue
+			}
+			if _, ok := deleted[v.ID]; ok {
+				continue
+			}
+			if err := a.deleteDuplicateVideoWithAssets(ctx, localDir, v, canonical.ID); err != nil {
+				return groupCount, deletedCount, fmt.Errorf("exact duplicate size=%d sampled=%s: %w", key.size, shortHashForLog(key.sampled), err)
+			}
+			deleted[v.ID] = struct{}{}
+			deletedCount++
+			log.Printf("[dedupe-maintenance] exact duplicate deleted id=%s canonical=%s size=%d sampled=%s", v.ID, canonical.ID, key.size, shortHashForLog(key.sampled))
+		}
+	}
+	return groupCount, deletedCount, nil
+}
+
+func (a *App) cleanupNearDuplicateVideos(ctx context.Context, localDir string, videos []*catalog.Video, deleted map[string]struct{}) (nearDuplicateMaintenanceStats, error) {
+	candidates := collectNearDuplicateMaintenanceCandidates(localDir, videos, deleted)
+	stats := nearDuplicateMaintenanceStats{Candidates: len(candidates)}
+	if len(candidates) < 2 {
+		return stats, nil
+	}
+
+	sets := newVideoMaintenanceDisjointSet(len(candidates))
+	bucketIndex := make(map[int]map[string][]int)
+	seenPairs := make(map[uint64]struct{})
+	for i, right := range candidates {
+		if right.video == nil {
+			continue
+		}
+		for duration := right.video.DurationSeconds - videoMaintenanceDurationToleranceSeconds; duration <= right.video.DurationSeconds+videoMaintenanceDurationToleranceSeconds; duration++ {
+			byBucket := bucketIndex[duration]
+			if len(byBucket) == 0 {
+				continue
+			}
+			for _, bucket := range right.titleBuckets {
+				for _, j := range byBucket[bucket] {
+					if j == i {
+						continue
+					}
+					pairKey := videoMaintenancePairKey(i, j)
+					if _, ok := seenPairs[pairKey]; ok {
+						continue
+					}
+					seenPairs[pairKey] = struct{}{}
+					left := candidates[j]
+					if left.video == nil {
+						continue
+					}
+					if !nearDuplicateTitlePrefilter(left, right) {
+						continue
+					}
+					titleScore := mediasim.TitleSimilarity(left.video.Title, right.video.Title)
+					if titleScore < videoMaintenanceTitleThreshold {
+						continue
+					}
+					stats.SSIMComparisons++
+					ssimScore, err := mediasim.ImageSSIM(left.thumbnailPath, right.thumbnailPath)
+					if err != nil {
+						log.Printf("[dedupe-maintenance] thumbnail ssim failed left=%s right=%s: %v", left.video.ID, right.video.ID, err)
+						continue
+					}
+					if ssimScore >= videoMaintenanceSSIMThreshold {
+						sets.union(i, j)
+					}
+				}
+			}
+		}
+		if len(right.titleBuckets) == 0 {
+			continue
+		}
+		byBucket := bucketIndex[right.video.DurationSeconds]
+		if byBucket == nil {
+			byBucket = make(map[string][]int)
+			bucketIndex[right.video.DurationSeconds] = byBucket
+		}
+		for _, bucket := range right.titleBuckets {
+			byBucket[bucket] = append(byBucket[bucket], i)
+		}
+	}
+
+	groups := make(map[int][]videoMaintenanceCandidate)
+	for i, candidate := range candidates {
+		root := sets.find(i)
+		groups[root] = append(groups[root], candidate)
+	}
+	roots := make([]int, 0, len(groups))
+	for root, group := range groups {
+		if len(group) > 1 {
+			roots = append(roots, root)
+		}
+	}
+	sort.Ints(roots)
+
+	for _, root := range roots {
+		group := groups[root]
+		canonical := selectNearDuplicateCanonical(group)
+		if canonical.video == nil {
+			continue
+		}
+		stats.Groups++
+		for _, candidate := range group {
+			v := candidate.video
+			if v == nil || v.ID == canonical.video.ID {
+				continue
+			}
+			if _, ok := deleted[v.ID]; ok {
+				continue
+			}
+			if err := a.deleteDuplicateVideoWithAssets(ctx, localDir, v, canonical.video.ID); err != nil {
+				return stats, fmt.Errorf("near duplicate canonical=%s duplicate=%s: %w", canonical.video.ID, v.ID, err)
+			}
+			deleted[v.ID] = struct{}{}
+			stats.Deleted++
+			log.Printf("[dedupe-maintenance] near duplicate deleted id=%s canonical=%s size=%d canonical_size=%d duration=%d title=%q",
+				v.ID, canonical.video.ID, v.Size, canonical.video.Size, v.DurationSeconds, v.Title)
+		}
+	}
+	return stats, nil
+}
+
+func collectNearDuplicateMaintenanceCandidates(localDir string, videos []*catalog.Video, deleted map[string]struct{}) []videoMaintenanceCandidate {
+	localDir = strings.TrimSpace(localDir)
+	if localDir == "" {
+		return nil
+	}
+	out := make([]videoMaintenanceCandidate, 0, len(videos))
+	for _, v := range videos {
+		if v == nil || strings.TrimSpace(v.ID) == "" {
+			continue
+		}
+		if _, ok := deleted[v.ID]; ok {
+			continue
+		}
+		if strings.TrimSpace(v.Title) == "" || v.DurationSeconds <= 0 {
+			continue
+		}
+		titleKeys := mediasim.TitleKeys(v.Title)
+		if len(titleKeys) == 0 {
+			continue
+		}
+		titleBuckets := titlePrefixBuckets(titleKeys, 12)
+		if len(titleBuckets) == 0 {
+			continue
+		}
+		thumbPath, ok := localGeneratedThumbnailPath(localDir, v)
+		if !ok {
+			continue
+		}
+		out = append(out, videoMaintenanceCandidate{
+			video:         v,
+			thumbnailPath: thumbPath,
+			assetScore:    videoAssetCompletenessScore(localDir, v),
+			titleKeys:     titleKeys,
+			titleQGrams:   titleQGrams(titleKeys, 4),
+			titleBuckets:  titleBuckets,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		left := out[i].video
+		right := out[j].video
+		if left.DurationSeconds != right.DurationSeconds {
+			return left.DurationSeconds < right.DurationSeconds
+		}
+		return earlierVideo(left, right)
+	})
+	return out
+}
+
+func nearDuplicateTitlePrefilter(left, right videoMaintenanceCandidate) bool {
+	if !titleLengthCouldReachThreshold(left.titleKeys, right.titleKeys, videoMaintenanceTitleThreshold) {
+		return false
+	}
+	return qGramContainment(left.titleQGrams, right.titleQGrams) >= 0.45
+}
+
+func videoMaintenancePairKey(left, right int) uint64 {
+	if left > right {
+		left, right = right, left
+	}
+	return uint64(uint32(left))<<32 | uint64(uint32(right))
+}
+
+func titlePrefixBuckets(keys []string, prefixRunes int) []string {
+	if prefixRunes <= 0 {
+		prefixRunes = 12
+	}
+	seen := make(map[string]struct{})
+	var out []string
+	var fallback []string
+	for _, key := range keys {
+		runes := []rune(key)
+		if len(runes) == 0 {
+			continue
+		}
+		if len(runes) > prefixRunes {
+			runes = runes[:prefixRunes]
+		}
+		bucket := string(runes)
+		if _, ok := seen[bucket]; ok {
+			continue
+		}
+		seen[bucket] = struct{}{}
+		if lowInformationTitleBucket(bucket) {
+			fallback = append(fallback, bucket)
+			continue
+		}
+		out = append(out, bucket)
+	}
+	if len(out) > 0 {
+		return out
+	}
+	return fallback
+}
+
+func lowInformationTitleBucket(bucket string) bool {
+	if strings.HasPrefix(bucket, "www") {
+		return true
+	}
+	if strings.Contains(bucket, "com") {
+		limit := len(bucket)
+		if limit > 8 {
+			limit = 8
+		}
+		for _, r := range bucket[:limit] {
+			if r >= '0' && r <= '9' {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func titleLengthCouldReachThreshold(leftKeys, rightKeys []string, threshold float64) bool {
+	for _, left := range leftKeys {
+		leftLen := len([]rune(left))
+		if leftLen == 0 {
+			continue
+		}
+		for _, right := range rightKeys {
+			rightLen := len([]rune(right))
+			if rightLen == 0 {
+				continue
+			}
+			maxLen := leftLen
+			minLen := rightLen
+			if rightLen > maxLen {
+				maxLen = rightLen
+				minLen = leftLen
+			}
+			if float64(minLen)/float64(maxLen) >= threshold {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func titleQGrams(keys []string, n int) map[string]struct{} {
+	out := make(map[string]struct{})
+	if n <= 0 {
+		n = 4
+	}
+	for _, key := range keys {
+		runes := []rune(key)
+		if len(runes) == 0 {
+			continue
+		}
+		if len(runes) <= n {
+			out[string(runes)] = struct{}{}
+			continue
+		}
+		for i := 0; i+n <= len(runes); i++ {
+			out[string(runes[i:i+n])] = struct{}{}
+		}
+	}
+	return out
+}
+
+func qGramContainment(left, right map[string]struct{}) float64 {
+	if len(left) == 0 || len(right) == 0 {
+		return 0
+	}
+	smaller := left
+	larger := right
+	if len(right) < len(left) {
+		smaller = right
+		larger = left
+	}
+	common := 0
+	for gram := range smaller {
+		if _, ok := larger[gram]; ok {
+			common++
+		}
+	}
+	return float64(common) / float64(len(smaller))
+}
+
+func selectExactDuplicateCanonical(localDir string, group []*catalog.Video) *catalog.Video {
+	var best *catalog.Video
+	for _, v := range group {
+		if v == nil {
+			continue
+		}
+		if best == nil || betterExactDuplicateCanonical(localDir, v, best) {
+			best = v
+		}
+	}
+	return best
+}
+
+func betterExactDuplicateCanonical(localDir string, left, right *catalog.Video) bool {
+	leftScore := videoAssetCompletenessScore(localDir, left)
+	rightScore := videoAssetCompletenessScore(localDir, right)
+	if leftScore != rightScore {
+		return leftScore > rightScore
+	}
+	return earlierVideo(left, right)
+}
+
+func selectNearDuplicateCanonical(group []videoMaintenanceCandidate) videoMaintenanceCandidate {
+	var best videoMaintenanceCandidate
+	for _, candidate := range group {
+		if candidate.video == nil {
+			continue
+		}
+		if best.video == nil || betterNearDuplicateCanonical(candidate, best) {
+			best = candidate
+		}
+	}
+	return best
+}
+
+func betterNearDuplicateCanonical(left, right videoMaintenanceCandidate) bool {
+	if right.video == nil {
+		return true
+	}
+	if left.video == nil {
+		return false
+	}
+	if left.video.Size != right.video.Size {
+		return left.video.Size > right.video.Size
+	}
+	if left.assetScore != right.assetScore {
+		return left.assetScore > right.assetScore
+	}
+	return earlierVideo(left.video, right.video)
+}
+
+func earlierVideo(left, right *catalog.Video) bool {
+	if right == nil {
+		return true
+	}
+	if left == nil {
+		return false
+	}
+	if !left.CreatedAt.Equal(right.CreatedAt) {
+		return left.CreatedAt.Before(right.CreatedAt)
+	}
+	return left.ID < right.ID
+}
+
+func videoAssetCompletenessScore(localDir string, v *catalog.Video) int {
+	if v == nil {
+		return 0
+	}
+	score := 0
+	if localGeneratedPreviewReady(localDir, v) {
+		score++
+	}
+	if _, ok := localGeneratedThumbnailPath(localDir, v); ok {
+		score++
+	}
+	if strings.TrimSpace(v.SampledSHA256) != "" && strings.TrimSpace(v.FingerprintStatus) == "ready" {
+		score++
+	}
+	return score
+}
+
+func localGeneratedPreviewReady(localDir string, v *catalog.Video) bool {
+	if v == nil || strings.TrimSpace(v.PreviewStatus) != "ready" || strings.TrimSpace(v.PreviewLocal) == "" {
+		return false
+	}
+	localDir = strings.TrimSpace(localDir)
+	if localDir == "" {
+		return true
+	}
+	clean, ok := localPathWithin(localDir, v.PreviewLocal)
+	if !ok {
+		return false
+	}
+	return regularFileExists(clean)
+}
+
+func localGeneratedThumbnailPath(localDir string, v *catalog.Video) (string, bool) {
+	if v == nil || strings.TrimSpace(localDir) == "" || strings.TrimSpace(v.ID) == "" {
+		return "", false
+	}
+	if strings.TrimSpace(v.ThumbnailURL) != "/p/thumb/"+v.ID {
+		return "", false
+	}
+	for _, candidate := range mediaasset.ThumbnailPathCandidates(localDir, v.ID) {
+		clean, ok := localPathWithin(localDir, candidate)
+		if !ok {
+			continue
+		}
+		if regularFileExists(clean) {
+			return clean, true
+		}
+	}
+	return "", false
+}
+
+func regularFileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
+}
+
+func (a *App) deleteDuplicateVideoWithAssets(ctx context.Context, localDir string, v *catalog.Video, canonicalID string) error {
+	if v == nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := removeLocalVideoAssets(localDir, v); err != nil {
+		return fmt.Errorf("remove local assets for %s: %w", v.ID, err)
+	}
+	var lastErr error
+	for attempt := 0; attempt < 12; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		clearPreview, removedPreview, missingPreview, skippedPreview, err := cleanupDuplicatePreviewAsset(localDir, item.PreviewLocal)
-		if err != nil {
-			return fmt.Errorf("cleanup duplicate preview video=%s canonical=%s: %w", item.VideoID, item.CanonicalID, err)
-		}
-		clearThumb, removedThumb, missingThumb, err := cleanupDuplicateThumbnailAsset(localDir, item.VideoID, item.ThumbnailURL)
-		if err != nil {
-			return fmt.Errorf("cleanup duplicate thumbnail video=%s canonical=%s: %w", item.VideoID, item.CanonicalID, err)
-		}
-		if skippedPreview {
-			stats.SkippedUnsafeRef++
-		}
-		if removedPreview {
-			stats.PreviewFiles++
-		}
-		if removedThumb {
-			stats.ThumbnailFiles++
-		}
-		if missingPreview {
-			stats.MissingFiles++
-		}
-		if missingThumb {
-			stats.MissingFiles++
-		}
-		if !clearPreview && !clearThumb {
+		if err := a.cat.DeleteVideoWithTombstoneReason(ctx, v.ID, catalog.DeletedVideoReasonDuplicate); err != nil {
+			if !isSQLiteBusyError(err) {
+				return fmt.Errorf("delete catalog video %s canonical=%s: %w", v.ID, canonicalID, err)
+			}
+			lastErr = err
+			time.Sleep(time.Duration(attempt+1) * 250 * time.Millisecond)
 			continue
 		}
-		if err := a.cat.ClearGeneratedAssets(ctx, item.VideoID, clearPreview, clearThumb); err != nil {
-			return fmt.Errorf("mark duplicate assets cleaned video=%s canonical=%s: %w", item.VideoID, item.CanonicalID, err)
-		}
-		stats.VideosUpdated++
+		return nil
 	}
-	log.Printf("[dedupe-cleanup] candidates=%d updated=%d preview_files=%d thumbnail_files=%d missing=%d skipped_unsafe_refs=%d",
-		stats.Candidates, stats.VideosUpdated, stats.PreviewFiles, stats.ThumbnailFiles, stats.MissingFiles, stats.SkippedUnsafeRef)
-	return nil
+	return fmt.Errorf("delete catalog video %s canonical=%s after retries: %w", v.ID, canonicalID, lastErr)
+}
+
+func isSQLiteBusyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "sqlite_busy") ||
+		strings.Contains(msg, "sqlite_locked") ||
+		strings.Contains(msg, "database is locked") ||
+		strings.Contains(msg, "database table is locked")
+}
+
+func shortHashForLog(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= 12 {
+		return value
+	}
+	return value[:12]
+}
+
+type videoMaintenanceDisjointSet struct {
+	parent []int
+	rank   []int
+}
+
+func newVideoMaintenanceDisjointSet(n int) *videoMaintenanceDisjointSet {
+	parent := make([]int, n)
+	rank := make([]int, n)
+	for i := range parent {
+		parent[i] = i
+	}
+	return &videoMaintenanceDisjointSet{parent: parent, rank: rank}
+}
+
+func (s *videoMaintenanceDisjointSet) find(x int) int {
+	if s.parent[x] != x {
+		s.parent[x] = s.find(s.parent[x])
+	}
+	return s.parent[x]
+}
+
+func (s *videoMaintenanceDisjointSet) union(a, b int) {
+	rootA := s.find(a)
+	rootB := s.find(b)
+	if rootA == rootB {
+		return
+	}
+	if s.rank[rootA] < s.rank[rootB] {
+		s.parent[rootA] = rootB
+		return
+	}
+	if s.rank[rootA] > s.rank[rootB] {
+		s.parent[rootB] = rootA
+		return
+	}
+	s.parent[rootB] = rootA
+	s.rank[rootA]++
 }
 
 func cleanupDuplicatePreviewAsset(localDir, previewLocal string) (clear bool, removed bool, missing bool, skippedUnsafe bool, err error) {
@@ -3155,7 +3462,7 @@ func (a *App) listScanTargetIDs(ctx context.Context) []string {
 	}
 	out := make([]string, 0, len(all))
 	for _, d := range all {
-		if d == nil || d.ID == localupload.DriveID || isCrawlerDriveKind(d.Kind) {
+		if d == nil || d.ID == localupload.DriveID || d.Kind == scriptcrawler.Kind {
 			continue
 		}
 		out = append(out, d.ID)
@@ -3163,31 +3470,16 @@ func (a *App) listScanTargetIDs(ctx context.Context) []string {
 	return out
 }
 
-// listSpider91DriveIDs 返回 nightly Phase 2 应触发爬取的爬虫 drive ID 列表。
-func (a *App) listSpider91DriveIDs(ctx context.Context) []string {
+// listCrawlerDriveIDs 返回 nightly Phase 2 应触发爬取的爬虫 drive ID 列表。
+func (a *App) listCrawlerDriveIDs(ctx context.Context) []string {
 	all, err := a.cat.ListDrives(ctx)
 	if err != nil {
-		log.Printf("[nightly] list spider91 drives: %v", err)
+		log.Printf("[nightly] list crawler drives: %v", err)
 		return nil
 	}
 	out := make([]string, 0, len(all))
 	for _, d := range all {
 		if d != nil && d.Kind == scriptcrawler.Kind && strings.TrimSpace(d.Credentials["script_path"]) != "" {
-			out = append(out, d.ID)
-		}
-	}
-	return out
-}
-
-func (a *App) listSpiderXVideosDriveIDs(ctx context.Context) []string {
-	all, err := a.cat.ListDrives(ctx)
-	if err != nil {
-		log.Printf("[nightly] list spiderxvideos drives: %v", err)
-		return nil
-	}
-	out := make([]string, 0, len(all))
-	for _, d := range all {
-		if d != nil && d.Kind == spiderxvideos.Kind {
 			out = append(out, d.ID)
 		}
 	}
@@ -3290,40 +3582,13 @@ func shouldScanDrive(d drives.Drive) bool {
 		return false
 	}
 	// 爬虫类 drive 由专用 crawl 阶段触发，不参与普通 scan
-	if isCrawlerDriveKind(d.Kind()) {
+	if d.Kind() == scriptcrawler.Kind || d.Kind() == spiderxvideos.Kind {
 		return false
 	}
 	return true
 }
 
-func isCrawlerDriveKind(kind string) bool {
-	return kind == spider91.Kind || kind == scriptcrawler.Kind || kind == spiderxvideos.Kind
-}
-
-// ---------- crawler crawl ----------
-
-func (a *App) scheduleSpider91Crawl(ctx context.Context, driveID string) bool {
-	if a.driveHasActiveWork(driveID) {
-		log.Printf("[spider91] drive=%s has active work, skip duplicate crawl request", driveID)
-		return false
-	}
-	if !a.beginDriveScanOrCrawl(driveID) {
-		log.Printf("[spider91] drive=%s already queued or running, skip duplicate crawl request", driveID)
-		return false
-	}
-	taskCtx, done := a.registerDriveTaskContext(ctx, driveID)
-
-	go func() {
-		defer func() {
-			a.endDriveScanOrCrawl(driveID)
-			done()
-		}()
-		if a.runSpider91CrawlWithTaskContext(taskCtx, driveID) {
-			a.runSpider91MigrationAfterManualCrawl(taskCtx, driveID)
-		}
-	}()
-	return true
-}
+// ---------- script crawler crawl ----------
 
 func (a *App) scheduleScriptCrawlerCrawl(ctx context.Context, driveID string) bool {
 	if a.driveHasActiveWork(driveID) {
@@ -3348,15 +3613,6 @@ func (a *App) scheduleScriptCrawlerCrawl(ctx context.Context, driveID string) bo
 	return true
 }
 
-// runSpider91Crawl 运行一次完整爬取流程并把 last_crawl_at 写回 drive.credentials。
-//
-// 即使爬取失败也会更新 last_crawl_at，避免一直在错误循环里反复触发；下一次 nightly
-// 流水线重跑时仍会重试。该方法是阻塞的，被 nightly Phase 2 串行调用，以及被
-// admin "立即抓取" 单 drive 异步调用。
-func (a *App) runSpider91Crawl(ctx context.Context, driveID string) {
-	a.runScriptCrawlerCrawl(ctx, driveID)
-}
-
 func (a *App) runScriptCrawlerCrawl(ctx context.Context, driveID string) {
 	if !a.beginDriveScanOrCrawl(driveID) {
 		log.Printf("[scriptcrawler] drive=%s already queued or running, skip direct crawl", driveID)
@@ -3366,10 +3622,6 @@ func (a *App) runScriptCrawlerCrawl(ctx context.Context, driveID string) {
 	taskCtx, done := a.registerDriveTaskContext(ctx, driveID)
 	defer done()
 	a.runScriptCrawlerCrawlWithTaskContext(taskCtx, driveID)
-}
-
-func (a *App) runSpider91CrawlWithTaskContext(ctx context.Context, driveID string) bool {
-	return a.runScriptCrawlerCrawlWithTaskContext(ctx, driveID)
 }
 
 func (a *App) runScriptCrawlerCrawlWithTaskContext(ctx context.Context, driveID string) bool {
@@ -3399,13 +3651,9 @@ func (a *App) runScriptCrawlerCrawlWithTaskContext(ctx context.Context, driveID 
 		log.Printf("[scriptcrawler] drive=%s lookup failed: %v", driveID, err)
 		return false
 	}
-	defaultTargetNew := scriptcrawler.DefaultTargetNew
-	if scriptCrawlerSourceKindForDrive(d) == spider91.Kind {
-		defaultTargetNew = spider91.DefaultTargetNew
-	}
-	targetNew := spider91IntCred(d, "target_new", defaultTargetNew)
+	targetNew := crawlerIntCred(d, "target_new", scriptcrawler.DefaultTargetNew)
 	if targetNew <= 0 {
-		targetNew = defaultTargetNew
+		targetNew = scriptcrawler.DefaultTargetNew
 	}
 
 	log.Printf("[scriptcrawler] drive=%s start crawl target_new=%d", driveID, targetNew)
@@ -3454,10 +3702,6 @@ func (a *App) updateScriptCrawlerRunState(ctx context.Context, driveID string, r
 	return a.cat.UpsertDrive(ctx, d)
 }
 
-func (a *App) runSpider91MigrationAfterManualCrawl(ctx context.Context, driveID string) {
-	a.runCrawlerMigrationAfterManualCrawl(ctx, driveID)
-}
-
 func (a *App) scheduleCrawlerUploadMigration(ctx context.Context, driveID string) bool {
 	driveID = strings.TrimSpace(driveID)
 	if driveID == "" || a == nil || a.cat == nil {
@@ -3467,7 +3711,7 @@ func (a *App) scheduleCrawlerUploadMigration(ctx context.Context, driveID string
 	if err != nil || d == nil || d.Kind != scriptcrawler.Kind || strings.TrimSpace(d.Credentials["upload_drive_id"]) == "" {
 		return false
 	}
-	if a.spider91Migrator == nil {
+	if a.crawlerUploader == nil {
 		log.Printf("[scriptcrawler] drive=%s skip saved upload migration: migrator not configured", driveID)
 		return false
 	}
@@ -3533,7 +3777,7 @@ func (a *App) runCrawlerUploadMigrationAfterSave(ctx context.Context, driveID st
 		log.Printf("[scriptcrawler] drive=%s skip saved upload migration after wait: %v", driveID, err)
 		return
 	}
-	if err := a.spider91Migrator.RunOnce(ctx); err != nil {
+	if err := a.crawlerUploader.RunOnce(ctx); err != nil {
 		log.Printf("[scriptcrawler] drive=%s saved upload migration: %v", driveID, err)
 	}
 }
@@ -3543,7 +3787,7 @@ func (a *App) scheduleManualCrawlerUploadMigration(ctx context.Context, driveID 
 	if driveID == "" || a == nil || a.cat == nil {
 		return false, "爬虫不存在"
 	}
-	if a.spider91Migrator == nil {
+	if a.crawlerUploader == nil {
 		return false, "上传迁移器未初始化"
 	}
 	if a.driveHasActiveWork(driveID) {
@@ -3625,7 +3869,6 @@ func crawlerCatalogVideoIDPrefixes(d *catalog.Drive) []string {
 	}
 	return []string{
 		scriptcrawler.Kind + "-" + d.ID + "-",
-		spider91.Kind + "-" + d.ID + "-",
 	}
 }
 
@@ -3635,7 +3878,7 @@ func (a *App) runManualCrawlerUploadMigration(ctx context.Context, driveID, targ
 		return
 	}
 	log.Printf("[scriptcrawler] drive=%s running manual upload migration target=%s", driveID, targetDriveID)
-	if err := a.spider91Migrator.RunOnce(ctx); err != nil {
+	if err := a.crawlerUploader.RunOnce(ctx); err != nil {
 		log.Printf("[scriptcrawler] drive=%s manual upload migration: %v", driveID, err)
 	}
 }
@@ -3645,33 +3888,16 @@ func (a *App) runCrawlerMigrationAfterManualCrawl(ctx context.Context, driveID s
 		log.Printf("[scriptcrawler] drive=%s skip post-crawl migration: %v", driveID, err)
 		return
 	}
-	if a.cat == nil {
-		targetDriveID := a.Spider91UploadDriveID()
-		if targetDriveID == "" || a.spider91Migrator == nil {
-			return
-		}
-		if err := a.waitDriveGenerationQueuesIdle(ctx, driveID); err != nil {
-			log.Printf("[scriptcrawler] drive=%s post-crawl migration wait canceled: %v", driveID, err)
-			return
-		}
-		if err := a.spider91Migrator.RunOnce(ctx); err != nil {
-			log.Printf("[scriptcrawler] drive=%s post-crawl migration: %v", driveID, err)
-		}
-		return
-	}
 	d, err := a.cat.GetDrive(ctx, driveID)
 	if err != nil || d == nil {
 		log.Printf("[scriptcrawler] drive=%s skip post-crawl migration lookup: %v", driveID, err)
 		return
 	}
 	targetDriveID := strings.TrimSpace(d.Credentials["upload_drive_id"])
-	if targetDriveID == "" && d.Kind == spider91.Kind {
-		targetDriveID = a.Spider91UploadDriveID()
-	}
 	if targetDriveID == "" {
 		return
 	}
-	if a.spider91Migrator == nil {
+	if a.crawlerUploader == nil {
 		log.Printf("[scriptcrawler] drive=%s skip post-crawl migration: migrator not configured", driveID)
 		return
 	}
@@ -3685,26 +3911,42 @@ func (a *App) runCrawlerMigrationAfterManualCrawl(ctx context.Context, driveID s
 		return
 	}
 	log.Printf("[scriptcrawler] drive=%s running post-crawl migration target=%s", driveID, targetDriveID)
-	if err := a.spider91Migrator.RunOnce(ctx); err != nil {
+	if err := a.crawlerUploader.RunOnce(ctx); err != nil {
 		log.Printf("[scriptcrawler] drive=%s post-crawl migration: %v", driveID, err)
 	}
 }
 
+// ---------- spiderxvideos crawl ----------
+
+func (a *App) listSpiderXVideosDriveIDs(ctx context.Context) []string {
+	all, err := a.cat.ListDrives(ctx)
+	if err != nil {
+		log.Printf("[nightly] list spiderxvideos drives: %v", err)
+		return nil
+	}
+	out := make([]string, 0, len(all))
+	for _, d := range all {
+		if d != nil && d.Kind == spiderxvideos.Kind {
+			out = append(out, d.ID)
+		}
+	}
+	return out
+}
+
 func (a *App) runSpiderXVideosCrawl(ctx context.Context, driveID string) {
-	taskCtx, done := a.registerDriveTaskContext(ctx, driveID)
-	defer done()
-	if err := taskCtx.Err(); err != nil {
-		log.Printf("[spiderxvideos] drive=%s crawl canceled before start: %v", driveID, err)
-		a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
-			status.Kind = "spiderxvideos"
-			status.State = "canceled"
-			status.Message = "crawl canceled before start"
-			status.LastError = err.Error()
-			status.FinishedAt = formatCrawlTime(time.Now())
-			status.Logs = append(status.Logs, "crawl canceled before start: "+err.Error())
-		})
+	if !a.beginDriveScanOrCrawl(driveID) {
+		log.Printf("[spiderxvideos] drive=%s already queued or running", driveID)
 		return
 	}
+	defer a.endDriveScanOrCrawl(driveID)
+	taskCtx, done := a.registerDriveTaskContext(ctx, driveID)
+	defer done()
+
+	a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
+		status.State = "running"
+		status.StartedAt = time.Now().UTC().Format(time.RFC3339)
+	})
+
 	a.mu.Lock()
 	c := a.spiderXVideosCrawlers[driveID]
 	a.mu.Unlock()
@@ -3712,12 +3954,8 @@ func (a *App) runSpiderXVideosCrawl(ctx context.Context, driveID string) {
 		if err := a.ensureDriveAttached(taskCtx, driveID); err != nil {
 			log.Printf("[spiderxvideos] drive=%s attach failed: %v", driveID, err)
 			a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
-				status.Kind = "spiderxvideos"
 				status.State = "error"
-				status.Message = "crawler attach failed"
-				status.LastError = err.Error()
-				status.FinishedAt = formatCrawlTime(time.Now())
-				status.Logs = append(status.Logs, "attach failed: "+err.Error())
+				status.Message = fmt.Sprintf("attach failed: %v", err)
 			})
 			return
 		}
@@ -3727,12 +3965,8 @@ func (a *App) runSpiderXVideosCrawl(ctx context.Context, driveID string) {
 		if c == nil {
 			log.Printf("[spiderxvideos] drive=%s crawler not attached", driveID)
 			a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
-				status.Kind = "spiderxvideos"
 				status.State = "error"
 				status.Message = "crawler not attached"
-				status.LastError = "crawler not attached"
-				status.FinishedAt = formatCrawlTime(time.Now())
-				status.Logs = append(status.Logs, "crawler not attached")
 			})
 			return
 		}
@@ -3742,121 +3976,48 @@ func (a *App) runSpiderXVideosCrawl(ctx context.Context, driveID string) {
 	if err != nil || d == nil {
 		log.Printf("[spiderxvideos] drive=%s lookup failed: %v", driveID, err)
 		a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
-			status.Kind = "spiderxvideos"
 			status.State = "error"
-			status.Message = "drive lookup failed"
-			if err != nil {
-				status.LastError = err.Error()
-				status.Logs = append(status.Logs, "lookup failed: "+err.Error())
-			} else {
-				status.LastError = "drive not found"
-				status.Logs = append(status.Logs, "lookup failed: drive not found")
-			}
-			status.FinishedAt = formatCrawlTime(time.Now())
+			status.Message = fmt.Sprintf("drive lookup failed: %v", err)
 		})
 		return
 	}
-	targetNew := spider91IntCred(d, "target_new", spiderxvideos.DefaultTargetNew)
+
+	targetNew := crawlerIntCred(d, "target_new", spiderxvideos.DefaultTargetNew)
 	if targetNew <= 0 {
 		targetNew = spiderxvideos.DefaultTargetNew
 	}
 
 	log.Printf("[spiderxvideos] drive=%s start crawl target_new=%d", driveID, targetNew)
-	started := time.Now()
-	a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
-		status.Kind = "spiderxvideos"
-		status.State = "running"
-		status.Message = "crawl running"
-		status.LastError = ""
-		status.TargetNew = targetNew
-		status.TotalEntries = 0
-		status.NewVideos = 0
-		status.Skipped = 0
-		status.Failed = 0
-		status.SeenSnapshot = 0
-		status.OutputJSON = ""
-		status.SeenFile = ""
-		status.StartedAt = formatCrawlTime(started)
-		status.FinishedAt = ""
-		status.Logs = append(status.Logs, fmt.Sprintf("start crawl target_new=%d", targetNew))
-	})
 	res, runErr := c.RunOnce(taskCtx, targetNew)
 	if runErr != nil {
 		log.Printf("[spiderxvideos] drive=%s crawl failed: %v", driveID, runErr)
 		a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
 			status.State = "error"
-			status.Message = "crawl failed"
-			status.LastError = runErr.Error()
-			status.FinishedAt = formatCrawlTime(time.Now())
-			if res != nil {
-				status.TargetNew = res.TargetNew
-				status.TotalEntries = res.TotalEntries
-				status.NewVideos = res.NewVideos
-				status.Skipped = res.Skipped
-				status.Failed = res.Failed
-				status.SeenSnapshot = res.SeenSnapshot
-				status.OutputJSON = res.OutputJSON
-				status.SeenFile = res.SeenFile
-			}
-			status.Logs = append(status.Logs, "crawl failed: "+runErr.Error())
+			status.Message = fmt.Sprintf("crawl failed: %v", runErr)
+			status.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 		})
 	} else if res != nil {
-		log.Printf("[spiderxvideos] drive=%s crawl done target=%d total=%d new=%d skipped=%d failed=%d seen_snapshot=%d",
-			driveID, res.TargetNew, res.TotalEntries, res.NewVideos, res.Skipped, res.Failed, res.SeenSnapshot)
+		log.Printf("[spiderxvideos] drive=%s crawl done target=%d total=%d new=%d skipped=%d failed=%d",
+			driveID, res.TargetNew, res.TotalEntries, res.NewVideos, res.Skipped, res.Failed)
 		a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
-			status.State = "ok"
-			status.Message = "crawl done"
-			status.LastError = ""
-			status.TargetNew = res.TargetNew
-			status.TotalEntries = res.TotalEntries
-			status.NewVideos = res.NewVideos
-			status.Skipped = res.Skipped
-			status.Failed = res.Failed
-			status.SeenSnapshot = res.SeenSnapshot
-			status.OutputJSON = res.OutputJSON
-			status.SeenFile = res.SeenFile
-			status.FinishedAt = formatCrawlTime(res.FinishedAt)
-			status.Logs = append(status.Logs, fmt.Sprintf("crawl done total=%d new=%d skipped=%d failed=%d", res.TotalEntries, res.NewVideos, res.Skipped, res.Failed))
+			status.State = "completed"
+			status.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 		})
 	}
 
-	if d.Credentials == nil {
-		d.Credentials = make(map[string]string)
+	if runErr == nil {
+		a.mu.Lock()
+		worker := a.workers[driveID]
+		thumbWorker := a.thumbWorkers[driveID]
+		fingerprintWorker := a.fingerprintWorkers[driveID]
+		a.mu.Unlock()
+		a.scheduleFingerprintBackfill(taskCtx, driveID, fingerprintWorker)
+		a.enqueueDriveGeneration(taskCtx, driveID, worker, thumbWorker)
 	}
-	d.Credentials["last_crawl_at"] = strconv.FormatInt(time.Now().Unix(), 10)
-	if runErr != nil {
-		d.Status = "error"
-		d.LastError = runErr.Error()
-	} else {
-		d.Status = "ok"
-		d.LastError = ""
-	}
-	if err := a.cat.UpsertDrive(taskCtx, d); err != nil {
-		log.Printf("[spiderxvideos] drive=%s update last_crawl_at: %v", driveID, err)
-	}
-	if err := taskCtx.Err(); err != nil {
-		log.Printf("[spiderxvideos] drive=%s crawl canceled after run: %v", driveID, err)
-		a.updateDriveCrawlStatus(driveID, func(status *api.CrawlStatus) {
-			status.State = "canceled"
-			status.Message = "crawl canceled"
-			status.LastError = err.Error()
-			status.FinishedAt = formatCrawlTime(time.Now())
-			status.Logs = append(status.Logs, "crawl canceled: "+err.Error())
-		})
-		return
-	}
-
-	a.mu.Lock()
-	worker := a.workers[driveID]
-	thumbWorker := a.thumbWorkers[driveID]
-	fingerprintWorker := a.fingerprintWorkers[driveID]
-	a.mu.Unlock()
-	a.scheduleFingerprintBackfill(taskCtx, driveID, fingerprintWorker)
-	a.enqueueDriveGeneration(taskCtx, driveID, worker, thumbWorker)
 }
 
-// spider91IntCred 解析 credentials 中的整数字段，缺省时返回 def。
-func spider91IntCred(d *catalog.Drive, key string, def int) int {
+// crawlerIntCred 解析 credentials 中的整数字段，缺省时返回 def。
+func crawlerIntCred(d *catalog.Drive, key string, def int) int {
 	if d == nil || d.Credentials == nil {
 		return def
 	}

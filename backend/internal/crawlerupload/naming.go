@@ -1,13 +1,13 @@
-package spider91migrate
+package crawlerupload
 
 import (
 	"strings"
 	"unicode"
 )
 
-// 期望的 PikPak 文件名格式（方案 B）：
+// 期望的上传文件名格式：
 //
-//	<sanitized-title>-<viewkey-后8位>.<ext>
+//	<sanitized-title>-<sourceID-后8位>.<ext>
 //
 // 例如：
 //
@@ -15,8 +15,8 @@ import (
 //
 // 设计目标：
 //   - 文件名一眼能看出视频内容（用 catalog 里的 title）
-//   - 后缀的 viewkey 8 字符保证同标题不会撞名
-//   - 全部字符在常见文件系统、PikPak、HTTP/Aliyun OSS Key 编码里都安全
+//   - 后缀的 sourceID 8 字符保证同标题不会撞名
+//   - 全部字符在常见文件系统、网盘 API、HTTP/Aliyun OSS Key 编码里都安全
 //
 // 字符清洗规则（sanitizeTitle）：
 //   - 去除控制字符（< 0x20 或 0x7F）
@@ -85,47 +85,47 @@ func truncateRunes(s string, maxRunes int) string {
 	return s
 }
 
-// extractViewKey 从 video.ID（"spider91-<driveID>-<viewkey>"）里
-// 取出最后一段 viewkey。
+// extractSourceID 从 video.ID（"<kind>-<driveID>-<sourceID>"）里
+// 取出最后一段 sourceID。
 //
-// driveID 中如果有 "-" 不影响（用 LastIndex），viewkey 本身（91 网站的
-// view 标识）目前都是纯 hex 或纯数字，不包含 "-"。
-func extractViewKey(videoID string) string {
+// driveID 中如果有 "-" 不影响（用 LastIndex）。爬虫脚本应提供不包含 "-"
+// 的稳定 source_id；如果包含 "-"，这里会取最后一段作为文件名后缀。
+func extractSourceID(videoID string) string {
 	if i := strings.LastIndex(videoID, "-"); i >= 0 {
 		return videoID[i+1:]
 	}
 	return videoID
 }
 
-// viewKeySuffix 取 viewkey 的最后 N 个字符；不足 N 返回原字符串。
+// sourceIDSuffix 取 sourceID 的最后 N 个字符；不足 N 返回原字符串。
 //
 // 默认 N=8（足够稀疏避免标题撞名时的同名冲突）。
-const viewKeySuffixLen = 8
+const sourceIDSuffixLen = 8
 
-func viewKeySuffix(viewkey string) string {
-	r := []rune(viewkey)
-	if len(r) <= viewKeySuffixLen {
+func sourceIDSuffix(sourceID string) string {
+	r := []rune(sourceID)
+	if len(r) <= sourceIDSuffixLen {
 		return string(r)
 	}
-	return string(r[len(r)-viewKeySuffixLen:])
+	return string(r[len(r)-sourceIDSuffixLen:])
 }
 
-// desiredPikPakName 构造 spider91 视频在 PikPak 上的期望文件名。
+// desiredUploadName 构造爬虫视频上传到目标网盘时的期望文件名。
 //
-//	desiredPikPakName("超白大奶律师约炮", "476fa8bf4b47e672d2fa", "mp4")
+//	desiredUploadName("超白大奶律师约炮", "476fa8bf4b47e672d2fa", "mp4")
 //	  → "超白大奶律师约炮-72d2fa.mp4"  // 实际是 e672d2fa（取最后 8）
 //
 // ext 不带前导点；空时默认 mp4。
-func desiredPikPakName(title, viewkey, ext string) string {
+func desiredUploadName(title, sourceID, ext string) string {
 	clean := sanitizeTitle(title)
-	suffix := viewKeySuffix(strings.TrimSpace(viewkey))
+	suffix := sourceIDSuffix(strings.TrimSpace(sourceID))
 	ext = strings.TrimSpace(ext)
 	ext = strings.TrimPrefix(ext, ".")
 	if ext == "" {
 		ext = "mp4"
 	}
 	if suffix == "" {
-		// viewkey 缺失时退化成 "<title>.<ext>"
+		// sourceID 缺失时退化成 "<title>.<ext>"
 		return clean + "." + ext
 	}
 	return clean + "-" + suffix + "." + ext

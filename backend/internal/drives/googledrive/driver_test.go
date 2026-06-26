@@ -227,10 +227,10 @@ func TestEnsureDirAndRenameUseGoogleDriveFileAPI(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&meta); err != nil {
 				t.Fatalf("decode mkdir body: %v", err)
 			}
-			if meta.Name != "91 Spider" || len(meta.Parents) != 1 || meta.Parents[0] != "root" || meta.MimeType != "application/vnd.google-apps.folder" {
+			if meta.Name != "Crawler Uploads" || len(meta.Parents) != 1 || meta.Parents[0] != "root" || meta.MimeType != "application/vnd.google-apps.folder" {
 				t.Fatalf("mkdir body = %+v", meta)
 			}
-			writeTestJSON(w, driveFile{ID: "folder-91", Name: "91 Spider", MimeType: "application/vnd.google-apps.folder"})
+			writeTestJSON(w, driveFile{ID: "folder-crawler", Name: "Crawler Uploads", MimeType: "application/vnd.google-apps.folder"})
 		case r.Method == http.MethodPatch && r.URL.Path == "/drive/v3/files/file-1":
 			renamed = true
 			var body map[string]string
@@ -251,12 +251,12 @@ func TestEnsureDirAndRenameUseGoogleDriveFileAPI(t *testing.T) {
 	d.accessToken = "access"
 	d.listInterval = -1
 
-	dirID, err := d.EnsureDir(context.Background(), "91 Spider")
+	dirID, err := d.EnsureDir(context.Background(), "Crawler Uploads")
 	if err != nil {
 		t.Fatalf("EnsureDir() error = %v", err)
 	}
-	if dirID != "folder-91" || !madeDir {
-		t.Fatalf("dirID/madeDir = %q/%v, want folder-91/true", dirID, madeDir)
+	if dirID != "folder-crawler" || !madeDir {
+		t.Fatalf("dirID/madeDir = %q/%v, want folder-crawler/true", dirID, madeDir)
 	}
 	if err := d.Rename(context.Background(), "file-1", "new-name.mp4"); err != nil {
 		t.Fatalf("Rename() error = %v", err)

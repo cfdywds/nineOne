@@ -172,7 +172,7 @@ test("detail player treats backend video routes as native mp4 sources", () => {
   assert.match(playerSource, /if \(isBackendNativeVideoRoute\(cleanPath\)\) return "mp4"/);
   assert.match(playerSource, /pathname\.startsWith\("\/p\/stream\/"\)/);
   assert.match(playerSource, /pathname\.startsWith\("\/p\/upload\/"\)/);
-  assert.match(playerSource, /pathname\.startsWith\("\/p\/spider91\/"\)/);
+  assert.doesNotMatch(playerSource, /\/p\/spider91\//);
   assert.doesNotMatch(playerSource, /crossOrigin/);
 });
 
